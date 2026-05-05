@@ -15,51 +15,61 @@ export default function Login() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [devCode, setDevCode] = useState('');
-const API_URL = "https://freebaraapp-2.onrender.com"
+const API_URL = "https://freebaraapp-2.onrender.com";
 
-  // ✅ REQUEST OTP
-  const handleRequestOtp = async (e: React.FormEvent) => {
-    e.preventDefault();
-
-    if (!email) {
-      setError('Email requis');
-      return;
-    }
-
-    setLoading(true);
-    setError('');
-       console.log('AVANT FETCH');
-    try {
-     const res = await fetch(`${API_URL}/api/auth/request-otp`, {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ email })
-});
-      
-        console.log('APRES FETCH');
-      const data = await res.json();
-
-      if (!res.ok) {
-        throw new Error(data.message || 'Erreur serveur');
-      }
-
-      if (data.devCode) {
-        setDevCode(data.devCode);
-      }
-
-      setStep('code');
-
-    } catch (err: any) {
-      setError(err.message);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleVerifyOtp = async (e: React.FormEvent) => {
+// ✅ REQUEST OTP
+const handleRequestOtp = async (e: React.FormEvent) => {
   e.preventDefault();
 
-  // ✅ Validation propre
+  if (!email) {
+    setError('Email requis');
+    return;
+  }
+
+  setLoading(true);
+  setError('');
+  console.log('AVANT FETCH');
+
+  try {
+    const res = await fetch(`${API_URL}/api/auth/request-otp`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ 
+        email: email.trim(),
+        isRegister: mode === 'register'
+      })
+    });
+
+    console.log('APRES FETCH');
+
+    const data = await res.json();
+
+    // ✅ CORRECTION ICI
+    if (!res.ok) {
+      throw new Error(data.error || data.message || 'Erreur serveur');
+    }
+
+    // ✅ Code dev (si pas SMTP)
+    if (data.devCode) {
+      console.log("CODE OTP DEV =", data.devCode);
+      setDevCode(data.devCode);
+    }
+
+    setStep('code');
+
+  } catch (err: any) {
+    console.error("REQUEST OTP ERROR:", err);
+    setError(err.message || 'Erreur serveur');
+  } finally {
+    setLoading(false);
+  }
+};
+
+
+// ✅ VERIFY OTP
+const handleVerifyOtp = async (e: React.FormEvent) => {
+  e.preventDefault();
+
   if (!code || code.trim().length !== 6) {
     setError('Code invalide');
     return;
@@ -83,27 +93,26 @@ const API_URL = "https://freebaraapp-2.onrender.com"
       })
     });
 
-    // ✅ Vérifie si réponse OK AVANT json()
-    if (!res.ok) {
-      let message = 'Erreur serveur';
-      try {
-        const errData = await res.json();
-        message = errData.message || message;
-      } catch {}
-      throw new Error(message);
+    let data;
+
+    // ✅ gestion safe JSON
+    try {
+      data = await res.json();
+    } catch {
+      throw new Error('Réponse invalide du serveur');
     }
 
-    const data = await res.json();
+    // ✅ CORRECTION ICI AUSSI
+    if (!res.ok) {
+      throw new Error(data.error || data.message || 'Erreur serveur');
+    }
 
-    // ✅ Vérifie token
     if (!data.token) {
       throw new Error('Token manquant');
     }
 
-    // ✅ Stockage sécurisé
     localStorage.setItem('token', data.token);
 
-    // ✅ Redirection
     navigate('/profile');
 
   } catch (err: any) {
