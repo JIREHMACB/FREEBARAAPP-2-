@@ -8,6 +8,7 @@ import Database from 'better-sqlite3';
 import crypto from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { mkdirSync } from 'fs';
 import dotenv from 'dotenv';
 import jwt from 'jsonwebtoken';
 import nodemailer from 'nodemailer';
@@ -74,7 +75,11 @@ const sendOTPEmail = async (email: string, code: string): Promise<void> => {
 };
 
 // --- Database ---
-const db = new Database('data/database.db');
+// Crée le répertoire data/ s'il n'existe pas (nécessaire sur Render et autres environnements cloud)
+const DB_DIR = process.env.DB_PATH ? path.dirname(process.env.DB_PATH) : 'data';
+const DB_FILE = process.env.DB_PATH || 'data/database.db';
+mkdirSync(DB_DIR, { recursive: true });
+const db = new Database(DB_FILE);
 
 // Create Tables
 db.exec(`
