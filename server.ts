@@ -6,7 +6,6 @@ import { Server } from 'socket.io';
 import cors from 'cors';
 import Database from 'better-sqlite3';
 import crypto from 'crypto';
-import path from 'path';
 import { fileURLToPath } from 'url';
 import { mkdirSync } from 'fs';
 import dotenv from 'dotenv';
