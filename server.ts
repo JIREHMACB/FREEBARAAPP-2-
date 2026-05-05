@@ -74,10 +74,7 @@ const sendOTPEmail = async (email: string, code: string): Promise<void> => {
 };
 
 // --- Database ---
-const dbPath = process.env.NODE_ENV === 'production'
-  ? '/data/database.sqlite'
-  : path.join(__dirname, 'database.sqlite');
-const db = new Database(dbPath);
+const db = new Database('data/database.db');
 
 // Create Tables
 db.exec(`
