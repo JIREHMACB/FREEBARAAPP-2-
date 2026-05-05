@@ -15,7 +15,7 @@ export default function Login() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [devCode, setDevCode] = useState('');
-const API_URL = 'http://localhost:3000';
+const API_URL = "https://freebaraapp-2.onrender.com"
 
   // ✅ REQUEST OTP
   const handleRequestOtp = async (e: React.FormEvent) => {
