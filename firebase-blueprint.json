@@ -1,0 +1,37 @@
+{
+  "entities": {
+    "CV": {
+      "title": "CV",
+      "description": "User's CV format and data",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "data": { "type": "string", "description": "JSON string of CV data to bypass depth constraints" }
+      }
+    },
+    "Portfolio": {
+      "title": "Portfolio",
+      "description": "User's Portfolio data",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "data": { "type": "string", "description": "JSON string of Portfolio data" }
+      }
+    },
+    "Startup": {
+      "title": "Startup",
+      "description": "User's Startup plan",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "data": { "type": "string", "description": "JSON string of Startup data" }
+      }
+    }
+  },
+  "firestore": {
+    "/users/{userId}/documents/{docId}": {
+      "schema": { "$ref": "#/entities/CV" },
+      "description": "User documents containing serialized JSON data"
+    }
+  }
+}
