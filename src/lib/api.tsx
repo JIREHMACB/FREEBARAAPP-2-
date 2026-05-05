@@ -3,7 +3,11 @@ import { toast } from 'react-hot-toast';
 import { io } from 'socket.io-client';
 
 // ✅ CORRECTION : BASE_URL pour le socket, API_URL avec /api pour les requêtes
-const BASE_URL = import.meta.env.VITE_API_URL || "http://localhost:3000";
+const BASE_URL =
+  import.meta.env.VITE_API_URL ||
+  (window.location.hostname === "localhost"
+    ? "http://localhost:3000"
+    : "https://freebaraapp-2.onrender.com");
 const API_URL = `${BASE_URL}/api`;
 
 export const socket = io(BASE_URL, {
