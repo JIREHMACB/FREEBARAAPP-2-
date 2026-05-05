@@ -3951,7 +3951,9 @@ async function startServer() {
   });
 
   // FRONTEND (PRODUCTION CLEAN)
-const buildPath = path.join(__dirname, 'dist');
+import * as path from 'path';
+
+const buildPath = path.join(process.cwd(), 'dist');
 
 app.use(express.static(buildPath));
 
@@ -3962,6 +3964,7 @@ app.get('*', (req, res) => {
 
   res.sendFile(path.join(buildPath, 'index.html'));
 });
+
 
   const PORT = process.env.PORT || 3000;
   httpServer.listen(PORT, () => {
