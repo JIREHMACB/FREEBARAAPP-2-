@@ -44,18 +44,17 @@ const handleRequestOtp = async (e: React.FormEvent) => {
 
     const data = await res.json();
 
-    // ✅ CORRECTION ICI
     if (!res.ok) {
       throw new Error(data.error || data.message || 'Erreur serveur');
     }
 
-    // ✅ Code dev (si pas SMTP)
     if (data.devCode) {
       console.log("CODE OTP DEV =", data.devCode);
       setDevCode(data.devCode);
     }
 
-    setStep('code');
+    // ⚠️ petit fix anti bug React
+    setTimeout(() => setStep('code'), 0);
 
   } catch (err: any) {
     console.error("REQUEST OTP ERROR:", err);
@@ -66,7 +65,7 @@ const handleRequestOtp = async (e: React.FormEvent) => {
 };
 
 
-// ✅ VERIFY OTP
+// ✅ VERIFY OTP (CORRIGÉ)
 const handleVerifyOtp = async (e: React.FormEvent) => {
   e.preventDefault();
 
@@ -81,6 +80,7 @@ const handleVerifyOtp = async (e: React.FormEvent) => {
   try {
     console.log("EMAIL:", email);
     console.log("CODE:", code);
+    console.log("MODE:", mode);
 
     const res = await fetch(`${API_URL}/api/auth/verify-otp`, {
       method: 'POST',
@@ -89,20 +89,19 @@ const handleVerifyOtp = async (e: React.FormEvent) => {
       },
       body: JSON.stringify({ 
         email: email.trim(), 
-        code: code.trim() 
+        code: code.trim(),
+        isRegister: mode === 'register' // 🔥 CORRECTION IMPORTANTE
       })
     });
 
     let data;
 
-    // ✅ gestion safe JSON
     try {
       data = await res.json();
     } catch {
       throw new Error('Réponse invalide du serveur');
     }
 
-    // ✅ CORRECTION ICI AUSSI
     if (!res.ok) {
       throw new Error(data.error || data.message || 'Erreur serveur');
     }
