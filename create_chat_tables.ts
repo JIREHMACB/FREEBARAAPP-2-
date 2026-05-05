@@ -18,8 +18,7 @@ try {
         FOREIGN KEY (userId) REFERENCES users(id)
     );
     CREATE TABLE IF NOT EXISTS messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        conversationId INTEGER,
+        id INTEGER PRIMARY KEY AUTOINCREMENT,3000      conversationId INTEGER,
         senderId INTEGER,
         content TEXT,
         isPinned INTEGER DEFAULT 0,
