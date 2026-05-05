@@ -10,6 +10,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { mkdirSync } from 'fs';
 import dotenv from 'dotenv';
+import * as path from 'path';
 import jwt from 'jsonwebtoken';
 import nodemailer from 'nodemailer';
 
@@ -3951,7 +3952,7 @@ async function startServer() {
   });
 
   // FRONTEND (PRODUCTION CLEAN)
-import * as path from 'path';
+
 
 const buildPath = path.join(process.cwd(), 'dist');
 
