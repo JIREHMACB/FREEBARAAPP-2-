@@ -94,10 +94,12 @@ const sendOTPEmail = async (email: string, code: string): Promise<void> => {
 
 // --- Database ---
 // Crée le répertoire data/ s'il n'existe pas (nécessaire sur Render et autres environnements cloud)
-const DB_DIR = process.env.DB_PATH ? path.dirname(process.env.DB_PATH) : 'data';
-const DB_FILE = process.env.DB_PATH || 'data/database.db';
+const DB_PATH = process.env.DB_PATH || '/data/database.db';
+
+const DB_DIR = path.dirname(DB_PATH);
 mkdirSync(DB_DIR, { recursive: true });
-const db = new Database(DB_FILE);
+
+const db = new Database(DB_PATH);
 
 // Create Tables
 db.exec(`
