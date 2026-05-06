@@ -13,65 +13,92 @@ import * as path from 'path';
 import jwt from 'jsonwebtoken';
 import nodemailer from 'nodemailer';
 
+// 🔥 ENV
 dotenv.config();
+
 
 // --- Setup ---
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(64).toString('hex');
 
-// --- Validation email ---
-const isValidEmail = (email: string): boolean => {
+
+ const isValidEmail = (email: string): boolean => {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 };
 
-// --- Nodemailer Transporter (SMTP) ---
-const transporter = nodemailer.createTransport({
+
+
+const sendOTPEmail = async (email: string, code: string): Promise<void> => {
+  if (!process.env.SMTP_USER || !process.env.SMTP_PASS) {
+    console.log(`📩 [DEV MODE] OTP pour ${email}: ${code}`);
+    return;
+  }
+
+ 
+
+  const transporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST || 'smtp.gmail.com',
   port: parseInt(process.env.SMTP_PORT || '587'),
-  secure: false, // true pour 465, false pour 587
+  secure: false,
   auth: {
     user: process.env.SMTP_USER,
     pass: process.env.SMTP_PASS,
   },
 });
+  
 
-// --- Envoi OTP par email ---
-const sendOTPEmail = async (email: string, code: string): Promise<void> => {
-  if (!process.env.SMTP_USER || !process.env.SMTP_PASS) {
-    // Mode dev : affiche le code dans le terminal
-    console.log(`📩 [OTP DEV - SMTP non configuré] Code pour ${email}: ${code}`);
-    return;
-  }
-
-  await transporter.sendMail({
-    from: process.env.SMTP_FROM || `"Freebara" <${process.env.SMTP_USER}>`,
-    to: email,
-    subject: 'Votre code de connexion Freebara',
-    html: `
-      <!DOCTYPE html>
-      <html>
-        <body style="font-family: Arial, sans-serif; background: #f4f4f4; margin: 0; padding: 0;">
-          <div style="max-width: 480px; margin: 40px auto; background: #fff; border-radius: 12px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.1);">
-            <div style="background: #4F46E5; padding: 32px; text-align: center;">
-              <h1 style="color: #fff; margin: 0; font-size: 28px;">Freebara</h1>
-            </div>
-            <div style="padding: 32px; text-align: center;">
-              <h2 style="color: #1a1a1a; margin-bottom: 8px;">Votre code de vérification</h2>
-              <p style="color: #555; margin-bottom: 24px;">Utilisez ce code pour vous connecter. Il expire dans <strong>10 minutes</strong>.</p>
-              <div style="background: #f0f0ff; border-radius: 8px; padding: 24px; display: inline-block; margin-bottom: 24px;">
-                <span style="font-size: 40px; font-weight: bold; letter-spacing: 12px; color: #4F46E5;">${code}</span>
+  try {
+    await transporter.sendMail({
+      from: process.env.SMTP_FROM || `"Freebara" <${process.env.SMTP_USER}>`,
+      to: email,
+      subject: 'Votre code de connexion Freebara',
+      html: `
+        <!DOCTYPE html>
+        <html>
+          <body style="font-family: Arial, sans-serif; background: #f4f4f4; margin: 0; padding: 0;">
+            <div style="max-width: 480px; margin: 40px auto; background: #fff; border-radius: 12px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.1);">
+              
+              <div style="background: #4F46E5; padding: 32px; text-align: center;">
+                <h1 style="color: #fff; margin: 0; font-size: 28px;">Freebara</h1>
               </div>
-              <p style="color: #999; font-size: 13px;">Si vous n'avez pas demandé ce code, ignorez cet email.</p>
+
+              <div style="padding: 32px; text-align: center;">
+                <h2 style="color: #1a1a1a; margin-bottom: 8px;">Votre code de vérification</h2>
+                <p style="color: #555; margin-bottom: 24px;">
+                  Utilisez ce code pour vous connecter. Il expire dans <strong>10 minutes</strong>.
+                </p>
+
+                <div style="background: #f0f0ff; border-radius: 8px; padding: 24px; display: inline-block; margin-bottom: 24px;">
+                  <span style="font-size: 40px; font-weight: bold; letter-spacing: 12px; color: #4F46E5;">
+                    ${code}
+                  </span>
+                </div>
+
+                <p style="color: #999; font-size: 13px;">
+                  Si vous n'avez pas demandé ce code, ignorez cet email.
+                </p>
+              </div>
+
+              <div style="background: #f9f9f9; padding: 16px; text-align: center;">
+                <p style="color: #bbb; font-size: 12px; margin: 0;">
+                  © ${new Date().getFullYear()} Freebara. Tous droits réservés.
+                </p>
+              </div>
+
             </div>
-            <div style="background: #f9f9f9; padding: 16px; text-align: center;">
-              <p style="color: #bbb; font-size: 12px; margin: 0;">© ${new Date().getFullYear()} Freebara. Tous droits réservés.</p>
-            </div>
-          </div>
-        </body>
-      </html>
-    `,
-  });
-  console.log(`📩 Email OTP envoyé à ${email}`);
+          </body>
+        </html>
+      `,
+    });
+
+    console.log(`📩 EMAIL OTP ENVOYÉ À : ${email}`);
+
+  } catch (err) {
+    console.error("❌ ERREUR ENVOI EMAIL OTP :", err);
+
+    // IMPORTANT: ne pas crash le serveur
+    throw new Error("Email OTP failed");
+  }
 };
 
 // --- Database ---
@@ -1413,110 +1440,153 @@ async function startServer() {
   });
 
   // 1. Request OTP
-  app.post('/api/auth/request-otp', (req, res) => {
+app.post('/api/auth/request-otp', async (req, res) => {
+  try {
     const { email, isRegister } = req.body;
-    if (!email) return res.status(400).json({ error: 'Email requis' });
-    
+
+    if (!email) {
+      return res.status(400).json({ error: 'Email requis' });
+    }
+
     if (!isValidEmail(email)) {
       return res.status(400).json({ error: 'Adresse email invalide' });
     }
-    
+
     const user = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
-    
+
     if (isRegister && user) {
       return res.status(400).json({ error: 'Un compte existe déjà avec cet email. Veuillez vous connecter.' });
     }
+
     if (!isRegister && !user) {
       return res.status(400).json({ error: 'Aucun compte trouvé avec cet email. Veuillez vous inscrire.' });
     }
-    
+
     const code = Math.floor(100000 + Math.random() * 900000).toString();
-    const expiresAt = new Date(Date.now() + 10 * 60000).toISOString(); // 10 mins
-    
-    db.prepare('INSERT OR REPLACE INTO otps (email, code, expiresAt) VALUES (?, ?, ?)').run(email, code, expiresAt);
-    
-    // Envoyer le code par email (console.log en mode dev si SMTP_USER/SMTP_PASS non configurés)
-    sendOTPEmail(email, code)
-      .then(() => {
-        const isDev = !process.env.SMTP_USER || !process.env.SMTP_PASS;
-        res.json({
-          message: 'Code envoyé avec succès',
-          ...(isDev && { devCode: code }),
-        });
-      })
-      .catch((err: any) => {
-        console.error('Erreur envoi email OTP:', err);
-        res.status(500).json({ error: "Impossible d'envoyer le code par email. Vérifiez SMTP_USER et SMTP_PASS dans .env" });
-      });
-  });
+    const expiresAt = new Date(Date.now() + 10 * 60000).toISOString();
+
+    db.prepare(
+      'INSERT OR REPLACE INTO otps (email, code, expiresAt) VALUES (?, ?, ?)'
+    ).run(email, code, expiresAt);
+
+    // 🔥 IMPORTANT: attendre l'envoi
+    await sendOTPEmail(email, code);
+
+    const isDev = !process.env.SMTP_USER || !process.env.SMTP_PASS;
+
+    console.log("📩 OTP généré pour :", email);
+
+    return res.json({
+      message: 'Code envoyé avec succès',
+      ...(isDev && { devCode: code }),
+    });
+
+  } catch (err) {
+    console.error('❌ ERREUR REQUEST OTP:', err);
+    return res.status(500).json({
+      error: "Impossible d'envoyer le code par email"
+    });
+  }
+});
 
   // 2. Verify OTP & Login/Register
-  app.post('/api/auth/verify-otp', (req, res) => {
+app.post('/api/auth/verify-otp', async (req, res) => {
+  try {
     const { email, code, referralCode, isRegister, country } = req.body;
-    
+
     if (!email || !isValidEmail(email)) {
       return res.status(400).json({ error: 'Adresse email invalide' });
     }
-    
+
+    if (!code) {
+      return res.status(400).json({ error: 'Code OTP requis' });
+    }
+
     const otpRecord = db.prepare('SELECT * FROM otps WHERE email = ?').get(email) as any;
-    if (!otpRecord || otpRecord.code !== code || new Date(otpRecord.expiresAt) < new Date()) {
+
+    if (
+      !otpRecord ||
+      String(otpRecord.code) !== String(code) ||
+      new Date(otpRecord.expiresAt) < new Date()
+    ) {
       return res.status(400).json({ error: 'Code invalide ou expiré' });
     }
-    
+
     let user = db.prepare('SELECT * FROM users WHERE email = ?').get(email) as any;
-    
+
     if (isRegister) {
       if (user) {
         return res.status(400).json({ error: 'Un compte existe déjà avec cet email. Veuillez vous connecter.' });
       }
-      // Register new user
+
       let referredBy = null;
+
       if (referralCode) {
         const referrer = db.prepare('SELECT id FROM users WHERE referralCode = ?').get(referralCode) as any;
         if (referrer) referredBy = referrer.id;
       }
-      
+
       const newReferralCode = Math.random().toString(36).substring(2, 8).toUpperCase();
-      const insert = db.prepare('INSERT INTO users (email, referralCode, referredBy, country) VALUES (?, ?, ?, ?)');
-      const info = insert.run(email, newReferralCode, referredBy, country || null);
+
+      const info = db
+        .prepare('INSERT INTO users (email, referralCode, referredBy, country) VALUES (?, ?, ?, ?)')
+        .run(email, newReferralCode, referredBy, country || null);
+
       const newUserId = info.lastInsertRowid;
       user = db.prepare('SELECT * FROM users WHERE id = ?').get(newUserId);
 
-      // Cell Logic
+      // Cell logic (inchangé)
       if (referredBy) {
-        // 1. Find or create sponsor's cell
         let sponsorCell = db.prepare('SELECT * FROM cells WHERE creatorId = ?').get(referredBy) as any;
+
         if (!sponsorCell) {
           const sponsor = db.prepare('SELECT name, referredBy FROM users WHERE id = ?').get(referredBy) as any;
-          const cellName = sponsor.name ? `Cellule de ${sponsor.name}` : 'Nouvelle cellule';
-          const cellInsert = db.prepare('INSERT INTO cells (name, creatorId) VALUES (?, ?)');
-          const cellInfo = cellInsert.run(cellName, referredBy);
-          const cellId = cellInfo.lastInsertRowid;
-          sponsorCell = { id: cellId, name: cellName, creatorId: referredBy };
 
-          // Add sponsor to their own cell as admin
-          db.prepare('INSERT INTO cell_members (cellId, userId, role) VALUES (?, ?, ?)').run(cellId, referredBy, 'admin');
+          const cellName = sponsor?.name ? `Cellule de ${sponsor.name}` : 'Nouvelle cellule';
 
-          // Hierarchy: The sponsor of the creator joins the cell automatically
-          if (sponsor.referredBy) {
-            db.prepare('INSERT OR IGNORE INTO cell_members (cellId, userId, role) VALUES (?, ?, ?)').run(cellId, sponsor.referredBy, 'member');
+          const cellInfo = db.prepare('INSERT INTO cells (name, creatorId) VALUES (?, ?)')
+            .run(cellName, referredBy);
+
+          sponsorCell = {
+            id: cellInfo.lastInsertRowid,
+            name: cellName,
+            creatorId: referredBy
+          };
+
+          db.prepare('INSERT INTO cell_members (cellId, userId, role) VALUES (?, ?, ?)')
+            .run(sponsorCell.id, referredBy, 'admin');
+
+          if (sponsor?.referredBy) {
+            db.prepare('INSERT OR IGNORE INTO cell_members (cellId, userId, role) VALUES (?, ?, ?)')
+              .run(sponsorCell.id, sponsor.referredBy, 'member');
           }
         }
 
-        // 2. Add new user to sponsor's cell
-        db.prepare('INSERT OR IGNORE INTO cell_members (cellId, userId, role) VALUES (?, ?, ?)').run(sponsorCell.id, newUserId, 'member');
+        db.prepare('INSERT OR IGNORE INTO cell_members (cellId, userId, role) VALUES (?, ?, ?)')
+          .run(sponsorCell.id, newUserId, 'member');
       }
+
     } else {
       if (!user) {
         return res.status(400).json({ error: 'Aucun compte trouvé avec cet email. Veuillez vous inscrire.' });
       }
     }
-    
+
     db.prepare('DELETE FROM otps WHERE email = ?').run(email);
-    
-    const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '7d' });
-    res.json({ token, user });
-  });
+
+    const token = jwt.sign(
+      { userId: user.id },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    return res.json({ token, user });
+
+  } catch (err) {
+    console.error('❌ VERIFY OTP ERROR:', err);
+    return res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
 
   // User Search for Mentions
   app.get('/api/users/search', authenticate, (req: any, res) => {

@@ -28,6 +28,37 @@ interface CreditInstitution {
   isHabilitated: number;
   createdAt: string;
 }
+interface CreditInstitution {
+  id: number;
+  eligibilityConditions: string;
+  name: string;
+  type: string;
+  description: string;
+  terms: string;
+  eligibility: string;
+  targets: string;
+  processingTime: string;
+  logoUrl: string;
+  coverUrl: string;
+  city: string;
+  country: string;
+  isHabilitated: number;
+  createdAt: string;
+}
+
+// 👇 AJOUTE ICI
+type FormDataType = {
+  name: string;
+  slogan: string;
+  description: string;
+  type: string;
+  logoUrl: string;
+  eligibilityConditions: string;
+  offers: string;
+  isConfirmed: boolean;
+  city: string;
+  country: string;
+}; 
 
 export default function InstitutionSpace() {
   const [activeTab, setActiveTab] = useState<'hub' | 'explorer' | 'my-requests' | 'my-institutions' | 'manage'>('hub');
@@ -45,16 +76,18 @@ export default function InstitutionSpace() {
   const [modalStep, setModalStep] = useState(1);
   const [showWarningModal, setShowWarningModal] = useState(false);
   
-  const [formData, setFormData] = useState({
-    name: '',
-    slogan: '',
-    description: '',
-    type: 'Banque',
-    logoUrl: '',
-    eligibilityConditions: '',
-    offers: '',
-    isConfirmed: false
-  });
+const [formData, setFormData] = useState<FormDataType>({
+  name: '',
+  slogan: '',
+  description: '',
+  type: 'Banque',
+  logoUrl: '',
+  eligibilityConditions: '',
+  offers: '',
+  isConfirmed: false,
+  city: '',        // 👈 AJOUT
+  country: ''      // 👈 AJOUT
+});
 
   // ... (rest of the component)
 
@@ -322,6 +355,7 @@ export default function InstitutionSpace() {
                       <option value="Banque">Banque</option>
                       <option value="Microfinance">Microfinance</option>
                       <option value="Assurance">Assurance</option>
+                      <option value="Associations">Associations</option>
                     </select>
                   </>
                 )}
