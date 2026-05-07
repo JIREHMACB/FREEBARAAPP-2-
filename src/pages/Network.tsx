@@ -375,7 +375,7 @@ export default function Network() {
               </div>
             ) : (
               <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4 sm:gap-6">
-                {users.map((user) => (
+                {users.map((user: any) =>  (
                   <motion.div 
                     key={user.id} 
                     onClick={() => navigate(`/profile/${user.id}`)}
@@ -528,7 +528,7 @@ export default function Network() {
             <div className="p-6 overflow-y-auto flex-1">
               <p className="text-sm text-slate-500 mb-6">Sélectionnez un membre pour discuter :</p>
               <div className="space-y-3">
-                {users.map(user => (
+                {users.map((user: any) =>  (
                   <label key={user.id} className="flex items-center gap-4 p-3 hover:bg-slate-50 rounded-2xl cursor-pointer transition-colors border border-transparent hover:border-slate-100">
                     <input 
                       type="checkbox" 

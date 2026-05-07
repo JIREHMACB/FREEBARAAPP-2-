@@ -1,4 +1,4 @@
-import { useUser } from '../App';
+import useUser from '../App';
 import React, { useState, useEffect, useRef, Suspense, lazy } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { api } from '../lib/api';
@@ -21,7 +21,7 @@ import Cropper from 'react-easy-crop';
 import MentionPicker from '../components/MentionPicker';
 import getCroppedImg from '../lib/cropImage';
 import { toast } from 'react-hot-toast';
-import Lightbox from '../components/Lightbox';
+import Lightbox from '../components/Lightbox'
 import { motion, AnimatePresence } from 'framer-motion';
 
 // Progressive Loading Component

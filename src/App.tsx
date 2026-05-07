@@ -1,4 +1,4 @@
- import React, {
+import React, {
   useEffect,
   useState,
   Suspense,
@@ -8,6 +8,7 @@ import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { Toaster } from 'react-hot-toast';
 import { UserContext } from './hooks/useAuth';
 import type { UserContextType } from './types/types';
+import SplashScreen from './components/SplashScreen';
 
 // ── Lazy pages ────────────────────────────────────────────────────────────
 const Layout        = lazy(() => import('./components/Layout'));
@@ -52,6 +53,7 @@ function PrivateRoute({ children }: { children: React.ReactNode }) {
 
 // ── App root ──────────────────────────────────────────────────────────────
 export default function App() {
+  const [showSplash, setShowSplash] = useState(true);
   const [authData, setAuthData] = useState<UserContextType>({
     user: null,
     profile: null,
@@ -64,7 +66,7 @@ export default function App() {
 
     if (token) {
       setAuthData({
-        user: { token } as any, // utilisateur minimal
+        user: { token } as any,
         profile: null,
         loading: false,
       });
@@ -79,6 +81,9 @@ export default function App() {
 
   return (
     <UserContext.Provider value={authData}>
+      {/* Splash Screen — s'affiche uniquement au premier chargement */}
+      {showSplash && <SplashScreen onFinish={() => setShowSplash(false)} />}
+
       <BrowserRouter>
         <Toaster
           position="top-center"
