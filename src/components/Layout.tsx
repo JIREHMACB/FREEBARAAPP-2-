@@ -212,7 +212,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col md:flex-row">
       {/* Desktop Sidebar */}
-      <aside className={`hidden md:flex flex-col ${isSidebarExpanded ? 'w-64' : 'w-20'} bg-white border-r border-slate-200 fixed h-full z-10 transition-all duration-300`}>
+      <aside className={`hidden md:flex flex-col ${isSidebarExpanded ? 'lg:w-64 md:w-20' : 'w-20'} bg-white border-r border-slate-200 fixed h-full z-10 transition-all duration-300`}>
         <div className="p-6">
           <div className="flex items-center justify-between gap-3">
             <div className="flex items-center gap-3">
@@ -222,7 +222,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
               >
                 {isSidebarExpanded ? <ChevronLeft size={24} /> : <ChevronRight size={24} />}
               </button>
-              {isSidebarExpanded && <span className="text-xl font-extrabold text-primary tracking-tight">FreeBara</span>}
+              {isSidebarExpanded && <span className="text-xl font-extrabold text-primary tracking-tight hidden lg:inline">FreeBara</span>}
             </div>
             {isSidebarExpanded && (
               <Link to="/notifications" className="relative p-2 text-slate-400 hover:text-primary hover:bg-slate-50 rounded-full transition-colors">
@@ -255,7 +255,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
                 >
                   <div className="flex items-center gap-3">
                     <Icon size={20} className={isActive ? 'text-blue-600' : 'text-slate-400'} />
-                    {isSidebarExpanded && <span>{item.label}</span>}
+                    {isSidebarExpanded && <span className="hidden lg:inline">{item.label}</span>}
                   </div>
                   {isSidebarExpanded && item.path === '/messages' && unreadMessagesCount > 0 && (
                     <span className="bg-primary text-white text-[10px] font-bold px-2 py-0.5 rounded-full">
@@ -287,7 +287,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
                     <User size={18} className="text-slate-500 m-1.5" />
                   )}
                 </div>
-                {isSidebarExpanded && <span className="text-sm font-medium text-slate-700">{currentUser?.name || 'Mon Profil'}</span>}
+                {isSidebarExpanded && <span className="text-sm font-medium text-slate-700 hidden lg:inline">{currentUser?.name || 'Mon Profil'}</span>}
               </div>
               {isSidebarExpanded && <ChevronRight size={16} className={`text-slate-400 transition-transform ${showSidebarProfileMenu ? 'rotate-90' : ''}`} />}
             </button>
@@ -331,7 +331,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
       </aside>
 
       {/* Main Content */}
-      <main className={`flex-1 ${isSidebarExpanded ? 'md:ml-64' : 'md:ml-20'} pb-20 md:pb-0 min-h-screen transition-all duration-300`}>
+      <main className={`flex-1 ${isSidebarExpanded ? 'md:ml-20 lg:ml-64' : 'md:ml-20'} pb-20 md:pb-0 min-h-screen transition-all duration-300`}>
 
         <div className="md:hidden flex justify-between items-center p-4 bg-white border-b border-slate-200 sticky top-0 z-40">
           <div className="flex items-center gap-2">
@@ -424,7 +424,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
           </div>
         </div>
 
-        <div className="max-w-[1800px] mx-auto p-4 md:p-8">
+        <div className="max-w-[1800px] mx-auto p-3 sm:p-4 md:p-6 lg:p-8">
           {children}
         </div>
       </main>
