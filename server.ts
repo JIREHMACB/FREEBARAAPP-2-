@@ -96,6 +96,8 @@ const sendOTPEmail = async (email: string, code: string): Promise<void> => {
 // Crée le répertoire data/ s'il n'existe pas (nécessaire sur Render et autres environnements cloud)
 const DB_PATH = process.env.DB_PATH || '/data/database.db';
 
+console.log("DB PATH =", DB_PATH);
+
 const DB_DIR = path.dirname(DB_PATH);
 mkdirSync(DB_DIR, { recursive: true });
 
