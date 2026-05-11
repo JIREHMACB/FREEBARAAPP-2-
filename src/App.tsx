@@ -10,6 +10,7 @@ import { UserContext } from './hooks/useAuth';
 import type { UserContextType } from './types/types';
 import SplashScreen from './components/SplashScreen';
 
+
 // ── Lazy pages ────────────────────────────────────────────────────────────
 const Layout        = lazy(() => import('./components/Layout'));
 const Login         = lazy(() => import('./pages/Login'));
@@ -25,6 +26,7 @@ const Communities   = lazy(() => import('./pages/Communities'));
 const Reseau        = lazy(() => import('./pages/Reseau'));
 const Tasks         = lazy(() => import('./pages/Tasks'));
 const Favorites     = lazy(() => import('./pages/Favorites'));
+const AdminPanel    = lazy(() => import('./pages/AdminPanel'));
 
 // ── Loading screen ────────────────────────────────────────────────────────
 function PageLoader() {
@@ -114,6 +116,7 @@ export default function App() {
             <Route path="/messages"        element={<PrivateRoute><Messages /></PrivateRoute>} />
             <Route path="/messages/:id"    element={<PrivateRoute><Messages /></PrivateRoute>} />
             <Route path="/notifications"   element={<PrivateRoute><Notifications /></PrivateRoute>} />
+             <Route path="/admin" element={<PrivateRoute><AdminPanel /></PrivateRoute>} />
 
             {/* Fallback */}
             <Route path="*" element={<Navigate to="/" replace />} />

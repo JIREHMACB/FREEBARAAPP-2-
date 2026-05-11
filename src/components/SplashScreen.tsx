@@ -38,7 +38,7 @@ export default function SplashScreen({ onFinish }: Props) {
         onError={(e) => {
           const img = e.target as HTMLImageElement;
           if (!img.src.includes('Logo_FreeBaraW1')) {
-            img.src = '/Logo_FreeBaraW1__2_.png';
+            img.src = '/dist/assets/Public/logo (2).png';
           }
         }}
       />

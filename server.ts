@@ -127,11 +127,44 @@ db.exec(`
     referralCode TEXT UNIQUE,
     referredBy INTEGER,
     balance REAL DEFAULT 0,
+    role TEXT DEFAULT 'user',
+    status TEXT DEFAULT 'active',
+    bannedReason TEXT,
     createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
   );
 `);
 
-// Add default user if none
+// Migrations sécurisées pour les nouvelles colonnes admin
+['role TEXT DEFAULT \'user\'', 'status TEXT DEFAULT \'active\'', 'bannedReason TEXT'].forEach(col => {
+  const colName = col.split(' ')[0];
+  try { db.prepare(`ALTER TABLE users ADD COLUMN ${col}`).run(); } catch {}
+});
+
+// Table des signalements
+db.exec(`
+  CREATE TABLE IF NOT EXISTS reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reporterId INTEGER NOT NULL,
+    targetType TEXT NOT NULL,
+    targetId INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    status TEXT DEFAULT 'pending',
+    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (reporterId) REFERENCES users(id)
+  );
+`);
+
+// Table logs admin
+db.exec(`
+  CREATE TABLE IF NOT EXISTS admin_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    adminId INTEGER NOT NULL,
+    action TEXT NOT NULL,
+    targetId INTEGER,
+    details TEXT,
+    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+`);
 const userCount = db.prepare('SELECT COUNT(*) as count FROM users').get() as { count: number };
 if (userCount.count === 0) {
   db.prepare("INSERT INTO users (email, name) VALUES ('admin@freebara.com', 'Admin')").run();
@@ -3964,6 +3997,123 @@ async function startServer() {
 
     const stmt = db.prepare('INSERT INTO reviews (userId, targetType, targetId, rating, comment) VALUES (?, ?, ?, ?, ?)');
     stmt.run(req.userId, targetType, targetId, rating, comment);
+    res.json({ success: true });
+  });
+
+  // ============================================================
+  // 🔐 ADMIN ROUTES
+  // ============================================================
+
+  // Middleware admin
+  const requireAdmin = (req: any, res: any, next: any) => {
+    const user = db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId) as any;
+    if (!user || user.role !== 'admin') {
+      return res.status(403).json({ error: 'Accès réservé aux administrateurs' });
+    }
+    next();
+  };
+
+  // Middleware bloqué si banni (ajouté dans authenticate)
+  // On vérifie le statut à chaque requête sensible
+
+  // GET /api/admin/stats — tableau de bord
+  app.get('/api/admin/stats', authenticate, requireAdmin, (req: any, res) => {
+    const totalUsers = (db.prepare('SELECT COUNT(*) as c FROM users').get() as any).c;
+    const activeUsers = (db.prepare("SELECT COUNT(*) as c FROM users WHERE status = 'active'").get() as any).c;
+    const bannedUsers = (db.prepare("SELECT COUNT(*) as c FROM users WHERE status = 'banned'").get() as any).c;
+    const totalPosts = (db.prepare('SELECT COUNT(*) as c FROM posts').get() as any).c;
+    const pendingReports = (db.prepare("SELECT COUNT(*) as c FROM reports WHERE status = 'pending'").get() as any).c;
+    const newUsersToday = (db.prepare("SELECT COUNT(*) as c FROM users WHERE date(createdAt) = date('now')").get() as any).c;
+    const newUsersWeek = (db.prepare("SELECT COUNT(*) as c FROM users WHERE createdAt >= datetime('now', '-7 days')").get() as any).c;
+    res.json({ totalUsers, activeUsers, bannedUsers, totalPosts, pendingReports, newUsersToday, newUsersWeek });
+  });
+
+  // GET /api/admin/users — liste tous les utilisateurs
+  app.get('/api/admin/users', authenticate, requireAdmin, (req: any, res) => {
+    const { search, status, role } = req.query as any;
+    let query = 'SELECT id, email, name, country, role, status, badge, bannedReason, createdAt FROM users WHERE 1=1';
+    const params: any[] = [];
+    if (search) { query += ' AND (name LIKE ? OR email LIKE ?)'; params.push(`%${search}%`, `%${search}%`); }
+    if (status) { query += ' AND status = ?'; params.push(status); }
+    if (role) { query += ' AND role = ?'; params.push(role); }
+    query += ' ORDER BY createdAt DESC';
+    const users = db.prepare(query).all(...params);
+    res.json(users);
+  });
+
+  // PUT /api/admin/users/:id/role — changer le rôle
+  app.put('/api/admin/users/:id/role', authenticate, requireAdmin, (req: any, res) => {
+    const { role } = req.body;
+    if (!['user', 'moderator', 'admin'].includes(role)) return res.status(400).json({ error: 'Rôle invalide' });
+    db.prepare('UPDATE users SET role = ? WHERE id = ?').run(role, req.params.id);
+    db.prepare('INSERT INTO admin_logs (adminId, action, targetId, details) VALUES (?, ?, ?, ?)').run(req.userId, 'change_role', req.params.id, `New role: ${role}`);
+    res.json({ success: true });
+  });
+
+  // PUT /api/admin/users/:id/ban — bannir un utilisateur
+  app.put('/api/admin/users/:id/ban', authenticate, requireAdmin, (req: any, res) => {
+    const { reason } = req.body;
+    if (Number(req.params.id) === req.userId) return res.status(400).json({ error: 'Impossible de se bannir soi-même' });
+    db.prepare("UPDATE users SET status = 'banned', bannedReason = ? WHERE id = ?").run(reason || 'Violation des règles', req.params.id);
+    db.prepare('INSERT INTO admin_logs (adminId, action, targetId, details) VALUES (?, ?, ?, ?)').run(req.userId, 'ban_user', req.params.id, reason);
+    res.json({ success: true });
+  });
+
+  // PUT /api/admin/users/:id/unban — débannir
+  app.put('/api/admin/users/:id/unban', authenticate, requireAdmin, (req: any, res) => {
+    db.prepare("UPDATE users SET status = 'active', bannedReason = NULL WHERE id = ?").run(req.params.id);
+    db.prepare('INSERT INTO admin_logs (adminId, action, targetId, details) VALUES (?, ?, ?, ?)').run(req.userId, 'unban_user', req.params.id, null);
+    res.json({ success: true });
+  });
+
+  // DELETE /api/admin/users/:id — supprimer un utilisateur
+  app.delete('/api/admin/users/:id', authenticate, requireAdmin, (req: any, res) => {
+    if (Number(req.params.id) === req.userId) return res.status(400).json({ error: 'Impossible de se supprimer soi-même' });
+    db.prepare('DELETE FROM users WHERE id = ?').run(req.params.id);
+    db.prepare('INSERT INTO admin_logs (adminId, action, targetId, details) VALUES (?, ?, ?, ?)').run(req.userId, 'delete_user', req.params.id, null);
+    res.json({ success: true });
+  });
+
+  // GET /api/admin/reports — voir les signalements
+  app.get('/api/admin/reports', authenticate, requireAdmin, (req: any, res) => {
+    const reports = db.prepare(`
+      SELECT r.*, u.name as reporterName, u.email as reporterEmail
+      FROM reports r
+      JOIN users u ON r.reporterId = u.id
+      ORDER BY r.createdAt DESC
+    `).all();
+    res.json(reports);
+  });
+
+  // PUT /api/admin/reports/:id — traiter un signalement
+  app.put('/api/admin/reports/:id', authenticate, requireAdmin, (req: any, res) => {
+    const { status } = req.body;
+    db.prepare('UPDATE reports SET status = ? WHERE id = ?').run(status, req.params.id);
+    res.json({ success: true });
+  });
+
+  // DELETE /api/admin/posts/:id — supprimer un post (modération)
+  app.delete('/api/admin/posts/:id', authenticate, requireAdmin, (req: any, res) => {
+    db.prepare('DELETE FROM posts WHERE id = ?').run(req.params.id);
+    db.prepare('INSERT INTO admin_logs (adminId, action, targetId, details) VALUES (?, ?, ?, ?)').run(req.userId, 'delete_post', req.params.id, null);
+    res.json({ success: true });
+  });
+
+  // GET /api/admin/logs — historique des actions admin
+  app.get('/api/admin/logs', authenticate, requireAdmin, (req: any, res) => {
+    const logs = db.prepare(`
+      SELECT al.*, u.name as adminName FROM admin_logs al
+      JOIN users u ON al.adminId = u.id
+      ORDER BY al.createdAt DESC LIMIT 100
+    `).all();
+    res.json(logs);
+  });
+
+  // POST /api/reports — signaler un contenu (utilisateur normal)
+  app.post('/api/reports', authenticate, (req: any, res) => {
+    const { targetType, targetId, reason } = req.body;
+    if (!targetType || !targetId || !reason) return res.status(400).json({ error: 'Données manquantes' });
+    db.prepare('INSERT INTO reports (reporterId, targetType, targetId, reason) VALUES (?, ?, ?, ?)').run(req.userId, targetType, targetId, reason);
     res.json({ success: true });
   });
 
