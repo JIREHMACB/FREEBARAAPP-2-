@@ -3,20 +3,16 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
-"scripts": {
-  "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\"",
-  "dev:backend": "tsx server.ts",
-  "dev:frontend": "vite",
-
-  "build:frontend": "vite build",
-"build:backend": "tsc -p tsconfig.server.json",
-
-  "build": "npm run build:frontend && npm run build:backend",
-
-  "start": "node dist/server.js",
-
-  "preview": "vite preview"
-},
+  "scripts": {
+    "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\"",
+    "dev:backend": "tsx server.ts",
+    "dev:frontend": "vite",
+    "build:frontend": "vite build",
+    "build:backend": "tsc -p tsconfig.server.json",
+    "build": "npm run build:frontend && npm run build:backend",
+    "start": "node dist/server.js",
+    "preview": "vite preview"
+  },
   "dependencies": {
     "@google/genai": "^1.29.0",
     "@tailwindcss/vite": "^4.1.14",
@@ -41,6 +37,7 @@
     "lucide-react": "^0.546.0",
     "motion": "^12.23.24",
     "nodemailer": "^8.0.7",
+    "pg": "^8.20.0",
     "react": "^19.2.5",
     "react-dom": "^19.2.5",
     "react-easy-crop": "^5.5.7",
@@ -61,6 +58,7 @@
     "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^22.14.0",
     "@types/nodemailer": "^8.0.0",
+    "@types/pg": "^8.20.0",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
     "autoprefixer": "^10.4.21",

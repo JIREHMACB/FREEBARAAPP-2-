@@ -1,4152 +1,1315 @@
-console.log('🚀 SERVER FILE CHARGÉ');
+// ════════════════════════════════════════════════════════════════════════════
+// 🚀 FREEBARA SERVER — PostgreSQL | Production Ready
+// ════════════════════════════════════════════════════════════════════════════
 
-import express from 'express';
-import { createServer } from 'http';
-import { Server } from 'socket.io';
-import cors from 'cors';
-import Database from 'better-sqlite3';
-import crypto from 'crypto';
+console.log('🚀 FreeBara Server démarrage...');
+
+// ─── IMPORTS ─────────────────────────────────────────────────────────────────
+import express        from 'express';
+import { createServer }  from 'http';
+import { Server }        from 'socket.io';
+import cors              from 'cors';
 import { fileURLToPath } from 'url';
-import { mkdirSync } from 'fs';
-import dotenv from 'dotenv';
-import * as path from 'path';
-import jwt from 'jsonwebtoken';
-import nodemailer from 'nodemailer';
+import dotenv            from 'dotenv';
+import * as path         from 'path';
+import jwt               from 'jsonwebtoken';
+import nodemailer        from 'nodemailer';
+import pkg               from 'pg';
+const { Pool } = pkg;
 
 dotenv.config();
-
-// --- Setup ---
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(64).toString('hex');
 
- const isValidEmail = (email: string): boolean => {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+// ─── CONFIGURATION ───────────────────────────────────────────────────────────
+if (!process.env.JWT_SECRET)    console.warn('⚠️  JWT_SECRET manquant → ajouter dans Render > Environment');
+if (!process.env.DATABASE_URL)  { console.error('❌ DATABASE_URL manquant!'); process.exit(1); }
+if (!process.env.SMTP_USER)     console.warn('⚠️  SMTP non configuré → codes OTP affichés en console');
+if (!process.env.CLOUDINARY_URL) console.warn('⚠️  CLOUDINARY_URL manquant → placeholders utilisés');
+
+const JWT_SECRET = process.env.JWT_SECRET || 'freebara-change-this-in-render-env';
+const PORT       = parseInt(process.env.PORT || '3000');
+const IS_DEV     = process.env.NODE_ENV !== 'production';
+
+// ─── POSTGRESQL ───────────────────────────────────────────────────────────────
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL!.includes('localhost') ? false : { rejectUnauthorized: false },
+  max: 20,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000,
+});
+
+// Helper raccourci
+const db = {
+  one: async (sql: string, p?: any[]) => { const r = await pool.query(sql, p); return r.rows[0] || null; },
+  all: async (sql: string, p?: any[]) => { const r = await pool.query(sql, p); return r.rows; },
+  run: (sql: string, p?: any[]) => pool.query(sql, p),
 };
 
-const sendOTPEmail = async (email: string, code: string): Promise<void> => {
+// ─── LOGS ─────────────────────────────────────────────────────────────────────
+const logAction = async (level: string, action: string, userId?: number, ip?: string, details?: string) => {
+  try {
+    await pool.query(
+      `INSERT INTO db_logs (level, action, "userId", ip, details) VALUES ($1,$2,$3,$4,$5)`,
+      [level, action, userId ?? null, ip ?? null, details ?? null]
+    );
+  } catch {}
+};
+
+// ─── ERROR TRACKER (monitoring interne) ──────────────────────────────────────
+const errorTracker = {
+  errors: [] as { time: string; msg: string; context?: string }[],
+  capture(err: any, context?: string) {
+    const entry = { time: new Date().toISOString(), msg: String(err?.message ?? err), context };
+    this.errors.unshift(entry);
+    if (this.errors.length > 200) this.errors.pop();
+    console.error(`[ERROR]${context ? ' ' + context : ''} ${entry.msg}`);
+    logAction('ERROR', context ?? 'error', undefined, undefined, entry.msg).catch(() => {});
+  },
+};
+process.on('uncaughtException',  (e) => errorTracker.capture(e, 'uncaughtException'));
+process.on('unhandledRejection', (e) => errorTracker.capture(e, 'unhandledRejection'));
+
+// ─── CLOUDINARY (upload images) ───────────────────────────────────────────────
+const uploadToCloudinary = async (base64Data: string, folder = 'freebara'): Promise<string> => {
+  if (!process.env.CLOUDINARY_URL) {
+    return `https://picsum.photos/seed/${Date.now()}/400/400`; // placeholder dev
+  }
+  const url      = new URL(process.env.CLOUDINARY_URL);
+  const apiKey   = url.username;
+  const apiSecret = url.password;
+  const cloudName = url.hostname;
+  const auth     = Buffer.from(`${apiKey}:${apiSecret}`).toString('base64');
+  const body     = new URLSearchParams({ file: base64Data, upload_preset: 'freebara', folder });
+  const resp     = await fetch(`https://api.cloudinary.com/v1_1/${cloudName}/image/upload`, {
+    method: 'POST',
+    headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body,
+  });
+  const data = await resp.json() as any;
+  if (!data.secure_url) throw new Error('Upload Cloudinary échoué: ' + JSON.stringify(data));
+  return data.secure_url;
+};
+
+// ─── EMAIL (OTP) ──────────────────────────────────────────────────────────────
+const isValidEmail = (e: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
+
+const sendOTPEmail = async (email: string, code: string) => {
   if (!process.env.SMTP_USER || !process.env.SMTP_PASS) {
-    console.log(`📩 [DEV MODE] OTP pour ${email}: ${code}`);
+    console.log(`\n📧 [DEV MODE] OTP pour ${email} : ${code}\n`);
     return;
   }
-   const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST || 'smtp.gmail.com',
-  port: parseInt(process.env.SMTP_PORT || '587'),
-  secure: false,
-  auth: {
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS,
-  },
-});
-
-  try {
-    await transporter.sendMail({
-      from: process.env.SMTP_FROM || `"Freebara" <${process.env.SMTP_USER}>`,
-      to: email,
-      subject: 'Votre code de connexion Freebara',
-      html: `
-        <!DOCTYPE html>
-        <html>
-          <body style="font-family: Arial, sans-serif; background: #f4f4f4; margin: 0; padding: 0;">
-            <div style="max-width: 480px; margin: 40px auto; background: #fff; border-radius: 12px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.1);">
-              
-              <div style="background: #4F46E5; padding: 32px; text-align: center;">
-                <h1 style="color: #fff; margin: 0; font-size: 28px;">Freebara</h1>
-              </div>
-
-              <div style="padding: 32px; text-align: center;">
-                <h2 style="color: #1a1a1a; margin-bottom: 8px;">Votre code de vérification</h2>
-                <p style="color: #555; margin-bottom: 24px;">
-                  Utilisez ce code pour vous connecter. Il expire dans <strong>10 minutes</strong>.
-                </p>
-
-                <div style="background: #f0f0ff; border-radius: 8px; padding: 24px; display: inline-block; margin-bottom: 24px;">
-                  <span style="font-size: 40px; font-weight: bold; letter-spacing: 12px; color: #4F46E5;">
-                    ${code}
-                  </span>
-                </div>
-
-                <p style="color: #999; font-size: 13px;">
-                  Si vous n'avez pas demandé ce code, ignorez cet email.
-                </p>
-              </div>
-
-              <div style="background: #f9f9f9; padding: 16px; text-align: center;">
-                <p style="color: #bbb; font-size: 12px; margin: 0;">
-                  © ${new Date().getFullYear()} Freebara. Tous droits réservés.
-                </p>
-              </div>
-
-            </div>
-          </body>
-        </html>
-      `,
-    });
-
-    console.log(`📩 EMAIL OTP ENVOYÉ À : ${email}`);
-
-  } catch (err) {
-    console.error("❌ ERREUR ENVOI EMAIL OTP :", err);
-
-    // IMPORTANT: ne pas crash le serveur
-    throw new Error("Email OTP failed");
-  }
+  const transporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST ?? 'smtp.gmail.com',
+    port: parseInt(process.env.SMTP_PORT ?? '587'),
+    secure: false,
+    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+  });
+  await transporter.sendMail({
+    from: `"FreeBara" <${process.env.SMTP_USER}>`,
+    to: email,
+    subject: 'Votre code de connexion FreeBara',
+    html: `
+      <div style="font-family:sans-serif;max-width:480px;margin:auto;padding:32px;background:#f8fafc;border-radius:16px;">
+        <img src="https://www.freebara.com/logo__2_.png" alt="FreeBara" style="height:40px;margin-bottom:24px;" />
+        <h2 style="color:#155be3;margin:0 0 8px;">Code de vérification</h2>
+        <p style="color:#64748b;margin:0 0 24px;">Utilisez ce code pour accéder à FreeBara :</p>
+        <div style="background:#fff;border:2px solid #e2e8f0;border-radius:12px;padding:24px;text-align:center;font-size:36px;font-weight:900;letter-spacing:10px;color:#0f172a;">${code}</div>
+        <p style="color:#94a3b8;font-size:12px;margin-top:20px;">⏱ Expire dans 10 minutes. Ne partagez jamais ce code.</p>
+      </div>
+    `,
+  });
 };
 
-// --- Database ---
-// Crée le répertoire data/ s'il n'existe pas (nécessaire sur Render et autres environnements cloud)
-const DB_PATH = process.env.DB_PATH || '/data/database.db';
+// ════════════════════════════════════════════════════════════════════════════
+// 🗄️  INITIALISATION BASE DE DONNÉES
+// ════════════════════════════════════════════════════════════════════════════
+async function initDB() {
+  // ── Tables utilisateurs & auth ──
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id                      SERIAL PRIMARY KEY,
+      email                   TEXT UNIQUE NOT NULL,
+      name                    TEXT,
+      profession              TEXT,
+      bio                     TEXT,
+      company                 TEXT,
+      "avatarUrl"             TEXT,
+      "coverUrl"              TEXT,
+      phone                   TEXT,
+      location                TEXT,
+      website                 TEXT,
+      church                  TEXT,
+      groups                  TEXT,
+      interests               TEXT,
+      skills                  TEXT,
+      marketing               TEXT,
+      goals                   TEXT,
+      badge                   TEXT DEFAULT 'Invité',
+      "referralCode"          TEXT UNIQUE,
+      "referredBy"            INTEGER,
+      balance                 REAL DEFAULT 0,
+      role                    TEXT DEFAULT 'user',
+      status                  TEXT DEFAULT 'active',
+      "bannedReason"          TEXT,
+      "notificationPreferences" TEXT,
+      visibility              TEXT DEFAULT 'public',
+      country                 TEXT,
+      "createdAt"             TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS otps (
+      email       TEXT PRIMARY KEY,
+      code        TEXT NOT NULL,
+      "expiresAt" TIMESTAMP NOT NULL
+    );
+  `);
 
-console.log("DB PATH =", DB_PATH);
+  // ── Tables réseau & social ──
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS follows (
+      "followerId"  INTEGER NOT NULL,
+      "followingId" INTEGER NOT NULL,
+      PRIMARY KEY ("followerId","followingId")
+    );
+    CREATE TABLE IF NOT EXISTS connection_requests (
+      id           SERIAL PRIMARY KEY,
+      "senderId"   INTEGER NOT NULL,
+      "receiverId" INTEGER NOT NULL,
+      status       TEXT DEFAULT 'pending',
+      "createdAt"  TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS notifications (
+      id          SERIAL PRIMARY KEY,
+      "userId"    INTEGER NOT NULL,
+      type        TEXT NOT NULL,
+      content     TEXT NOT NULL,
+      "relatedId" INTEGER,
+      read        BOOLEAN DEFAULT FALSE,
+      "createdAt" TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS certifications (
+      id              SERIAL PRIMARY KEY,
+      "userId"        INTEGER NOT NULL,
+      name            TEXT NOT NULL,
+      organization    TEXT NOT NULL,
+      "dateObtained"  TEXT NOT NULL,
+      "createdAt"     TIMESTAMP DEFAULT NOW()
+    );
+  `);
 
-const DB_DIR = path.dirname(DB_PATH);
-mkdirSync(DB_DIR, { recursive: true });
+  // ── Tables posts & interactions ──
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS posts (
+      id          SERIAL PRIMARY KEY,
+      "authorId"  INTEGER NOT NULL,
+      "cellId"    INTEGER,
+      content     TEXT NOT NULL,
+      category    TEXT DEFAULT 'Tous',
+      "mediaUrls" TEXT,
+      views       INTEGER DEFAULT 0,
+      "createdAt" TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS post_likes (
+      "postId"    INTEGER NOT NULL,
+      "userId"    INTEGER NOT NULL,
+      type        TEXT DEFAULT 'like',
+      "createdAt" TIMESTAMP DEFAULT NOW(),
+      PRIMARY KEY ("postId","userId")
+    );
+    CREATE TABLE IF NOT EXISTS post_comments (
+      id          SERIAL PRIMARY KEY,
+      "postId"    INTEGER NOT NULL,
+      "userId"    INTEGER NOT NULL,
+      content     TEXT NOT NULL,
+      "createdAt" TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS post_boosts (
+      "postId"    INTEGER PRIMARY KEY,
+      "userId"    INTEGER NOT NULL,
+      amount      REAL NOT NULL,
+      "createdAt" TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS stories (
+      id          SERIAL PRIMARY KEY,
+      "userId"    INTEGER NOT NULL,
+      "mediaUrl"  TEXT NOT NULL,
+      "mediaType" TEXT DEFAULT 'image',
+      "createdAt" TIMESTAMP DEFAULT NOW(),
+      "expiresAt" TIMESTAMP NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS story_views (
+      "storyId"  INTEGER NOT NULL,
+      "userId"   INTEGER NOT NULL,
+      "viewedAt" TIMESTAMP DEFAULT NOW(),
+      PRIMARY KEY ("storyId","userId")
+    );
+    CREATE TABLE IF NOT EXISTS story_reactions (
+      id          SERIAL PRIMARY KEY,
+      "storyId"   INTEGER NOT NULL,
+      "userId"    INTEGER NOT NULL,
+      emoji       TEXT NOT NULL,
+      "createdAt" TIMESTAMP DEFAULT NOW()
+    );
+  `);
 
-const db = new Database(DB_PATH);
+  // ── Tables événements ──
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS events (
+      id              SERIAL PRIMARY KEY,
+      title           TEXT NOT NULL,
+      description     TEXT NOT NULL,
+      "imageUrl"      TEXT,
+      country         TEXT NOT NULL,
+      city            TEXT NOT NULL,
+      location        TEXT NOT NULL,
+      latitude        REAL,
+      longitude       REAL,
+      "startDate"     TIMESTAMP NOT NULL,
+      "endDate"       TIMESTAMP NOT NULL,
+      category        TEXT NOT NULL,
+      "communityId"   INTEGER,
+      "creatorId"     INTEGER NOT NULL,
+      price           REAL DEFAULT 0,
+      "visualUrl"     TEXT,
+      "shares_count"  INTEGER DEFAULT 0,
+      "createdAt"     TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS event_participants (
+      "eventId"   INTEGER NOT NULL,
+      "userId"    INTEGER NOT NULL,
+      PRIMARY KEY ("eventId","userId")
+    );
+    CREATE TABLE IF NOT EXISTS event_likes (
+      "eventId"   INTEGER NOT NULL,
+      "userId"    INTEGER NOT NULL,
+      "createdAt" TIMESTAMP DEFAULT NOW(),
+      PRIMARY KEY ("eventId","userId")
+    );
+    CREATE TABLE IF NOT EXISTS event_comments (
+      id          SERIAL PRIMARY KEY,
+      "eventId"   INTEGER,
+      "userId"    INTEGER,
+      content     TEXT NOT NULL,
+      "createdAt" TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS favorite_events (
+      "userId"    INTEGER NOT NULL,
+      "eventId"   INTEGER NOT NULL,
+      "createdAt" TIMESTAMP DEFAULT NOW(),
+      PRIMARY KEY ("userId","eventId")
+    );
+  `);
 
-// Create Tables
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    email TEXT UNIQUE NOT NULL,
-    name TEXT,
-    age INTEGER,
-    profession TEXT,
-    company TEXT,
-    maritalStatus TEXT,
-    whatsapp TEXT,
-    avatarUrl TEXT,
-    coverUrl TEXT,
-    country TEXT,
-    church TEXT,
-    groups TEXT,
-    interests TEXT,
-    skills TEXT,
-    marketing TEXT,
-    goals TEXT,
-    badge TEXT DEFAULT 'Invité',
-    referralCode TEXT UNIQUE,
-    referredBy INTEGER,
-    balance REAL DEFAULT 0,
-    role TEXT DEFAULT 'user',
-    status TEXT DEFAULT 'active',
-    bannedReason TEXT,
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-`);
+  // ── Tables business & entreprises ──
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS companies (
+      id           SERIAL PRIMARY KEY,
+      "ownerId"    INTEGER NOT NULL,
+      name         TEXT NOT NULL,
+      sector       TEXT,
+      description  TEXT,
+      address      TEXT,
+      whatsapp     TEXT,
+      facebook     TEXT,
+      twitter      TEXT,
+      linkedin     TEXT,
+      "logoUrl"    TEXT,
+      "coverUrl"   TEXT,
+      "isShop"     INTEGER DEFAULT 0,
+      specialty    TEXT,
+      categories   TEXT,
+      country      TEXT,
+      city         TEXT,
+      latitude     REAL,
+      longitude    REAL,
+      "managerId"  INTEGER,
+      "createdAt"  TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS company_catalog (
+      id             SERIAL PRIMARY KEY,
+      "companyId"    INTEGER NOT NULL,
+      name           TEXT NOT NULL,
+      description    TEXT,
+      price          REAL,
+      "imageUrl"     TEXT,
+      category       TEXT,
+      tag            TEXT,
+      "tagValue"     TEXT,
+      "shares_count" INTEGER DEFAULT 0,
+      "createdAt"    TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS stocks (
+      "productId"   INTEGER PRIMARY KEY,
+      quantity      INTEGER DEFAULT 0,
+      "minQuantity" INTEGER DEFAULT 5,
+      "costPrice"   REAL DEFAULT 0,
+      "lastUpdated" TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS stock_movements (
+      id          SERIAL PRIMARY KEY,
+      "productId" INTEGER NOT NULL,
+      quantity    INTEGER NOT NULL,
+      type        TEXT NOT NULL,
+      reason      TEXT,
+      "createdAt" TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS shop_orders (
+      id                 SERIAL PRIMARY KEY,
+      "companyId"        INTEGER NOT NULL,
+      "customerId"       INTEGER NOT NULL,
+      "productId"        INTEGER NOT NULL,
+      quantity           INTEGER DEFAULT 1,
+      "totalPrice"       REAL NOT NULL,
+      status             TEXT DEFAULT 'pending',
+      "customerName"     TEXT,
+      "customerWhatsapp" TEXT,
+      "createdAt"        TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS favorite_companies (
+      "userId"    INTEGER NOT NULL,
+      "companyId" INTEGER NOT NULL,
+      "createdAt" TIMESTAMP DEFAULT NOW(),
+      PRIMARY KEY ("userId","companyId")
+    );
+    CREATE TABLE IF NOT EXISTS favorite_products (
+      "userId"    INTEGER NOT NULL,
+      "productId" INTEGER NOT NULL,
+      "createdAt" TIMESTAMP DEFAULT NOW(),
+      PRIMARY KEY ("userId","productId")
+    );
+    CREATE TABLE IF NOT EXISTS transactions (
+      id          SERIAL PRIMARY KEY,
+      "userId"    INTEGER NOT NULL,
+      date        TEXT NOT NULL,
+      description TEXT NOT NULL,
+      category    TEXT NOT NULL,
+      amount      REAL NOT NULL,
+      type        TEXT NOT NULL,
+      "createdAt" TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS funding_requests (
+      id             SERIAL PRIMARY KEY,
+      "userId"       INTEGER NOT NULL,
+      "companyId"    INTEGER NOT NULL,
+      "institutionId" INTEGER,
+      "fundingType"  TEXT NOT NULL,
+      amount         REAL,
+      reason         TEXT,
+      "strategicData" TEXT,
+      status         TEXT DEFAULT 'En attente',
+      "createdAt"    TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS credit_institutions (
+      id               SERIAL PRIMARY KEY,
+      "creatorId"      INTEGER NOT NULL,
+      name             TEXT NOT NULL,
+      type             TEXT NOT NULL,
+      description      TEXT,
+      terms            TEXT,
+      eligibility      TEXT,
+      targets          TEXT,
+      "processingTime" TEXT,
+      "logoUrl"        TEXT,
+      "coverUrl"       TEXT,
+      address          TEXT,
+      city             TEXT,
+      country          TEXT,
+      "isHabilitated"  INTEGER DEFAULT 0,
+      "createdAt"      TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS ads (
+      id          SERIAL PRIMARY KEY,
+      "companyId" INTEGER NOT NULL,
+      goal        TEXT NOT NULL,
+      content     TEXT NOT NULL,
+      targeting   TEXT NOT NULL,
+      budget      REAL NOT NULL,
+      duration    INTEGER NOT NULL,
+      status      TEXT DEFAULT 'pending',
+      "createdAt" TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS reviews (
+      id           SERIAL PRIMARY KEY,
+      "userId"     INTEGER NOT NULL,
+      "targetType" TEXT NOT NULL,
+      "targetId"   INTEGER NOT NULL,
+      rating       INTEGER NOT NULL,
+      comment      TEXT,
+      "createdAt"  TIMESTAMP DEFAULT NOW()
+    );
+  `);
 
-// Migrations sécurisées pour les nouvelles colonnes admin
-['role TEXT DEFAULT \'user\'', 'status TEXT DEFAULT \'active\'', 'bannedReason TEXT'].forEach(col => {
-  const colName = col.split(' ')[0];
-  try { db.prepare(`ALTER TABLE users ADD COLUMN ${col}`).run(); } catch {}
-});
+  // ── Tables messages & chat ──
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS messages (
+      id           SERIAL PRIMARY KEY,
+      "senderId"   INTEGER NOT NULL,
+      "receiverId" INTEGER,
+      "roomId"     INTEGER,
+      content      TEXT NOT NULL,
+      "fileUrl"    TEXT,
+      "fileType"   TEXT,
+      "fileName"   TEXT,
+      read         INTEGER DEFAULT 0,
+      "isPinned"   BOOLEAN DEFAULT FALSE,
+      "replyToId"  INTEGER,
+      "createdAt"  TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS message_reactions (
+      id          SERIAL PRIMARY KEY,
+      "messageId" INTEGER NOT NULL,
+      "userId"    INTEGER NOT NULL,
+      emoji       TEXT NOT NULL,
+      "createdAt" TIMESTAMP DEFAULT NOW(),
+      UNIQUE("messageId","userId")
+    );
+    CREATE TABLE IF NOT EXISTS chat_rooms (
+      id          SERIAL PRIMARY KEY,
+      name        TEXT,
+      type        TEXT DEFAULT 'direct',
+      "avatarUrl" TEXT,
+      "creatorId" INTEGER,
+      "createdAt" TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS chat_room_members (
+      "roomId"   INTEGER NOT NULL,
+      "userId"   INTEGER NOT NULL,
+      "joinedAt" TIMESTAMP DEFAULT NOW(),
+      PRIMARY KEY ("roomId","userId")
+    );
+  `);
 
-// Table des signalements
-db.exec(`
-  CREATE TABLE IF NOT EXISTS reports (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    reporterId INTEGER NOT NULL,
-    targetType TEXT NOT NULL,
-    targetId INTEGER NOT NULL,
-    reason TEXT NOT NULL,
-    status TEXT DEFAULT 'pending',
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (reporterId) REFERENCES users(id)
-  );
-`);
+  // ── Tables communautés & cellules ──
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS cells (
+      id          SERIAL PRIMARY KEY,
+      name        TEXT NOT NULL,
+      description TEXT,
+      "sponsorId" INTEGER,
+      "creatorId" INTEGER NOT NULL,
+      "coverUrl"  TEXT,
+      latitude    REAL,
+      longitude   REAL,
+      city        TEXT,
+      country     TEXT,
+      "createdAt" TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS cell_members (
+      "cellId"   INTEGER NOT NULL,
+      "userId"   INTEGER NOT NULL,
+      role       TEXT DEFAULT 'member',
+      "joinedAt" TIMESTAMP DEFAULT NOW(),
+      PRIMARY KEY ("cellId","userId")
+    );
+    CREATE TABLE IF NOT EXISTS communities (
+      id          SERIAL PRIMARY KEY,
+      name        TEXT NOT NULL,
+      description TEXT,
+      "createdAt" TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS community_members (
+      "communityId" INTEGER NOT NULL,
+      "userId"      INTEGER NOT NULL,
+      role          TEXT DEFAULT 'member',
+      PRIMARY KEY ("communityId","userId")
+    );
+    CREATE TABLE IF NOT EXISTS churches (
+      id          SERIAL PRIMARY KEY,
+      name        TEXT NOT NULL,
+      pastor      TEXT,
+      hq          TEXT,
+      description TEXT,
+      programs    TEXT,
+      "coverUrl"  TEXT,
+      latitude    REAL,
+      longitude   REAL,
+      city        TEXT,
+      country     TEXT,
+      "creatorId" INTEGER NOT NULL,
+      "createdAt" TIMESTAMP DEFAULT NOW()
+    );
+  `);
 
-// Table logs admin
-db.exec(`
-  CREATE TABLE IF NOT EXISTS admin_logs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    adminId INTEGER NOT NULL,
-    action TEXT NOT NULL,
-    targetId INTEGER,
-    details TEXT,
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-`);
-const userCount = db.prepare('SELECT COUNT(*) as count FROM users').get() as { count: number };
-if (userCount.count === 0) {
-  db.prepare("INSERT INTO users (email, name) VALUES ('admin@freebara.com', 'Admin')").run();
+  // ── Tables formation (Pannels) ──
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS pannels (
+      id          SERIAL PRIMARY KEY,
+      name        TEXT NOT NULL,
+      description TEXT,
+      theme       TEXT,
+      "ownerId"   INTEGER NOT NULL,
+      "avatarUrl" TEXT,
+      "logoUrl"   TEXT,
+      "coverUrl"  TEXT,
+      "createdAt" TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS pannel_members (
+      "pannelId" INTEGER NOT NULL,
+      "userId"   INTEGER NOT NULL,
+      role       TEXT DEFAULT 'member',
+      "joinedAt" TIMESTAMP DEFAULT NOW(),
+      PRIMARY KEY ("pannelId","userId")
+    );
+    CREATE TABLE IF NOT EXISTS pannel_courses (
+      id          SERIAL PRIMARY KEY,
+      "pannelId"  INTEGER NOT NULL,
+      title       TEXT NOT NULL,
+      description TEXT,
+      duration    TEXT,
+      "fileUrl"   TEXT NOT NULL,
+      "fileType"  TEXT NOT NULL,
+      views       INTEGER DEFAULT 0,
+      "createdAt" TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS pannel_progress (
+      "pannelId"    INTEGER NOT NULL,
+      "userId"      INTEGER NOT NULL,
+      "courseId"    INTEGER NOT NULL,
+      status        TEXT DEFAULT 'non_commence',
+      position      REAL DEFAULT 0,
+      notes         TEXT,
+      "stickyNotes" TEXT,
+      "updatedAt"   TIMESTAMP DEFAULT NOW(),
+      PRIMARY KEY ("pannelId","userId","courseId")
+    );
+    CREATE TABLE IF NOT EXISTS pannel_evaluations (
+      id            SERIAL PRIMARY KEY,
+      "pannelId"    INTEGER NOT NULL,
+      "userId"      INTEGER NOT NULL,
+      "courseTitle" TEXT,
+      grade         INTEGER,
+      feedback      TEXT,
+      "createdAt"   TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS pannel_badges (
+      id          SERIAL PRIMARY KEY,
+      "pannelId"  INTEGER NOT NULL,
+      "userId"    INTEGER NOT NULL,
+      "badgeType" TEXT NOT NULL,
+      "unlockedAt" TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS pannel_forum (
+      id          SERIAL PRIMARY KEY,
+      "pannelId"  INTEGER NOT NULL,
+      "userId"    INTEGER NOT NULL,
+      content     TEXT NOT NULL,
+      "createdAt" TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS pannel_course_comments (
+      id          SERIAL PRIMARY KEY,
+      "courseId"  INTEGER NOT NULL,
+      "userId"    INTEGER NOT NULL,
+      content     TEXT NOT NULL,
+      "createdAt" TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  // ── Tables tâches ──
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS tasks (
+      id               SERIAL PRIMARY KEY,
+      "userId"         INTEGER NOT NULL,
+      title            TEXT NOT NULL,
+      description      TEXT,
+      "dueDate"        TEXT,
+      "reminderTime"   TEXT,
+      status           TEXT DEFAULT 'todo',
+      priority         TEXT DEFAULT 'medium',
+      category         TEXT DEFAULT 'Général',
+      "assignedUserId" INTEGER,
+      "isArchived"     INTEGER DEFAULT 0,
+      "createdAt"      TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS task_subtasks (
+      id          SERIAL PRIMARY KEY,
+      "taskId"    INTEGER NOT NULL,
+      title       TEXT NOT NULL,
+      status      TEXT DEFAULT 'todo',
+      "createdAt" TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS task_dependencies (
+      "taskId"          INTEGER NOT NULL,
+      "dependsOnTaskId" INTEGER NOT NULL,
+      PRIMARY KEY ("taskId","dependsOnTaskId")
+    );
+  `);
+
+  // ── Tables admin & sécurité ──
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS reports (
+      id           SERIAL PRIMARY KEY,
+      "reporterId" INTEGER NOT NULL,
+      "targetType" TEXT NOT NULL,
+      "targetId"   INTEGER NOT NULL,
+      reason       TEXT NOT NULL,
+      status       TEXT DEFAULT 'pending',
+      "createdAt"  TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS admin_logs (
+      id          SERIAL PRIMARY KEY,
+      "adminId"   INTEGER NOT NULL,
+      action      TEXT NOT NULL,
+      "targetId"  INTEGER,
+      details     TEXT,
+      "createdAt" TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS db_logs (
+      id          SERIAL PRIMARY KEY,
+      level       TEXT NOT NULL,
+      action      TEXT NOT NULL,
+      "userId"    INTEGER,
+      ip          TEXT,
+      details     TEXT,
+      "createdAt" TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  console.log('✅ Toutes les tables PostgreSQL sont prêtes');
 }
 
-try {
-  db.prepare('SELECT roomId FROM messages LIMIT 1').get();
-} catch (e) {
-  try {
-    db.prepare('ALTER TABLE messages ADD COLUMN roomId INTEGER').run();
-  } catch (err) {}
-}
-
-try {
-  db.prepare('SELECT receiverId FROM messages LIMIT 1').get();
-} catch (e) {
-  // receiverId should exist, but we might want to make it nullable for group chats
-}
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS message_reactions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    messageId INTEGER NOT NULL,
-    userId INTEGER NOT NULL,
-    emoji TEXT NOT NULL,
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(messageId, userId),
-    FOREIGN KEY (messageId) REFERENCES messages(id),
-    FOREIGN KEY (userId) REFERENCES users(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS otps (
-    email TEXT PRIMARY KEY,
-    code TEXT NOT NULL,
-    expiresAt DATETIME NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS ads (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    companyId INTEGER NOT NULL,
-    goal TEXT NOT NULL,
-    content TEXT NOT NULL,
-    targeting TEXT NOT NULL,
-    budget REAL NOT NULL,
-    duration INTEGER NOT NULL,
-    status TEXT DEFAULT 'pending',
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (companyId) REFERENCES companies(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS communities (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    description TEXT,
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS community_members (
-    communityId INTEGER,
-    userId INTEGER,
-    role TEXT DEFAULT 'member',
-    PRIMARY KEY (communityId, userId)
-  );
-
-  CREATE TABLE IF NOT EXISTS follows (
-    followerId INTEGER,
-    followingId INTEGER,
-    PRIMARY KEY (followerId, followingId)
-  );
-
-  CREATE TABLE IF NOT EXISTS companies (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ownerId INTEGER NOT NULL,
-    name TEXT NOT NULL,
-    sector TEXT,
-    description TEXT,
-    address TEXT,
-    whatsapp TEXT,
-    facebook TEXT,
-    twitter TEXT,
-    linkedin TEXT,
-    logoUrl TEXT,
-    coverUrl TEXT,
-    isShop INTEGER DEFAULT 0,
-    specialty TEXT,
-    categories TEXT,
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (ownerId) REFERENCES users(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS company_catalog (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    companyId INTEGER NOT NULL,
-    name TEXT NOT NULL,
-    description TEXT,
-    price REAL,
-    category TEXT,
-    imageUrls TEXT,
-    imageUrl TEXT,
-    tag TEXT,
-    tagValue TEXT,
-    shares_count INTEGER DEFAULT 0,
-    FOREIGN KEY (companyId) REFERENCES companies(id)
-  );
-`);
-
-try {
-  db.prepare('SELECT shares_count FROM company_catalog LIMIT 1').get();
-} catch (e) {
-  db.prepare('ALTER TABLE company_catalog ADD COLUMN shares_count INTEGER DEFAULT 0').run();
-}
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS stocks (
-    productId INTEGER PRIMARY KEY,
-    quantity INTEGER DEFAULT 0,
-    minQuantity INTEGER DEFAULT 5,
-    lastUpdated DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (productId) REFERENCES company_catalog(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS stock_movements (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    productId INTEGER NOT NULL,
-    quantity INTEGER NOT NULL,
-    type TEXT NOT NULL,
-    reason TEXT,
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (productId) REFERENCES company_catalog(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS transactions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    userId INTEGER NOT NULL,
-    date TEXT NOT NULL,
-    description TEXT NOT NULL,
-    category TEXT NOT NULL,
-    amount REAL NOT NULL,
-    type TEXT NOT NULL,
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (userId) REFERENCES users(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS cells (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    description TEXT,
-    sponsorId INTEGER,
-    creatorId INTEGER NOT NULL,
-    coverUrl TEXT,
-    latitude REAL,
-    longitude REAL,
-    city TEXT,
-    country TEXT,
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS posts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    authorId INTEGER NOT NULL,
-    cellId INTEGER,
-    content TEXT NOT NULL,
-    category TEXT DEFAULT 'Tous',
-    mediaUrls TEXT,
-    views INTEGER DEFAULT 0,
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (cellId) REFERENCES cells(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    title TEXT NOT NULL,
-    description TEXT NOT NULL,
-    imageUrl TEXT,
-    country TEXT NOT NULL,
-    city TEXT NOT NULL,
-    location TEXT NOT NULL,
-    latitude REAL,
-    longitude REAL,
-    startDate DATETIME NOT NULL,
-    endDate DATETIME NOT NULL,
-    category TEXT NOT NULL,
-    communityId INTEGER,
-    creatorId INTEGER NOT NULL,
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS pannels (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    description TEXT,
-    theme TEXT,
-    ownerId INTEGER NOT NULL,
-    avatarUrl TEXT,
-    logoUrl TEXT,
-    coverUrl TEXT,
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS pannel_members (
-    pannelId INTEGER,
-    userId INTEGER,
-    role TEXT DEFAULT 'member',
-    joinedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (pannelId, userId)
-  );
-
-  CREATE TABLE IF NOT EXISTS pannel_courses (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    pannelId INTEGER NOT NULL,
-    title TEXT NOT NULL,
-    description TEXT,
-    duration TEXT,
-    fileUrl TEXT NOT NULL,
-    fileType TEXT NOT NULL,
-    views INTEGER DEFAULT 0,
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS pannel_evaluations (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    pannelId INTEGER NOT NULL,
-    userId INTEGER NOT NULL,
-    courseTitle TEXT,
-    grade INTEGER,
-    feedback TEXT,
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS pannel_badges (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    pannelId INTEGER NOT NULL,
-    userId INTEGER NOT NULL,
-    badgeType TEXT NOT NULL,
-    unlockedAt DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS pannel_progress (
-    pannelId INTEGER NOT NULL,
-    userId INTEGER NOT NULL,
-    courseId INTEGER NOT NULL,
-    status TEXT DEFAULT 'non_commence',
-    position REAL DEFAULT 0,
-    notes TEXT,
-    stickyNotes TEXT,
-    updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (pannelId, userId, courseId)
-  );
-
-  CREATE TABLE IF NOT EXISTS pannel_forum (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    pannelId INTEGER NOT NULL,
-    userId INTEGER NOT NULL,
-    content TEXT NOT NULL,
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (pannelId) REFERENCES pannels(id),
-    FOREIGN KEY (userId) REFERENCES users(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS event_participants (
-    eventId INTEGER,
-    userId INTEGER,
-    PRIMARY KEY (eventId, userId)
-  );
-
-  CREATE TABLE IF NOT EXISTS event_likes (
-    eventId INTEGER,
-    userId INTEGER,
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (eventId, userId)
-  );
-
-  CREATE TABLE IF NOT EXISTS funding_requests (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    userId INTEGER NOT NULL,
-    companyId INTEGER NOT NULL,
-    institutionId INTEGER,
-    fundingType TEXT NOT NULL,
-    amount REAL,
-    reason TEXT,
-    strategicData TEXT, -- JSON holding IA Score, sales, etc.
-    status TEXT DEFAULT 'En attente',
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (userId) REFERENCES users(id),
-    FOREIGN KEY (companyId) REFERENCES companies(id),
-    FOREIGN KEY (institutionId) REFERENCES credit_institutions(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS credit_institutions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    creatorId INTEGER NOT NULL,
-    name TEXT NOT NULL,
-    type TEXT NOT NULL, -- 'Banque', 'IMF', 'Programme', 'RiCi'
-    description TEXT,
-    terms TEXT, -- Conditions générales
-    eligibility TEXT, -- Conditions d'éligibilité
-    targets TEXT, -- Cibles (profils)
-    processingTime TEXT, -- Délais
-    logoUrl TEXT,
-    coverUrl TEXT,
-    address TEXT,
-    city TEXT,
-    country TEXT,
-    isHabilitated INTEGER DEFAULT 0, -- Status de validation réglementaire
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (creatorId) REFERENCES users(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS event_comments (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    eventId INTEGER,
-    userId INTEGER,
-    content TEXT NOT NULL,
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS services (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    providerId INTEGER NOT NULL,
-    title TEXT NOT NULL,
-    description TEXT NOT NULL,
-    availability TEXT,
-    budget TEXT,
-    type TEXT DEFAULT 'projet',
-    companyName TEXT,
-    location TEXT,
-    contractType TEXT,
-    fileUrl TEXT,
-    category TEXT,
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS service_applications (
-    serviceId INTEGER,
-    userId INTEGER,
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (serviceId, userId)
-  );
-
-  CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    senderId INTEGER NOT NULL,
-    receiverId INTEGER,
-    roomId INTEGER,
-    content TEXT NOT NULL,
-    fileUrl TEXT,
-    fileType TEXT,
-    fileName TEXT,
-    read INTEGER DEFAULT 0,
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (roomId) REFERENCES chat_rooms(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS chat_rooms (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT,
-    type TEXT DEFAULT 'direct', -- 'direct' or 'group'
-    avatarUrl TEXT,
-    creatorId INTEGER,
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS chat_room_members (
-    roomId INTEGER,
-    userId INTEGER,
-    joinedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (roomId, userId),
-    FOREIGN KEY (roomId) REFERENCES chat_rooms(id),
-    FOREIGN KEY (userId) REFERENCES users(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS churches (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    pastor TEXT,
-    hq TEXT,
-    description TEXT,
-    programs TEXT,
-    coverUrl TEXT,
-    latitude REAL,
-    longitude REAL,
-    city TEXT,
-    country TEXT,
-    creatorId INTEGER NOT NULL,
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS cell_members (
-    cellId INTEGER,
-    userId INTEGER,
-    role TEXT DEFAULT 'member',
-    joinedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (cellId, userId)
-  );
-
-  CREATE TABLE IF NOT EXISTS post_likes (
-    postId INTEGER,
-    userId INTEGER,
-    type TEXT DEFAULT 'like',
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (postId, userId)
-  );
-
-  CREATE TABLE IF NOT EXISTS post_comments (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    postId INTEGER,
-    userId INTEGER,
-    content TEXT NOT NULL,
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS notifications (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    userId INTEGER NOT NULL,
-    type TEXT NOT NULL,
-    content TEXT NOT NULL,
-    relatedId INTEGER,
-    read BOOLEAN DEFAULT 0,
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS connection_requests (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    senderId INTEGER NOT NULL,
-    receiverId INTEGER NOT NULL,
-    status TEXT DEFAULT 'pending',
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS stories (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    userId INTEGER NOT NULL,
-    mediaUrl TEXT NOT NULL,
-    mediaType TEXT DEFAULT 'image',
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-    expiresAt DATETIME NOT NULL,
-    FOREIGN KEY(userId) REFERENCES users(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS story_views (
-    storyId INTEGER NOT NULL,
-    userId INTEGER NOT NULL,
-    viewedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (storyId, userId),
-    FOREIGN KEY(storyId) REFERENCES stories(id),
-    FOREIGN KEY(userId) REFERENCES users(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS story_reactions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    storyId INTEGER NOT NULL,
-    userId INTEGER NOT NULL,
-    emoji TEXT NOT NULL,
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(storyId) REFERENCES stories(id),
-    FOREIGN KEY(userId) REFERENCES users(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS post_boosts (
-    postId INTEGER PRIMARY KEY,
-    userId INTEGER NOT NULL,
-    amount REAL NOT NULL,
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (postId) REFERENCES posts(id),
-    FOREIGN KEY (userId) REFERENCES users(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS favorite_companies (
-    userId INTEGER,
-    companyId INTEGER,
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (userId, companyId),
-    FOREIGN KEY (userId) REFERENCES users(id),
-    FOREIGN KEY (companyId) REFERENCES companies(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS favorite_products (
-    userId INTEGER,
-    productId INTEGER,
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (userId, productId),
-    FOREIGN KEY (userId) REFERENCES users(id),
-    FOREIGN KEY (productId) REFERENCES company_catalog(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS favorite_events (
-    userId INTEGER,
-    eventId INTEGER,
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (userId, eventId),
-    FOREIGN KEY (userId) REFERENCES users(id),
-    FOREIGN KEY (eventId) REFERENCES events(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS certifications (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    userId INTEGER,
-    name TEXT NOT NULL,
-    organization TEXT NOT NULL,
-    dateObtained TEXT NOT NULL,
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (userId) REFERENCES users(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS shop_orders (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    companyId INTEGER NOT NULL,
-    customerId INTEGER NOT NULL,
-    productId INTEGER NOT NULL,
-    quantity INTEGER DEFAULT 1,
-    totalPrice REAL NOT NULL,
-    status TEXT DEFAULT 'pending',
-    customerName TEXT,
-    customerWhatsapp TEXT,
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (companyId) REFERENCES companies(id),
-    FOREIGN KEY (customerId) REFERENCES users(id),
-    FOREIGN KEY (productId) REFERENCES company_catalog(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS pannel_course_comments (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    courseId INTEGER NOT NULL,
-    userId INTEGER NOT NULL,
-    content TEXT NOT NULL,
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (courseId) REFERENCES pannel_courses(id),
-    FOREIGN KEY (userId) REFERENCES users(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS reviews (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    userId INTEGER NOT NULL,
-    targetType TEXT NOT NULL, -- 'company' or 'product'
-    targetId INTEGER NOT NULL,
-    rating INTEGER NOT NULL, -- 1 to 5
-    comment TEXT,
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (userId) REFERENCES users(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS tasks (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    userId INTEGER NOT NULL,
-    title TEXT NOT NULL,
-    description TEXT,
-    dueDate TEXT,
-    reminderTime TEXT,
-    status TEXT DEFAULT 'todo',
-    priority TEXT DEFAULT 'medium',
-    category TEXT DEFAULT 'Général',
-    assignedUserId INTEGER,
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (userId) REFERENCES users(id),
-    FOREIGN KEY (assignedUserId) REFERENCES users(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS task_subtasks (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    taskId INTEGER NOT NULL,
-    title TEXT NOT NULL,
-    status TEXT DEFAULT 'todo',
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (taskId) REFERENCES tasks(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS task_dependencies (
-    taskId INTEGER NOT NULL,
-    dependsOnTaskId INTEGER NOT NULL,
-    PRIMARY KEY (taskId, dependsOnTaskId),
-    FOREIGN KEY (taskId) REFERENCES tasks(id),
-    FOREIGN KEY (dependsOnTaskId) REFERENCES tasks(id)
-  );
-`);
-
-// Helper to add columns safely
-const addColumn = (table: string, column: string, type: string) => {
-  try {
-    const columns = db.prepare(`PRAGMA table_info(${table})`).all() as any[];
-    const columnNames = columns.map(c => c.name);
-    if (columnNames.length > 0 && !columnNames.includes(column)) {
-      db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
-    }
-  } catch (e) {
-    // Table might not exist or other error
-  }
-};
-
-// Ensure new columns exist
-addColumn('users', 'church', 'TEXT');
-addColumn('users', 'groups', 'TEXT');
-addColumn('users', 'interests', 'TEXT');
-addColumn('users', 'skills', 'TEXT');
-addColumn('users', 'marketing', 'TEXT');
-addColumn('users', 'goals', 'TEXT');
-addColumn('users', 'coverUrl', 'TEXT');
-addColumn('users', 'notificationPreferences', 'TEXT');
-addColumn('users', 'visibility', "TEXT DEFAULT 'public'");
-addColumn('users', 'country', 'TEXT');
-
-addColumn('cells', 'coverUrl', 'TEXT');
-addColumn('cells', 'description', 'TEXT');
-addColumn('cells', 'sponsorId', 'INTEGER');
-addColumn('cells', 'latitude', 'REAL');
-addColumn('cells', 'longitude', 'REAL');
-addColumn('cells', 'city', 'TEXT');
-addColumn('cells', 'country', 'TEXT');
-
-addColumn('tasks', 'isArchived', 'INTEGER DEFAULT 0');
-addColumn('tasks', 'priority', "TEXT DEFAULT 'medium'");
-addColumn('tasks', 'category', "TEXT DEFAULT 'Général'");
-addColumn('tasks', 'assignedUserId', 'INTEGER');
-
-addColumn('churches', 'latitude', 'REAL');
-addColumn('churches', 'longitude', 'REAL');
-addColumn('churches', 'city', 'TEXT');
-addColumn('churches', 'country', 'TEXT');
-
-addColumn('companies', 'country', 'TEXT');
-addColumn('companies', 'city', 'TEXT');
-addColumn('companies', 'latitude', 'REAL');
-addColumn('companies', 'longitude', 'REAL');
-
-addColumn('posts', 'views', 'INTEGER DEFAULT 0');
-addColumn('posts', 'category', "TEXT DEFAULT 'Tous'");
-addColumn('posts', 'mediaUrls', 'TEXT');
-addColumn('posts', 'cellId', 'INTEGER');
-addColumn('stocks', 'costPrice', 'REAL DEFAULT 0');
-
-addColumn('pannel_courses', 'views', 'INTEGER DEFAULT 0');
-
-addColumn('pannel_progress', 'status', "TEXT DEFAULT 'non_commence'");
-addColumn('pannel_progress', 'position', 'REAL DEFAULT 0');
-addColumn('pannel_progress', 'notes', 'TEXT');
-addColumn('pannel_progress', 'stickyNotes', 'TEXT');
-
-addColumn('messages', 'fileUrl', 'TEXT');
-addColumn('messages', 'fileType', 'TEXT');
-addColumn('messages', 'fileName', 'TEXT');
-addColumn('messages', 'read', 'INTEGER DEFAULT 0');
-addColumn('messages', 'isPinned', 'BOOLEAN DEFAULT 0');
-addColumn('messages', 'replyToId', 'INTEGER');
-
-addColumn('post_likes', 'type', "TEXT DEFAULT 'like'");
-addColumn('notifications', 'read', 'BOOLEAN DEFAULT 0');
-addColumn('service_applications', 'message', 'TEXT');
-addColumn('service_applications', 'contactDetails', 'TEXT');
-addColumn('events', 'latitude', 'REAL');
-addColumn('events', 'longitude', 'REAL');
-addColumn('events', 'price', 'REAL DEFAULT 0');
-addColumn('events', 'visualUrl', 'TEXT');
-addColumn('events', 'shares_count', 'INTEGER DEFAULT 0');
-addColumn('services', 'type', "TEXT DEFAULT 'projet'");
-addColumn('services', 'companyName', 'TEXT');
-addColumn('services', 'location', 'TEXT');
-addColumn('services', 'contractType', 'TEXT');
-addColumn('services', 'fileUrl', 'TEXT');
-addColumn('company_catalog', 'tag', 'TEXT');
-addColumn('company_catalog', 'tagValue', 'TEXT');
-addColumn('companies', 'managerId', 'INTEGER');
-addColumn('funding_requests', 'institutionId', 'INTEGER');
-addColumn('funding_requests', 'strategicData', 'TEXT');
-addColumn('credit_institutions', 'city', 'TEXT');
-addColumn('credit_institutions', 'country', 'TEXT');
-
+// ════════════════════════════════════════════════════════════════════════════
+// 🌐 DÉMARRAGE DU SERVEUR
+// ════════════════════════════════════════════════════════════════════════════
 async function startServer() {
-  try {
-    const app = express();
-    const httpServer = createServer(app);
-    const io = new Server(httpServer, {
-      path: "/socket.io",
-      cors: {
-        origin: "*",
-        methods: ["GET", "POST"]
-      }
-    });
-    // Seed Community Data
-    try {
-      const instCount = db.prepare('SELECT COUNT(*) as count FROM credit_institutions').get() as { count: number };
-      if (instCount.count === 0) {
-        db.prepare(`
-          INSERT INTO credit_institutions (creatorId, name, type, description, terms, eligibility, targets, processingTime, city, country, isHabilitated)
-          VALUES (1, 'Banque de l''Entrepreneuriat Freebara', 'Banque', 'Institution financière dédiée au soutien des PME et startups de l''écosystème.', 'Taux préférentiel de 5%, différé de 6 mois.', 'Être membre Freebara actif, avoir un Shop avec transactions.', 'VSE, SME, Startups', '48h - 72h', 'Abidjan', 'Côte d''Ivoire', 1)
-        `).run();
-      }
+  await initDB();
 
-      const cellCount = db.prepare('SELECT COUNT(*) as count FROM cells').get() as { count: number };
-      if (cellCount.count === 0) {
-        // En s'assurant qu'un utilisateur existe pour le creatorId
-        const firstUser = db.prepare('SELECT id FROM users LIMIT 1').get() as { id: number } | undefined;
-        const creatorId = firstUser ? firstUser.id : 1;
-        
-        db.prepare(`
-          INSERT INTO cells (name, description, creatorId, latitude, longitude, city, country, coverUrl)
-          VALUES 
-            ('Cellule d''Impact Paris', 'Une communauté dynamique au cœur de Paris.', ?, 48.8566, 2.3522, 'Paris', 'France', 'https://picsum.photos/seed/paris/800/400'),
-            ('Cellule Lyon Leadership', 'Développement du leadership à Lyon.', ?, 45.7640, 4.8357, 'Lyon', 'France', 'https://picsum.photos/seed/lyon/800/400'),
-            ('Cellule Abidjan Business', 'Réseautage d''affaires à Abidjan.', ?, 5.3097, -4.0127, 'Abidjan', 'Côte d''Ivoire', 'https://picsum.photos/seed/abidjan/800/400')
-        `).run(creatorId, creatorId, creatorId);
-      } else {
-        // Mettre à jour les cellules existantes sans coordonnées pour la démo
-        db.prepare("UPDATE cells SET latitude = 48.8566, longitude = 2.3522, city = 'Paris', country = 'France' WHERE latitude IS NULL").run();
-      }
+  const app        = express();
+  const httpServer = createServer(app);
+  const io         = new Server(httpServer, {
+    path: '/socket.io',
+    cors: { origin: '*', methods: ['GET', 'POST'] },
+  });
 
-      const churchCount = db.prepare('SELECT COUNT(*) as count FROM churches').get() as { count: number };
-      if (churchCount.count === 0) {
-        const firstUser = db.prepare('SELECT id FROM users LIMIT 1').get() as { id: number } | undefined;
-        const creatorId = firstUser ? firstUser.id : 1;
-        
-        db.prepare(`
-          INSERT INTO churches (name, pastor, hq, description, creatorId, latitude, longitude, city, country, coverUrl)
-          VALUES 
-            ('Église de la Victoire', 'Pasteur Jean', 'Paris Centre', 'Une église accueillante pour tous.', ?, 48.8647, 2.3292, 'Paris', 'France', 'https://picsum.photos/seed/church1/800/400'),
-            ('Centre Apostolique Lyon', 'Pasteur Pierre', 'Lyon Sud', 'Focus sur le leadership chrétien.', ?, 45.7500, 4.8500, 'Lyon', 'France', 'https://picsum.photos/seed/church2/800/400')
-        `).run(creatorId, creatorId);
-      } else {
-        db.prepare("UPDATE churches SET latitude = 48.8647, longitude = 2.3292, city = 'Paris', country = 'France' WHERE latitude IS NULL").run();
-      }
-      
-      // Update companies with country/city if missing for filtering demo
-      db.prepare("UPDATE companies SET country = 'France', city = 'Paris' WHERE country IS NULL OR country = ''").run();
-    } catch (err: any) {
-      console.error('Error seeding communities:', err.message);
+  // ─── MIDDLEWARE ────────────────────────────────────────────────────────────
+  app.use(cors({
+    origin: [
+      'https://www.freebara.com',
+      'https://freebara.com',
+      'https://freebaraapp-2.onrender.com',
+      'http://localhost:5173',
+      'http://localhost:3000',
+    ],
+    credentials: true,
+  }));
+  app.use(express.json({ limit: '50mb' }));
+  app.use(express.urlencoded({ limit: '50mb', extended: true }));
+
+  // Headers sécurité
+  app.use((req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('X-XSS-Protection', '1; mode=block');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    next();
+  });
+
+  // Rate limiting (anti-abus)
+  const rlMap = new Map<string, { count: number; reset: number }>();
+  const rateLimit = (max: number, ms: number) => (req: any, res: any, next: any) => {
+    const ip = req.ip ?? 'x';
+    const now = Date.now();
+    const e = rlMap.get(ip);
+    if (!e || now > e.reset) { rlMap.set(ip, { count: 1, reset: now + ms }); return next(); }
+    e.count++;
+    if (e.count > max) {
+      logAction('WARN', 'rate_limit', undefined, ip, req.path);
+      return res.status(429).json({ error: 'Trop de requêtes. Réessayez dans un instant.' });
     }
-    
-    app.use(cors());
-    app.use(express.json({ limit: '50mb' }));
-    app.use(express.urlencoded({ limit: '50mb', extended: true }));
+    next();
+  };
+  setInterval(() => { const n = Date.now(); for (const [k, v] of rlMap) if (n > v.reset) rlMap.delete(k); }, 60000);
+  app.use('/api/auth', rateLimit(10, 60000));   // 10 tentatives auth/minute
+  app.use('/api',      rateLimit(300, 60000));  // 300 requêtes API/minute
 
-    // Request Logger
-    app.use((req, res, next) => {
-      console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
-      next();
-    });
+  // Logger
+  app.use((req, res, next) => {
+    console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
+    next();
+  });
 
-    // Authentication Middleware
-  const authenticate = (req: any, res: any, next: any) => {
+  // ─── MIDDLEWARE AUTHENTIFICATION ──────────────────────────────────────────
+  const authenticate = async (req: any, res: any, next: any) => {
     const token = req.headers.authorization?.split(' ')[1];
     if (!token) return res.status(401).json({ error: 'Non autorisé' });
     try {
       const decoded = jwt.verify(token, JWT_SECRET) as { userId: number };
-      const userExists = db.prepare('SELECT id FROM users WHERE id = ?').get(decoded.userId);
-      if (!userExists) {
-        return res.status(401).json({ error: 'Utilisateur non trouvé' });
-      }
-      req.userId = decoded.userId;
+      const user    = await db.one(`SELECT id, status, role FROM users WHERE id=$1`, [decoded.userId]);
+      if (!user)             return res.status(401).json({ error: 'Utilisateur introuvable' });
+      if (user.status === 'banned')
+        return res.status(403).json({ error: 'Compte suspendu. Contactez le support FreeBara.' });
+      req.userId   = decoded.userId;
+      req.userRole = user.role;
       next();
-    } catch (err) {
-      res.status(401).json({ error: 'Token invalide' });
+    } catch {
+      res.status(401).json({ error: 'Session expirée. Veuillez vous reconnecter.' });
     }
   };
 
-    app.get('/api/health', (req, res) => {
-      res.json({ status: 'ok' });
-    });
-
-    // Tasks Routes
-    app.get('/api/tasks', authenticate, (req: any, res) => {
-      const tasks = db.prepare('SELECT * FROM tasks WHERE userId = ? ORDER BY createdAt DESC').all(req.userId);
-      res.json(tasks);
-    });
-
-    app.post('/api/tasks', authenticate, (req: any, res) => {
-      const { title, description, dueDate, reminderTime, status, priority, category, assignedUserId } = req.body;
-      const stmt = db.prepare('INSERT INTO tasks (userId, title, description, dueDate, reminderTime, status, priority, category, assignedUserId) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
-      const info = stmt.run(req.userId, title, description, dueDate, reminderTime, status || 'todo', priority || 'medium', category || 'Général', assignedUserId || null);
-      res.json({ id: info.lastInsertRowid, userId: req.userId, title, description, dueDate, reminderTime, status: status || 'todo', priority: priority || 'medium', category: category || 'Général', assignedUserId: assignedUserId || null });
-    });
-
-    app.put('/api/tasks/:id', authenticate, (req: any, res: any) => {
-  const { status, title, description, dueDate, reminderTime, priority, category, assignedUserId } = req.body;
-
-  // Dependency Check Logic
-  if (status === 'in_progress' || status === 'done') {
-    const dependencies = db
-      .prepare('SELECT dependsOnTaskId FROM task_dependencies WHERE taskId = ?')
-      .all(req.params.id) as { dependsOnTaskId: number }[];
-
-    for (const dep of dependencies) {
-      const depTask = db
-        .prepare('SELECT status FROM tasks WHERE id = ?')
-        .get(dep.dependsOnTaskId) as any;
-
-      if (!depTask || depTask.status !== 'done') {
-        return res.status(400).json({
-          error: 'Une ou plusieurs tâches dépendantes ne sont pas terminées.'
-        });
-      }
-    }
-  }
-
-  const stmt = db.prepare(`
-    UPDATE tasks 
-    SET status = ?, title = ?, description = ?, dueDate = ?, reminderTime = ?, priority = ?, category = ?, assignedUserId = ? 
-    WHERE id = ? AND userId = ?
-  `);
-
-  stmt.run(
-    status,
-    title,
-    description,
-    dueDate,
-    reminderTime,
-    priority,
-    category,
-    assignedUserId || null,
-    req.params.id,
-    req.userId
-  );
-
-  res.json({ success: true });
-});
-    app.post('/api/tasks/:taskId/subtasks', authenticate, (req: any, res) => {
-      const { title } = req.body;
-      const stmt = db.prepare('INSERT INTO task_subtasks (taskId, title) VALUES (?, ?)');
-      const info = stmt.run(req.params.taskId, title);
-      res.json({ id: info.lastInsertRowid, taskId: req.params.taskId, title, status: 'todo' });
-    });
-    app.get('/api/tasks/:taskId/subtasks', authenticate, (req: any, res) => {
-        const subtasks = db.prepare('SELECT * FROM task_subtasks WHERE taskId = ?').all(req.params.taskId);
-        res.json(subtasks);
-    });
-    
-    app.put('/api/subtasks/:id', authenticate, (req: any, res) => {
-      const { status } = req.body;
-      const stmt = db.prepare('UPDATE task_subtasks SET status = ? WHERE id = ?');
-      stmt.run(status, req.params.id);
-      res.json({ success: true });
-    });
-
-    // Dependencies Routes
-    app.post('/api/tasks/:taskId/dependencies', authenticate, (req: any, res) => {
-        const { dependsOnTaskId } = req.body;
-        const stmt = db.prepare('INSERT INTO task_dependencies (taskId, dependsOnTaskId) VALUES (?, ?)');
-        stmt.run(req.params.taskId, dependsOnTaskId);
-        res.json({ success: true });
-    });
-    app.get('/api/tasks/:taskId/dependencies', authenticate, (req: any, res) => {
-        const deps = db.prepare('SELECT * FROM task_dependencies WHERE taskId = ?').all(req.params.taskId);
-        res.json(deps);
-    });
-
-    app.delete('/api/tasks/:id', authenticate, (req: any, res) => {
-      db.prepare('DELETE FROM tasks WHERE id = ? AND userId = ?').run(req.params.id, req.userId);
-      res.json({ success: true });
-    });
-
-    // Socket.io Authentication Middleware
-    io.use((socket, next) => {
-      try {
-        const token = socket.handshake.auth.token;
-        if (!token || typeof token !== 'string') {
-          console.error('Socket Auth: Missing or invalid token');
-          return next(new Error('Authentication error'));
-        }
-        
-        jwt.verify(token, JWT_SECRET, (err: any, decoded: any) => {
-          if (err) {
-            console.error('Socket Auth: JWT verification failed', err.message, 'Secret:', JWT_SECRET);
-            return next(new Error('Authentication error'));
-          }
-          if (!decoded || typeof decoded !== 'object' || !('userId' in decoded)) {
-            console.error('Socket Auth: Invalid token payload');
-            return next(new Error('Authentication error'));
-          }
-          (socket as any).userId = decoded.userId;
-          next();
-        });
-      } catch (err) {
-        console.error('Socket Auth: Unexpected error', err);
-        next(new Error('Authentication error'));
-      }
-    });
-
-    io.on('connection', (socket: any) => {
-      console.log(`User connected: ${socket.userId}`);
-      socket.join(`user_${socket.userId}`);
-
-      socket.on('disconnect', () => {
-        console.log(`User disconnected: ${socket.userId}`);
-      });
-
-      socket.on('pin_message', (data: { messageId: number, roomId?: number, receiverId?: number }) => {
-        io.emit('message_pinned', data);
-      });
-
-      socket.on('unpin_message', (data: { messageId: number, roomId?: number, receiverId?: number }) => {
-        io.emit('message_unpinned', data);
-      });
-
-      socket.on('message_reaction', (data: { messageId: number, userId: number, emoji: string, type: 'add' | 'remove', roomId?: number, receiverId?: number }) => {
-        io.emit('message_reaction_updated', data);
-      });
-
-      socket.on('message_edit', (data: { messageId: number, content: string, roomId?: number, receiverId?: number }) => {
-        io.emit('message_updated', data);
-      });
-
-      socket.on('message_delete', (data: { messageId: number, roomId?: number, receiverId?: number }) => {
-        io.emit('message_deleted', data);
-      });
-    });
-
-    // --- API Routes ---
-
-  // AI Endpoints
-  // All AI logic has been moved to the frontend.
-
-  app.put('/api/users/me/budget-proposals/:id', authenticate, (req: any, res) => {
-    const { category, amount, note } = req.body;
-    const proposalId = req.params.id;
-    
-    // Vérifier si la proposition appartient bien à l'utilisateur
-    const proposal = db.prepare('SELECT userId FROM budget_proposals WHERE id = ?').get(proposalId) as any;
-    if (!proposal || proposal.userId !== req.userId) {
-      return res.status(404).json({ error: 'Proposition de budget non trouvée' });
-    }
-
-    db.prepare('UPDATE budget_proposals SET category = ?, amount = ?, note = ? WHERE id = ?')
-      .run(category, amount, note, proposalId);
-      
-    res.json({ success: true });
-  });
-
-  // Pannels API
-  app.get('/api/pannels', authenticate, (req: any, res) => {
-    const pannels = db.prepare(`
-      SELECT p.*, u.name as ownerName,
-      (SELECT COUNT(*) FROM pannel_members WHERE pannelId = p.id) as membersCount,
-      (SELECT role FROM pannel_members WHERE pannelId = p.id AND userId = ?) as userRole
-      FROM pannels p
-      JOIN users u ON p.ownerId = u.id
-    `).all(req.userId);
-    res.json(pannels);
-  });
-
-  app.get('/api/pannels/my', authenticate, (req: any, res) => {
-    const pannels = db.prepare(`
-      SELECT p.*, u.name as ownerName,
-      (SELECT COUNT(*) FROM pannel_members WHERE pannelId = p.id) as membersCount,
-      pm.role as userRole
-      FROM pannels p
-      JOIN pannel_members pm ON p.id = pm.pannelId
-      JOIN users u ON p.ownerId = u.id
-      WHERE pm.userId = ?
-    `).all(req.userId);
-    res.json(pannels);
-  });
-
-  // Get all courses from all pannels
-  app.get('/api/courses/all', authenticate, (req: any, res) => {
-    const courses = db.prepare(`
-      SELECT c.*, p.name as pannelName, p.theme as pannelTheme,
-      (SELECT status FROM pannel_progress WHERE courseId = c.id AND userId = ?) as progressStatus
-      FROM pannel_courses c
-      JOIN pannels p ON c.pannelId = p.id
-      ORDER BY c.createdAt DESC
-    `).all(req.userId);
-    res.json(courses);
-  });
-
-  app.post('/api/pannels', authenticate, (req: any, res) => {
-    const { name, description, theme, logoUrl, coverUrl } = req.body;
-    const result = db.prepare('INSERT INTO pannels (name, description, theme, ownerId, logoUrl, coverUrl) VALUES (?, ?, ?, ?, ?, ?)')
-      .run(name, description, theme, req.userId, logoUrl, coverUrl);
-    
-    const pannelId = result.lastInsertRowid;
-    db.prepare('INSERT INTO pannel_members (pannelId, userId, role) VALUES (?, ?, ?)').run(pannelId, req.userId, 'admin');
-    
-    res.json({ id: pannelId });
-  });
-
-  app.put('/api/pannels/:id', authenticate, (req: any, res) => {
-    const { name, description, theme, logoUrl, coverUrl } = req.body;
-    const pannelId = req.params.id;
-    
-    // Check if user is admin or owner
-    const member = db.prepare('SELECT role FROM pannel_members WHERE pannelId = ? AND userId = ?').get(pannelId, req.userId) as any;
-    const pannel = db.prepare('SELECT ownerId FROM pannels WHERE id = ?').get(pannelId) as any;
-    
-    if (pannel.ownerId !== req.userId && (!member || member.role !== 'admin')) {
-      return res.status(403).json({ error: 'Non autorisé' });
-    }
-
-    db.prepare('UPDATE pannels SET name = ?, description = ?, theme = ?, logoUrl = ?, coverUrl = ? WHERE id = ?')
-      .run(name, description, theme, logoUrl, coverUrl, pannelId);
-      
-    res.json({ success: true });
-  });
-
-  app.get('/api/pannels/:id', authenticate, (req: any, res) => {
-    const pannel = db.prepare(`
-      SELECT p.*, u.name as ownerName,
-      (SELECT role FROM pannel_members WHERE pannelId = p.id AND userId = ?) as userRole
-      FROM pannels p
-      JOIN users u ON p.ownerId = u.id
-      WHERE p.id = ?
-    `).get(req.userId, req.params.id);
-    
-    if (!pannel) return res.status(404).json({ error: 'Pannel non trouvé' });
-    res.json(pannel);
-  });
-
-  app.post('/api/pannels/:id/join', authenticate, (req: any, res) => {
-    const pannelId = req.params.id;
-    try {
-      db.prepare('INSERT INTO pannel_members (pannelId, userId) VALUES (?, ?)').run(pannelId, req.userId);
-      
-      // Create notification for pannel owner
-      const pannel = db.prepare('SELECT ownerId, name FROM pannels WHERE id = ?').get(pannelId) as any;
-      if (pannel && pannel.ownerId !== req.userId) {
-        const user = db.prepare('SELECT name FROM users WHERE id = ?').get(req.userId) as any;
-        const notificationContent = `${user.name} a rejoint votre pannel: ${pannel.name}`;
-        const notifResult = db.prepare('INSERT INTO notifications (userId, type, content, relatedId) VALUES (?, ?, ?, ?)').run(
-          pannel.ownerId, 'pannel_join', notificationContent, pannelId
-        );
-
-        // Emit real-time notification
-        io.to(`user_${pannel.ownerId}`).emit('notification', {
-          id: notifResult.lastInsertRowid,
-          userId: pannel.ownerId,
-          type: 'pannel_join',
-          content: notificationContent,
-          relatedId: Number(pannelId),
-          read: 0,
-          createdAt: new Date().toISOString()
-        });
-      }
-
-      res.json({ success: true });
-    } catch (err) {
-      res.status(400).json({ error: 'Déjà membre ou erreur' });
-    }
-  });
-
-  app.post('/api/pannels/:id/add-member', authenticate, (req: any, res) => {
-    const pannelId = req.params.id;
-    const pannel = db.prepare('SELECT ownerId, name FROM pannels WHERE id = ?').get(pannelId) as any;
-    const admin = db.prepare('SELECT role FROM pannel_members WHERE pannelId = ? AND userId = ?').get(pannelId, req.userId) as any;
-    
-    if (pannel.ownerId !== req.userId && admin?.role !== 'admin') {
-      return res.status(403).json({ error: 'Seuls les admins peuvent ajouter des membres' });
-    }
-    
-    const { userId } = req.body;
-    try {
-      db.prepare('INSERT INTO pannel_members (pannelId, userId) VALUES (?, ?)').run(pannelId, userId);
-      
-      // Create notification for added user
-      const notificationContent = `Vous avez été ajouté au pannel: ${pannel.name}`;
-      const notifResult = db.prepare('INSERT INTO notifications (userId, type, content, relatedId) VALUES (?, ?, ?, ?)').run(
-        userId, 'pannel_add_member', notificationContent, pannelId
-      );
-
-      // Emit real-time notification
-      io.to(`user_${userId}`).emit('notification', {
-        id: notifResult.lastInsertRowid,
-        userId: Number(userId),
-        type: 'pannel_add_member',
-        content: notificationContent,
-        relatedId: Number(pannelId),
-        read: 0,
-        createdAt: new Date().toISOString()
-      });
-
-      res.json({ success: true });
-    } catch (err) {
-      res.status(400).json({ error: 'Déjà membre ou erreur' });
-    }
-  });
-
-  app.get('/api/pannels/:id/courses', authenticate, (req: any, res) => {
-    const courses = db.prepare(`
-      SELECT pc.*, 
-      (SELECT status FROM pannel_progress WHERE courseId = pc.id AND userId = ?) as progressStatus
-      FROM pannel_courses pc 
-      WHERE pc.pannelId = ? 
-      ORDER BY pc.createdAt DESC
-    `).all(req.userId, req.params.id);
-    res.json(courses);
-  });
-
-  app.post('/api/pannels/:id/courses', authenticate, (req: any, res) => {
-    try {
-      const pannel = db.prepare('SELECT ownerId FROM pannels WHERE id = ?').get(req.params.id) as any;
-      if (!pannel) return res.status(404).json({ error: 'Pannel introuvable' });
-
-      const member = db.prepare('SELECT role FROM pannel_members WHERE pannelId = ? AND userId = ?').get(req.params.id, req.userId) as any;
-      
-      if (pannel.ownerId !== req.userId && member?.role !== 'admin') {
-        return res.status(403).json({ error: 'Seuls les admins peuvent publier des cours' });
-      }
-      
-      const { title, description, duration, fileUrl, fileType, url, type } = req.body;
-      const finalUrl = fileUrl || url;
-      const finalType = fileType || type;
-
-      if (!title || !finalUrl || !finalType) {
-        return res.status(400).json({ error: 'Titre, fichier et type sont requis' });
-      }
-
-      db.prepare('INSERT INTO pannel_courses (pannelId, title, description, duration, fileUrl, fileType) VALUES (?, ?, ?, ?, ?, ?)')
-        .run(req.params.id, title, description, duration, finalUrl, finalType);
-      res.json({ success: true });
-    } catch (error) {
-      console.error('Error adding course:', error);
-      res.status(500).json({ error: 'Erreur lors de l\'ajout du cours' });
-    }
-  });
-
-  app.delete('/api/pannels/:id/courses/:courseId', authenticate, (req: any, res) => {
-    try {
-      const pannel = db.prepare('SELECT ownerId FROM pannels WHERE id = ?').get(req.params.id) as any;
-      if (!pannel) {
-        return res.status(404).json({ error: 'Pannel introuvable' });
-      }
-
-      const member = db.prepare('SELECT role FROM pannel_members WHERE pannelId = ? AND userId = ?').get(req.params.id, req.userId) as any;
-      
-      if (pannel.ownerId !== req.userId && member?.role !== 'admin') {
-        return res.status(403).json({ error: 'Seuls les admins peuvent supprimer des cours' });
-      }
-      
-      db.prepare('DELETE FROM pannel_courses WHERE id = ? AND pannelId = ?').run(req.params.courseId, req.params.id);
-      db.prepare('DELETE FROM pannel_progress WHERE courseId = ?').run(req.params.courseId);
-      db.prepare('DELETE FROM pannel_course_comments WHERE courseId = ?').run(req.params.courseId);
-      res.json({ success: true });
-    } catch (error) {
-      console.error('Error deleting course:', error);
-      res.status(500).json({ error: 'Erreur lors de la suppression du cours' });
-    }
-  });
-
-  app.get('/api/pannels/:id/courses/:courseId/comments', authenticate, (req: any, res) => {
-    const comments = db.prepare(`
-      SELECT c.*, u.name as userName, u.avatarUrl as userAvatar
-      FROM pannel_course_comments c
-      JOIN users u ON c.userId = u.id
-      WHERE c.courseId = ?
-      ORDER BY c.createdAt ASC
-    `).all(req.params.courseId);
-    res.json(comments);
-  });
-
-  app.post('/api/pannels/:id/courses/:courseId/comments', authenticate, (req: any, res) => {
-    const { content } = req.body;
-    if (!content) return res.status(400).json({ error: 'Le contenu est requis' });
-    
-    db.prepare('INSERT INTO pannel_course_comments (courseId, userId, content) VALUES (?, ?, ?)')
-      .run(req.params.courseId, req.userId, content);
-    res.json({ success: true });
-  });
-
-  app.post('/api/pannels/:id/courses/:courseId/learn', authenticate, (req: any, res) => {
-    const { status, position, notes, stickyNotes } = req.body;
-    const finalStatus = status || 'en_cours';
-    
-    const existing = db.prepare('SELECT status FROM pannel_progress WHERE userId = ? AND courseId = ?').get(req.userId, req.params.courseId);
-    if (!existing) {
-      db.prepare('UPDATE pannel_courses SET views = views + 1 WHERE id = ?').run(req.params.courseId);
-    }
-
-    db.prepare(`
-      INSERT OR REPLACE INTO pannel_progress (pannelId, userId, courseId, status, position, notes, stickyNotes, updatedAt) 
-      VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-    `).run(req.params.id, req.userId, req.params.courseId, finalStatus, position || 0, notes || null, stickyNotes || null);
-    
-    res.json({ success: true });
-  });
-
-  app.get('/api/pannels/:id/courses/:courseId/progress', authenticate, (req: any, res) => {
-    const progress = db.prepare('SELECT * FROM pannel_progress WHERE userId = ? AND courseId = ?')
-      .get(req.userId, req.params.courseId);
-    res.json(progress || { status: 'non_commence', position: 0, notes: '', stickyNotes: '[]' });
-  });
-
-  app.get('/api/pannels/:id/evaluations', authenticate, (req: any, res) => {
-    const pannel = db.prepare('SELECT ownerId FROM pannels WHERE id = ?').get(req.params.id) as any;
-    const member = db.prepare('SELECT role FROM pannel_members WHERE pannelId = ? AND userId = ?').get(req.params.id, req.userId) as any;
-    
-    let evaluations;
-    if (pannel.ownerId === req.userId || member?.role === 'admin') {
-      evaluations = db.prepare(`
-        SELECT e.*, u.name as userName, u.avatarUrl as userAvatar
-        FROM pannel_evaluations e
-        JOIN users u ON e.userId = u.id
-        WHERE e.pannelId = ?
-        ORDER BY e.createdAt DESC
-      `).all(req.params.id);
-    } else {
-      evaluations = db.prepare('SELECT * FROM pannel_evaluations WHERE pannelId = ? AND userId = ? ORDER BY createdAt DESC')
-        .all(req.params.id, req.userId);
-    }
-    res.json(evaluations);
-  });
-
-  app.post('/api/pannels/:id/evaluations', authenticate, (req: any, res) => {
-    const { courseTitle, grade, feedback } = req.body;
-    db.prepare('INSERT INTO pannel_evaluations (pannelId, userId, courseTitle, grade, feedback) VALUES (?, ?, ?, ?, ?)')
-      .run(req.params.id, req.userId, courseTitle, grade, feedback);
-    res.json({ success: true });
-  });
-
-  app.get('/api/pannels/:id/badges', authenticate, (req: any, res) => {
-    const badges = db.prepare('SELECT * FROM pannel_badges WHERE pannelId = ? AND userId = ?').all(req.params.id, req.userId);
-    res.json(badges);
-  });
-
-  app.post('/api/pannels/:id/badges', authenticate, (req: any, res) => {
-    const { badgeType } = req.body;
-    try {
-      db.prepare('INSERT INTO pannel_badges (pannelId, userId, badgeType) VALUES (?, ?, ?)').run(req.params.id, req.userId, badgeType);
-      res.json({ success: true });
-    } catch (err) {
-      res.status(400).json({ error: 'Badge déjà débloqué' });
-    }
-  });
-
-  app.get('/api/pannels/:id/members', authenticate, (req: any, res) => {
-    const members = db.prepare(`
-      SELECT u.id, u.name, u.avatarUrl, u.profession, pm.role,
-      (SELECT GROUP_CONCAT(badgeType) FROM pannel_badges WHERE pannelId = ? AND userId = u.id) as badges
-      FROM pannel_members pm
-      JOIN users u ON pm.userId = u.id
-      WHERE pm.pannelId = ?
-    `).all(req.params.id, req.params.id);
-    res.json(members);
-  });
-
-  app.delete('/api/pannels/:id/members/:userId', authenticate, (req: any, res) => {
-    const pannel = db.prepare('SELECT ownerId FROM pannels WHERE id = ?').get(req.params.id) as any;
-    const admin = db.prepare('SELECT role FROM pannel_members WHERE pannelId = ? AND userId = ?').get(req.params.id, req.userId) as any;
-    
-    if (pannel.ownerId !== req.userId && admin?.role !== 'admin') {
-      return res.status(403).json({ error: 'Seuls les admins peuvent supprimer des membres' });
-    }
-    
-    db.prepare('DELETE FROM pannel_members WHERE pannelId = ? AND userId = ?').run(req.params.id, req.params.userId);
-    res.json({ success: true });
-  });
-
-  app.put('/api/pannels/:id/members/:userId/role', authenticate, (req: any, res) => {
-    const pannel = db.prepare('SELECT ownerId FROM pannels WHERE id = ?').get(req.params.id) as any;
-    const admin = db.prepare('SELECT role FROM pannel_members WHERE pannelId = ? AND userId = ?').get(req.params.id, req.userId) as any;
-    
-    if (pannel.ownerId !== req.userId && admin?.role !== 'admin') {
-      return res.status(403).json({ error: 'Seuls les admins peuvent modifier les rôles' });
-    }
-    
-    const { role } = req.body;
-    db.prepare('UPDATE pannel_members SET role = ? WHERE pannelId = ? AND userId = ?').run(role, req.params.id, req.params.userId);
-    res.json({ success: true });
-  });
-
-  app.get('/api/pannels/:id/stats', authenticate, (req: any, res) => {
-    const pannel = db.prepare('SELECT ownerId FROM pannels WHERE id = ?').get(req.params.id) as any;
-    const member = db.prepare('SELECT role FROM pannel_members WHERE pannelId = ? AND userId = ?').get(req.params.id, req.userId) as any;
-    
-    if (pannel.ownerId !== req.userId && member?.role !== 'admin') {
-      return res.status(403).json({ error: 'Seuls les admins peuvent voir les stats' });
-    }
-
-    const totalMembers = db.prepare('SELECT COUNT(*) as count FROM pannel_members WHERE pannelId = ?').get(req.params.id) as any;
-    const completedCourses = db.prepare('SELECT COUNT(*) as count FROM pannel_progress WHERE pannelId = ?').get(req.params.id) as any;
-    const avgGrade = db.prepare('SELECT AVG(grade) as avg FROM pannel_evaluations WHERE pannelId = ?').get(req.params.id) as any;
-    const topBadges = db.prepare(`
-      SELECT badgeType, COUNT(*) as count 
-      FROM pannel_badges 
-      WHERE pannelId = ? 
-      GROUP BY badgeType 
-      ORDER BY count DESC 
-      LIMIT 3
-    `).all(req.params.id);
-
-    res.json({
-      totalMembers: totalMembers.count,
-      completedCourses: completedCourses.count,
-      averageGrade: avgGrade.avg || 0,
-      topBadges
-    });
-  });
-
-  app.get('/api/pannels/:id/forum', authenticate, (req: any, res) => {
-    const messages = db.prepare(`
-      SELECT f.*, u.name as userName, u.avatarUrl as userAvatar
-      FROM pannel_forum f
-      JOIN users u ON f.userId = u.id
-      WHERE f.pannelId = ?
-      ORDER BY f.createdAt ASC
-    `).all(req.params.id);
-    res.json(messages);
-  });
-
-  app.post('/api/pannels/:id/forum', authenticate, (req: any, res) => {
-    const { content } = req.body;
-    if (!content) return res.status(400).json({ error: 'Le contenu est requis' });
-    
-    db.prepare('INSERT INTO pannel_forum (pannelId, userId, content) VALUES (?, ?, ?)')
-      .run(req.params.id, req.userId, content);
-    res.json({ success: true });
-  });
-
-  // 1. Request OTP
-  app.post('/api/auth/request-otp', (req, res) => {
-    const { email, isRegister } = req.body;
-    if (!email) return res.status(400).json({ error: 'Email requis' });
-    
-    if (!isValidEmail(email)) {
-      return res.status(400).json({ error: 'Adresse email invalide' });
-    }
-    
-    const user = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
-    
-    if (isRegister && user) {
-      return res.status(400).json({ error: 'Un compte existe déjà avec cet email. Veuillez vous connecter.' });
-    }
-    if (!isRegister && !user) {
-      return res.status(400).json({ error: 'Aucun compte trouvé avec cet email. Veuillez vous inscrire.' });
-    }
-    
-    const code = Math.floor(100000 + Math.random() * 900000).toString();
-    const expiresAt = new Date(Date.now() + 10 * 60000).toISOString(); // 10 mins
-    
-    db.prepare('INSERT OR REPLACE INTO otps (email, code, expiresAt) VALUES (?, ?, ?)').run(email, code, expiresAt);
-    
-    // Envoyer le code par email (console.log en mode dev si SMTP_USER/SMTP_PASS non configurés)
-    sendOTPEmail(email, code)
-      .then(() => {
-        const isDev = !process.env.SMTP_USER || !process.env.SMTP_PASS;
-        res.json({
-          message: 'Code envoyé avec succès',
-          ...(isDev && { devCode: code }),
-        });
-      })
-      .catch((err: any) => {
-        console.error('Erreur envoi email OTP:', err);
-        res.status(500).json({ error: "Impossible d'envoyer le code par email. Vérifiez SMTP_USER et SMTP_PASS dans .env" });
-      });
-  });
-
-  // 2. Verify OTP & Login/Register
-  app.post('/api/auth/verify-otp', (req, res) => {
-    const { email, code, referralCode, isRegister, country } = req.body;
-    
-    if (!email || !isValidEmail(email)) {
-      return res.status(400).json({ error: 'Adresse email invalide' });
-    }
-    
-    const otpRecord = db.prepare('SELECT * FROM otps WHERE email = ?').get(email) as any;
-    if (!otpRecord || otpRecord.code !== code || new Date(otpRecord.expiresAt) < new Date()) {
-      return res.status(400).json({ error: 'Code invalide ou expiré' });
-    }
-    
-    let user = db.prepare('SELECT * FROM users WHERE email = ?').get(email) as any;
-    
-    if (isRegister) {
-      if (user) {
-        return res.status(400).json({ error: 'Un compte existe déjà avec cet email. Veuillez vous connecter.' });
-      }
-      // Register new user
-      let referredBy = null;
-      if (referralCode) {
-        const referrer = db.prepare('SELECT id FROM users WHERE referralCode = ?').get(referralCode) as any;
-        if (referrer) referredBy = referrer.id;
-      }
-      
-      const newReferralCode = Math.random().toString(36).substring(2, 8).toUpperCase();
-      const insert = db.prepare('INSERT INTO users (email, referralCode, referredBy, country) VALUES (?, ?, ?, ?)');
-      const info = insert.run(email, newReferralCode, referredBy, country || null);
-      const newUserId = info.lastInsertRowid;
-      user = db.prepare('SELECT * FROM users WHERE id = ?').get(newUserId);
-
-      // Cell Logic
-      if (referredBy) {
-        // 1. Find or create sponsor's cell
-        let sponsorCell = db.prepare('SELECT * FROM cells WHERE creatorId = ?').get(referredBy) as any;
-        if (!sponsorCell) {
-          const sponsor = db.prepare('SELECT name, referredBy FROM users WHERE id = ?').get(referredBy) as any;
-          const cellName = sponsor.name ? `Cellule de ${sponsor.name}` : 'Nouvelle cellule';
-          const cellInsert = db.prepare('INSERT INTO cells (name, creatorId) VALUES (?, ?)');
-          const cellInfo = cellInsert.run(cellName, referredBy);
-          const cellId = cellInfo.lastInsertRowid;
-          sponsorCell = { id: cellId, name: cellName, creatorId: referredBy };
-
-          // Add sponsor to their own cell as admin
-          db.prepare('INSERT INTO cell_members (cellId, userId, role) VALUES (?, ?, ?)').run(cellId, referredBy, 'admin');
-
-          // Hierarchy: The sponsor of the creator joins the cell automatically
-          if (sponsor.referredBy) {
-            db.prepare('INSERT OR IGNORE INTO cell_members (cellId, userId, role) VALUES (?, ?, ?)').run(cellId, sponsor.referredBy, 'member');
-          }
-        }
-
-        // 2. Add new user to sponsor's cell
-        db.prepare('INSERT OR IGNORE INTO cell_members (cellId, userId, role) VALUES (?, ?, ?)').run(sponsorCell.id, newUserId, 'member');
-      }
-    } else {
-      if (!user) {
-        return res.status(400).json({ error: 'Aucun compte trouvé avec cet email. Veuillez vous inscrire.' });
-      }
-    }
-    
-    db.prepare('DELETE FROM otps WHERE email = ?').run(email);
-    
-    const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '7d' });
-    res.json({ token, user });
-  });
-
-  // User Search for Mentions
-  app.get('/api/users/search', authenticate, (req: any, res) => {
-    const query = req.query.q;
-    if (!query) return res.json([]);
-    const users = db.prepare('SELECT id, name, avatarUrl FROM users WHERE name LIKE ? LIMIT 10')
-      .all(`%${query}%`);
-    res.json(users);
-  });
-
-  function handleMentions(content: string, senderId: number, relatedId: number, type: 'post' | 'comment' | 'message') {
-    if (!content) return;
-    // Regex to find @[Name](userId)
-    const mentionRegex = /@\[([^\]]+)\]\((\d+)\)/g;
-    let match;
-    const notifiedUserIds = new Set<number>();
-
-    while ((match = mentionRegex.exec(content)) !== null) {
-      const userId = parseInt(match[2]);
-      if (userId && userId !== senderId && !notifiedUserIds.has(userId)) {
-        try {
-          const sender = db.prepare('SELECT name FROM users WHERE id = ?').get(senderId) as any;
-          if (!sender) continue;
-          
-          let typeLabel = '';
-          let notifSubtype = 'mention';
-          if (type === 'post') {
-            typeLabel = 'post';
-            notifSubtype = 'post_mention';
-          } else if (type === 'comment') {
-            typeLabel = 'commentaire';
-            notifSubtype = 'comment_mention';
-          } else if (type === 'message') {
-            typeLabel = 'message';
-            notifSubtype = 'message_mention';
-          }
-
-          const notificationContent = `${sender.name} vous a mentionné dans un ${typeLabel}.`;
-          
-          const notifResult = db.prepare('INSERT INTO notifications (userId, type, content, relatedId) VALUES (?, ?, ?, ?)').run(
-            userId, notifSubtype, notificationContent, relatedId
-          );
-
-          if (io) {
-            io.to(`user_${userId}`).emit('notification', {
-              id: notifResult.lastInsertRowid,
-              userId: userId,
-              type: notifSubtype,
-              content: notificationContent,
-              relatedId: Number(relatedId),
-              read: 0,
-              createdAt: new Date().toISOString()
-            });
-          }
-          notifiedUserIds.add(userId);
-        } catch (err) {
-          console.error('Error creating mention notification:', err);
-        }
-      }
-    }
-  }
-
-  // 3. Get Current User
-  app.get('/api/users/me', authenticate, (req: any, res) => {
-    const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.userId) as any;
-    
-    if (!user) {
-      return res.status(404).json({ error: 'Utilisateur non trouvé' });
-    }
-    
-    if (user.notificationPreferences) {
-      try {
-        user.notificationPreferences = JSON.parse(user.notificationPreferences);
-      } catch (e) {
-        user.notificationPreferences = {};
-      }
-    } else {
-      user.notificationPreferences = {
-        connections: true,
-        comments: true,
-        events: true,
-        offers: true,
-        messages: true
-      };
-    }
-
-    // Calculate badges based on connections
-    const connectionsCount = db.prepare('SELECT COUNT(*) as count FROM follows WHERE followerId = ? OR followingId = ?').get(req.userId, req.userId) as { count: number };
-    const badges = [];
-    if (connectionsCount.count >= 100) badges.push('Super Connecteur');
-    if (connectionsCount.count >= 50) badges.push('Réseauteur Actif');
-    if (connectionsCount.count >= 10) badges.push('Sociable');
-    
-    user.badges = badges;
-    
-    res.json(user);
-  });
-
-  app.get('/api/users/me/transactions', authenticate, (req: any, res) => {
-    const transactions = db.prepare('SELECT * FROM transactions WHERE userId = ? ORDER BY date DESC, createdAt DESC').all(req.userId);
-    res.json(transactions);
-  });
-
-  app.post('/api/users/me/transactions', authenticate, (req: any, res) => {
-    const { date, description, category, amount, type } = req.body;
-    const result = db.prepare('INSERT INTO transactions (userId, date, description, category, amount, type) VALUES (?, ?, ?, ?, ?, ?)').run(req.userId, date, description, category, amount, type);
-    const newTransaction = db.prepare('SELECT * FROM transactions WHERE id = ?').get(result.lastInsertRowid);
-    
-    // Emit real-time update
-    io.to(`user_${req.userId}`).emit('transaction_update', newTransaction);
-    
-    res.json(newTransaction);
-  });
-
-  app.delete('/api/users/me', authenticate, (req: any, res) => {
-    const userId = req.userId;
-    try {
-      const deleteTransaction = db.transaction(() => {
-        // 1. Delete Social & Profile related
-        db.prepare('DELETE FROM community_members WHERE userId = ?').run(userId);
-        db.prepare('DELETE FROM follows WHERE followerId = ? OR followingId = ?').run(userId, userId);
-        db.prepare('DELETE FROM connection_requests WHERE senderId = ? OR receiverId = ?').run(userId, userId);
-        db.prepare('DELETE FROM notifications WHERE userId = ?').run(userId);
-        db.prepare('DELETE FROM certifications WHERE userId = ?').run(userId);
-
-        // 2. Delete Business & Shop related
-        const userCompanies = db.prepare('SELECT id FROM companies WHERE ownerId = ?').all(userId) as { id: number }[];
-        for (const company of userCompanies) {
-          db.prepare('DELETE FROM company_catalog WHERE companyId = ?').run(company.id);
-          db.prepare('DELETE FROM shop_orders WHERE companyId = ?').run(company.id);
-        }
-        db.prepare('DELETE FROM companies WHERE ownerId = ?').run(userId);
-        db.prepare('DELETE FROM shop_orders WHERE customerId = ?').run(userId);
-        db.prepare('DELETE FROM favorite_companies WHERE userId = ?').run(userId);
-        db.prepare('DELETE FROM transactions WHERE userId = ?').run(userId);
-
-        // 3. Delete JCE & Communities related
-        db.prepare('DELETE FROM cell_members WHERE userId = ?').run(userId);
-        db.prepare('DELETE FROM cells WHERE creatorId = ?').run(userId);
-        db.prepare('DELETE FROM churches WHERE creatorId = ?').run(userId);
-
-        // 4. Delete Posts & Interactions
-        db.prepare('DELETE FROM post_likes WHERE userId = ?').run(userId);
-        db.prepare('DELETE FROM post_comments WHERE userId = ?').run(userId);
-        db.prepare('DELETE FROM posts WHERE authorId = ?').run(userId);
-        db.prepare('DELETE FROM post_boosts WHERE userId = ?').run(userId);
-
-        // 5. Delete Events
-        db.prepare('DELETE FROM event_participants WHERE userId = ?').run(userId);
-        db.prepare('DELETE FROM event_likes WHERE userId = ?').run(userId);
-        db.prepare('DELETE FROM event_comments WHERE userId = ?').run(userId);
-        db.prepare('DELETE FROM events WHERE creatorId = ?').run(userId);
-
-        // 6. Delete Pannels (Learning)
-        db.prepare('DELETE FROM pannel_members WHERE userId = ?').run(userId);
-        db.prepare('DELETE FROM pannel_evaluations WHERE userId = ?').run(userId);
-        db.prepare('DELETE FROM pannel_badges WHERE userId = ?').run(userId);
-        db.prepare('DELETE FROM pannel_progress WHERE userId = ?').run(userId);
-        db.prepare('DELETE FROM pannel_forum WHERE userId = ?').run(userId);
-        db.prepare('DELETE FROM pannel_course_comments WHERE userId = ?').run(userId);
-        db.prepare('DELETE FROM pannels WHERE ownerId = ?').run(userId);
-
-        // 7. Delete Services
-        db.prepare('DELETE FROM service_applications WHERE userId = ?').run(userId);
-        db.prepare('DELETE FROM services WHERE providerId = ?').run(userId);
-
-        // 8. Delete Messages & Stories
-        db.prepare('DELETE FROM messages WHERE senderId = ? OR receiverId = ?').run(userId, userId);
-        db.prepare('DELETE FROM story_views WHERE userId = ?').run(userId);
-        db.prepare('DELETE FROM story_reactions WHERE userId = ?').run(userId);
-        db.prepare('DELETE FROM stories WHERE userId = ?').run(userId);
-
-        // 9. Finally delete the user
-        db.prepare('DELETE FROM users WHERE id = ?').run(userId);
-      });
-
-      deleteTransaction();
-      res.json({ success: true });
-    } catch (error) {
-      console.error('Error deleting account:', error);
-      res.status(500).json({ error: 'Erreur lors de la suppression du compte' });
-    }
-  });
-
-  app.get('/api/users/me/certifications', authenticate, (req: any, res) => {
-    const certifications = db.prepare('SELECT * FROM certifications WHERE userId = ? ORDER BY dateObtained DESC').all(req.userId);
-    res.json(certifications);
-  });
-
-  app.post('/api/users/me/certifications', authenticate, (req: any, res) => {
-    const { name, organization, dateObtained } = req.body;
-    const result = db.prepare('INSERT INTO certifications (userId, name, organization, dateObtained) VALUES (?, ?, ?, ?)').run(req.userId, name, organization, dateObtained);
-    res.json({ id: result.lastInsertRowid, name, organization, dateObtained });
-  });
-
-  app.delete('/api/users/me/certifications/:id', authenticate, (req: any, res) => {
-    db.prepare('DELETE FROM certifications WHERE id = ? AND userId = ?').run(req.params.id, req.userId);
-    res.json({ success: true });
-  });
-
-  app.get('/api/users/me/favorite-companies', authenticate, (req: any, res) => {
-    const companies = db.prepare(`
-      SELECT c.* FROM companies c
-      JOIN favorite_companies fc ON c.id = fc.companyId
-      WHERE fc.userId = ?
-    `).all(req.userId);
-    res.json(companies);
-  });
-
-  app.post('/api/companies/:id/favorite', authenticate, (req: any, res) => {
-    db.prepare('INSERT OR IGNORE INTO favorite_companies (userId, companyId) VALUES (?, ?)').run(req.userId, req.params.id);
-    res.json({ success: true });
-  });
-
-  app.delete('/api/companies/:id/favorite', authenticate, (req: any, res) => {
-    db.prepare('DELETE FROM favorite_companies WHERE userId = ? AND companyId = ?').run(req.userId, req.params.id);
-    res.json({ success: true });
-  });
-
-  app.get('/api/users/me/favorite-products', authenticate, (req: any, res) => {
-    const products = db.prepare(`
-      SELECT p.*, c.name as companyName,
-      (SELECT COUNT(*) FROM favorite_products WHERE productId = p.id) as favoritesCount
-      FROM company_catalog p
-      JOIN companies c ON p.companyId = c.id
-      JOIN favorite_products fp ON p.id = fp.productId
-      WHERE fp.userId = ?
-    `).all(req.userId);
-    res.json(products);
-  });
-
-  app.post('/api/products/:id/favorite', authenticate, (req: any, res) => {
-    db.prepare('INSERT OR IGNORE INTO favorite_products (userId, productId) VALUES (?, ?)').run(req.userId, req.params.id);
-    res.json({ success: true });
-  });
-
-  app.delete('/api/products/:id/favorite', authenticate, (req: any, res) => {
-    db.prepare('DELETE FROM favorite_products WHERE userId = ? AND productId = ?').run(req.userId, req.params.id);
-    res.json({ success: true });
-  });
-
-  app.post('/api/products/:id/share', authenticate, (req: any, res) => {
-    db.prepare('UPDATE company_catalog SET shares_count = shares_count + 1 WHERE id = ?').run(req.params.id);
-    res.json({ success: true });
-  });
-
-  // 3.1 Get User by ID
-  app.get('/api/users/:id', authenticate, (req: any, res) => {
-    const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id) as any;
-    if (!user) return res.status(404).json({ error: 'Utilisateur non trouvé' });
-
-    // Visibility check
-    if (user.visibility === 'private' && req.userId !== Number(req.params.id)) {
-      return res.status(403).json({ error: 'Profil privé' });
-    }
-    if (user.visibility === 'network' && req.userId !== Number(req.params.id)) {
-      const connection = db.prepare('SELECT status FROM connection_requests WHERE ((senderId = ? AND receiverId = ?) OR (senderId = ? AND receiverId = ?)) AND status = ?').get(req.userId, req.params.id, req.params.id, req.userId, 'accepted');
-      if (!connection) {
-        // Return limited information
-        return res.json({ id: user.id, name: user.name, avatarUrl: user.avatarUrl, visibility: 'network' });
-      }
-    }
-    
-    res.json(user);
-  });
-
-  // 4. Update Profile
-  app.put('/api/users/me', authenticate, (req: any, res) => {
-    const { name, age, profession, company, maritalStatus, whatsapp, avatarUrl, coverUrl, country, church, groups, interests, skills, marketing, goals, notificationPreferences, visibility } = req.body;
-    const stmt = db.prepare(`
-      UPDATE users 
-      SET name = ?, age = ?, profession = ?, company = ?, maritalStatus = ?, whatsapp = ?, avatarUrl = ?, coverUrl = ?, country = ?, church = ?, groups = ?, interests = ?, skills = ?, marketing = ?, goals = ?, notificationPreferences = ?, visibility = ?
-      WHERE id = ?
-    `);
-    stmt.run(name, age, profession, company, maritalStatus, whatsapp, avatarUrl, coverUrl, country, church, groups, interests, skills, marketing, goals, notificationPreferences ? JSON.stringify(notificationPreferences) : null, visibility || 'public', req.userId);
-    res.json({ message: 'Profil mis à jour' });
-  });
-
-  // 5. Get All Users (Directory)
-  app.get('/api/users', authenticate, (req: any, res) => {
-    const { name, country, church, profession, skills } = req.query;
-    let query = `
-      SELECT u.id, u.name, u.profession, u.company, u.avatarUrl, u.badge, u.country, u.church, u.createdAt, u.skills,
-             (SELECT COUNT(*) FROM follows WHERE followingId = u.id) as followersCount,
-             EXISTS(SELECT 1 FROM connection_requests WHERE senderId = ? AND receiverId = u.id AND status = 'pending') as requestSent,
-             EXISTS(SELECT 1 FROM follows WHERE followerId = ? AND followingId = u.id) as isFollowing
-      FROM users u 
-      WHERE u.name IS NOT NULL AND u.id != ?
-    `;
-    const params: any[] = [req.userId, req.userId, req.userId];
-
-    if (name) {
-      query += ` AND u.name LIKE ? `;
-      params.push(`%${name}%`);
-    }
-    if (country && country !== 'Tous') {
-      query += ` AND u.country = ? `;
-      params.push(country);
-    }
-    if (church && church !== 'Toutes') {
-      query += ` AND u.church = ? `;
-      params.push(church);
-    }
-    if (profession && profession !== 'Toutes') {
-      query += ` AND u.profession = ? `;
-      params.push(profession);
-    }
-    if (skills) {
-      query += ` AND u.skills LIKE ? `;
-      params.push(`%${skills}%`);
-    }
-
-    query += ` ORDER BY u.createdAt DESC `;
-    const users = db.prepare(query).all(...params);
-    res.json(users);
-  });
-
-  // 5.1 Send Connection Request
-  app.post('/api/users/:id/connect', authenticate, (req: any, res) => {
-    const receiverId = req.params.id;
-    const senderId = req.userId;
-    
-    // Check if already connected or request sent
-    const existing = db.prepare('SELECT * FROM connection_requests WHERE senderId = ? AND receiverId = ?').get(senderId, receiverId);
-    if (existing) return res.status(400).json({ error: 'Demande déjà envoyée' });
-
-    db.prepare('INSERT INTO connection_requests (senderId, receiverId) VALUES (?, ?)').run(senderId, receiverId);
-    
-    // Create notification for receiver
-    const sender = db.prepare('SELECT name FROM users WHERE id = ?').get(senderId) as any;
-    const notificationContent = `${sender.name} souhaite se connecter avec vous.`;
-    const notifResult = db.prepare('INSERT INTO notifications (userId, type, content, relatedId) VALUES (?, ?, ?, ?)').run(
-      receiverId, 'connection_request', notificationContent, senderId
-    );
-
-    // Emit real-time notification
-    io.to(`user_${receiverId}`).emit('notification', {
-      id: notifResult.lastInsertRowid,
-      userId: Number(receiverId),
-      type: 'connection_request',
-      content: notificationContent,
-      relatedId: senderId,
-      read: 0,
-      createdAt: new Date().toISOString()
-    });
-
-    res.json({ message: 'Demande envoyée' });
-  });
-
-  // 5.2 Get Notifications
-  app.get('/api/notifications', authenticate, (req: any, res) => {
-    const notifs = db.prepare('SELECT * FROM notifications WHERE userId = ? ORDER BY createdAt DESC').all(req.userId);
-    res.json(notifs);
-  });
-
-  // 5.2.1 Get Network Requests (alias)
-  app.get('/api/users/me/network-requests', authenticate, (req: any, res) => {
-    const requests = db.prepare(`
-      SELECT cr.*, u.name as senderName, u.avatarUrl as senderAvatar
-      FROM connection_requests cr
-      JOIN users u ON cr.senderId = u.id
-      WHERE cr.receiverId = ? AND cr.status = 'pending'
-    `).all(req.userId);
-    res.json(requests);
-  });
-
-  app.get('/api/users/me/connections', authenticate, (req: any, res) => {
-    const connections = db.prepare(`
-      SELECT DISTINCT u.id, u.name, u.avatarUrl, u.profession, u.company
-      FROM users u
-      JOIN connection_requests cr ON (u.id = cr.senderId OR u.id = cr.receiverId)
-      WHERE (cr.senderId = ? OR cr.receiverId = ?) 
-      AND cr.status = 'accepted'
-      AND u.id != ?
-    `).all(req.userId, req.userId, req.userId);
-    res.json(connections);
-  });
-
-  // 5.3 Mark Notification as Read
-  app.put('/api/notifications/:id/read', authenticate, (req: any, res) => {
-    db.prepare('UPDATE notifications SET read = 1 WHERE id = ? AND userId = ?').run(req.params.id, req.userId);
-    res.json({ success: true });
-  });
-
-  // 5.4 Follow User (Accept Connection)
-  app.post('/api/users/:id/follow', authenticate, (req: any, res) => {
-    const followingId = req.params.id;
-    const followerId = req.userId;
-    
-    try {
-      db.prepare('INSERT INTO follows (followerId, followingId) VALUES (?, ?)').run(followerId, followingId);
-      // Update request status if exists
-      db.prepare("UPDATE connection_requests SET status = 'accepted' WHERE senderId = ? AND receiverId = ?").run(followingId, followerId);
-      res.json({ message: 'Connecté avec succès' });
-    } catch (e) {
-      res.status(400).json({ error: 'Déjà connecté' });
-    }
-  });
-
-  // 6. Get Events
-  app.get('/api/events', authenticate, (req: any, res) => {
-    const events = db.prepare(`
-      SELECT e.*, 
-             (SELECT COUNT(*) FROM event_participants WHERE eventId = e.id) as participantsCount,
-             (SELECT COUNT(*) FROM event_participants WHERE eventId = e.id AND userId = ?) as isParticipating,
-             (SELECT COUNT(*) FROM favorite_events WHERE eventId = e.id) as favoritesCount,
-             (SELECT COUNT(*) FROM favorite_events WHERE eventId = e.id AND userId = ?) as isFavorite
-      FROM events e 
-      ORDER BY startDate ASC
-    `).all(req.userId, req.userId);
-    res.json(events);
-  });
-
-  app.get('/api/events/:id', authenticate, (req: any, res) => {
-    const event = db.prepare(`
-      SELECT e.*, 
-             (SELECT COUNT(*) FROM event_participants WHERE eventId = e.id) as participantsCount,
-             (SELECT COUNT(*) FROM event_participants WHERE eventId = e.id AND userId = ?) as isParticipating,
-             (SELECT COUNT(*) FROM favorite_events WHERE eventId = e.id) as favoritesCount,
-             (SELECT COUNT(*) FROM favorite_events WHERE eventId = e.id AND userId = ?) as isFavorite
-      FROM events e 
-      WHERE e.id = ?
-    `).get(req.userId, req.userId, req.params.id);
-    if (!event) return res.status(404).json({ error: 'Événement non trouvé' });
-    res.json(event);
-  });
-
-  app.post('/api/events/:id/favorite', authenticate, (req: any, res) => {
-    const { id } = req.params;
-    const favorite = db.prepare('SELECT 1 FROM favorite_events WHERE userId = ? AND eventId = ?').get(req.userId, id);
-
-    if (favorite) {
-      db.prepare('DELETE FROM favorite_events WHERE userId = ? AND eventId = ?').run(req.userId, id);
-      res.json({ isFavorite: false });
-    } else {
-      db.prepare('INSERT INTO favorite_events (userId, eventId) VALUES (?, ?)').run(req.userId, id);
-      res.json({ isFavorite: true });
-    }
-  });
-
-  app.post('/api/events/:id/share', authenticate, (req: any, res) => {
-    const { id } = req.params;
-    db.prepare('UPDATE events SET shares_count = shares_count + 1 WHERE id = ?').run(id);
-    const updated = db.prepare('SELECT shares_count FROM events WHERE id = ?').get(id) as any;
-    res.json({ shares_count: updated.shares_count });
-  });
-
-  // 7. Create Event
-  app.post('/api/events', authenticate, (req: any, res) => {
-    try {
-      const { title, description, imageUrl, visualUrl, country, city, location, latitude, longitude, startDate, endDate, category, communityId, price } = req.body;
-      
-      if (!title || !description || !country || !city || !location || !startDate || !endDate || !category) {
-        return res.status(400).json({ error: 'Tous les champs obligatoires doivent être remplis' });
-      }
-
-      const stmt = db.prepare(`
-        INSERT INTO events (title, description, imageUrl, visualUrl, country, city, location, latitude, longitude, startDate, endDate, category, communityId, creatorId, price)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
-      const info = stmt.run(title, description, imageUrl || null, visualUrl || null, country, city, location, latitude || null, longitude || null, startDate, endDate, category, communityId || null, req.userId, price || 0);
-      
-      // Auto-post to feed
-      db.prepare(`
-        INSERT INTO posts (authorId, content, category, mediaUrls)
-        VALUES (?, ?, ?, ?)
-      `).run(req.userId, `🎉 Nouvel événement : ${title}\n\n${description}\n\n📍 Lieu : ${location}\n📅 Date : ${startDate}`, 'Programme', imageUrl ? JSON.stringify([{url: imageUrl, type: 'image'}]) : null);
-      
-      res.json({ id: info.lastInsertRowid });
-    } catch (err: any) {
-      console.error('Error creating event:', err);
-      res.status(500).json({ error: 'Erreur lors de la création de l\'événement: ' + err.message });
-    }
-  });
-
-  app.put('/api/events/:id', authenticate, (req: any, res) => {
-    const event = db.prepare('SELECT creatorId FROM events WHERE id = ?').get(req.params.id) as any;
-    if (!event || event.creatorId !== req.userId) return res.status(403).json({ error: 'Non autorisé' });
-    const { title, description, location, latitude, longitude, startDate, endDate, category, city, country, price, imageUrl, visualUrl, communityId } = req.body;
-    db.prepare('UPDATE events SET title = ?, description = ?, location = ?, latitude = ?, longitude = ?, startDate = ?, endDate = ?, category = ?, city = ?, country = ?, price = ?, imageUrl = ?, visualUrl = ?, communityId = ? WHERE id = ?')
-      .run(title, description, location, latitude, longitude, startDate, endDate, category, city, country, price, imageUrl || null, visualUrl || null, communityId || null, req.params.id);
-    res.json({ message: 'Événement mis à jour' });
-  });
-
-  app.delete('/api/events/:id', authenticate, (req: any, res) => {
-    const event = db.prepare('SELECT creatorId FROM events WHERE id = ?').get(req.params.id) as any;
-    if (!event || event.creatorId !== req.userId) return res.status(403).json({ error: 'Non autorisé' });
-    db.prepare('DELETE FROM events WHERE id = ?').run(req.params.id);
-    db.prepare('DELETE FROM event_participants WHERE eventId = ?').run(req.params.id);
-    res.json({ message: 'Événement supprimé' });
-  });
-
-  // 8. Participate in Event
-  app.post('/api/events/:id/participate', authenticate, (req: any, res) => {
-    const eventId = req.params.id;
-    try {
-      db.prepare('INSERT INTO event_participants (eventId, userId) VALUES (?, ?)').run(eventId, req.userId);
-      
-      // Create notification for event organizer
-      const event = db.prepare('SELECT creatorId as organizerId, title FROM events WHERE id = ?').get(eventId) as any;
-      if (event && event.organizerId !== req.userId) {
-        const participant = db.prepare('SELECT name FROM users WHERE id = ?').get(req.userId) as any;
-        const notificationContent = `${participant.name} participe à votre événement: ${event.title}`;
-        const notifResult = db.prepare('INSERT INTO notifications (userId, type, content, relatedId) VALUES (?, ?, ?, ?)').run(
-          event.organizerId, 'event_participation', notificationContent, eventId
-        );
-
-        // Emit real-time notification
-        io.to(`user_${event.organizerId}`).emit('notification', {
-          id: notifResult.lastInsertRowid,
-          userId: event.organizerId,
-          type: 'event_participation',
-          content: notificationContent,
-          relatedId: Number(eventId),
-          read: 0,
-          createdAt: new Date().toISOString()
-        });
-      }
-
-      res.json({ message: 'Participation confirmée' });
-    } catch (e) {
-      res.status(400).json({ error: 'Déjà participant' });
-    }
-  });
-
-  app.delete('/api/events/:id/participate', authenticate, (req: any, res) => {
-    const eventId = req.params.id;
-    try {
-      db.prepare('DELETE FROM event_participants WHERE eventId = ? AND userId = ?').run(eventId, req.userId);
-      res.json({ message: 'Participation annulée' });
-    } catch (e) {
-      res.status(500).json({ error: 'Erreur lors de l\'annulation' });
-    }
-  });
-
-  // 8.1 Get Event Participants
-  app.get('/api/events/:id/participants', authenticate, (req: any, res) => {
-    const participants = db.prepare(`
-      SELECT u.id, u.name, u.avatarUrl
-      FROM event_participants ep
-      JOIN users u ON ep.userId = u.id
-      WHERE ep.eventId = ?
-    `).all(req.params.id);
-    res.json(participants);
-  });
-
-  // 8.2 Get Single Event
-  app.get('/api/events/:id', authenticate, (req: any, res) => {
-    const event = db.prepare(`
-      SELECT e.*, u.name as creatorName, u.avatarUrl as creatorAvatar,
-             (SELECT COUNT(*) FROM event_participants WHERE eventId = e.id) as participantsCount,
-             (SELECT COUNT(*) FROM event_participants WHERE eventId = e.id AND userId = ?) as isParticipating,
-             (SELECT COUNT(*) FROM event_likes WHERE eventId = e.id) as likesCount,
-             (SELECT COUNT(*) FROM event_likes WHERE eventId = e.id AND userId = ?) as isLiked
-      FROM events e
-      JOIN users u ON e.creatorId = u.id
-      WHERE e.id = ?
-    `).get(req.userId, req.userId, req.params.id);
-    
-    if (!event) return res.status(404).json({ error: 'Événement non trouvé' });
-    res.json(event);
-  });
-
-  // 8.3 Toggle Like Event
-  app.post('/api/events/:id/like', authenticate, (req: any, res) => {
-    const eventId = req.params.id;
-    const isLiked = db.prepare('SELECT 1 FROM event_likes WHERE eventId = ? AND userId = ?').get(eventId, req.userId);
-    
-    if (isLiked) {
-      db.prepare('DELETE FROM event_likes WHERE eventId = ? AND userId = ?').run(eventId, req.userId);
-      res.json({ liked: false });
-    } else {
-      db.prepare('INSERT INTO event_likes (eventId, userId) VALUES (?, ?)').run(eventId, req.userId);
-      res.json({ liked: true });
-    }
-  });
-
-  // 8.4 Get Event Comments
-  app.get('/api/events/:id/comments', authenticate, (req: any, res) => {
-    const comments = db.prepare(`
-      SELECT c.*, u.name as userName, u.avatarUrl as userAvatar
-      FROM event_comments c
-      JOIN users u ON c.userId = u.id
-      WHERE c.eventId = ?
-      ORDER BY c.createdAt DESC
-    `).all(req.params.id);
-    res.json(comments);
-  });
-
-  // 8.5 Add Event Comment
-  app.post('/api/events/:id/comments', authenticate, (req: any, res) => {
-    const { content } = req.body;
-    if (!content) return res.status(400).json({ error: 'Le contenu est requis' });
-    
-    const result = db.prepare('INSERT INTO event_comments (eventId, userId, content) VALUES (?, ?, ?)')
-      .run(req.params.id, req.userId, content);
-    
-    const comment = db.prepare(`
-      SELECT c.*, u.name as userName, u.avatarUrl as userAvatar
-      FROM event_comments c
-      JOIN users u ON c.userId = u.id
-      WHERE c.id = ?
-    `).get(result.lastInsertRowid);
-    
-    res.json(comment);
-  });
-
-  // 8.6 Invite Users to Event
-  app.post('/api/events/:id/invite', authenticate, (req: any, res) => {
-    const { userIds } = req.body;
-    if (!userIds || !Array.isArray(userIds)) return res.status(400).json({ error: 'Liste d\'utilisateurs invalide' });
-    
-    const event = db.prepare('SELECT title FROM events WHERE id = ?').get(req.params.id) as any;
-    const sender = db.prepare('SELECT name FROM users WHERE id = ?').get(req.userId) as any;
-    
-    userIds.forEach(userId => {
-      const content = `${sender.name} vous invite à participer à l'événement : ${event.title}`;
-      const result = db.prepare('INSERT INTO notifications (userId, type, content, relatedId) VALUES (?, ?, ?, ?)')
-        .run(userId, 'event_invite', content, req.params.id);
-        
-      io.to(`user_${userId}`).emit('notification', {
-        id: result.lastInsertRowid,
-        userId,
-        type: 'event_invite',
-        content,
-        relatedId: Number(req.params.id),
-        read: 0,
-        createdAt: new Date().toISOString()
-      });
-    });
-    
-    res.json({ success: true });
-  });
-
-  // 9. Get Posts (Feed)
-  app.get('/api/posts', authenticate, (req: any, res) => {
-    const page = parseInt(req.query.page as string) || 1;
-    const limit = parseInt(req.query.limit as string) || 10;
-    const offset = (page - 1) * limit;
-    const category = req.query.category as string;
-    const country = req.query.country as string;
-    const cellId = req.query.cellId ? parseInt(req.query.cellId as string) : null;
-    const authorId = req.query.authorId ? parseInt(req.query.authorId as string) : null;
-    const feedType = req.query.feedType as string;
-    const search = req.query.search as string;
-
-    // If cellId is provided, verify membership
-    if (cellId) {
-      const isMember = db.prepare('SELECT 1 FROM cell_members WHERE cellId = ? AND userId = ?').get(cellId, req.userId);
-      if (!isMember) return res.status(403).json({ error: 'Vous n\'êtes pas membre de cette cellule' });
-    }
-
-    let query = `
-      SELECT p.*, u.name as authorName, u.avatarUrl as authorAvatar, u.profession as authorProfession, u.country as authorCountry,
-             (SELECT COUNT(*) FROM post_likes WHERE postId = p.id) as likesCount,
-             (SELECT COUNT(*) FROM post_likes WHERE postId = p.id AND type = 'like') as reactionLikeCount,
-             (SELECT COUNT(*) FROM post_likes WHERE postId = p.id AND type = 'applause') as reactionApplauseCount,
-             (SELECT COUNT(*) FROM post_likes WHERE postId = p.id AND type = 'inspiration') as reactionInspirationCount,
-             (SELECT COUNT(*) FROM post_comments WHERE postId = p.id) as commentsCount,
-             (SELECT type FROM post_likes WHERE postId = p.id AND userId = ?) as myReactionType,
-             (SELECT 1 FROM post_boosts WHERE postId = p.id) as isBoosted
-      FROM posts p
-      JOIN users u ON p.authorId = u.id
-      WHERE 1=1
-    `;
-    const params: any[] = [req.userId];
-
-    if (authorId) {
-      query += ` AND p.authorId = ? `;
-      params.push(authorId);
-    }
-
-    if (cellId) {
-      query += ` AND p.cellId = ? `;
-      params.push(cellId);
-    } else if (!authorId) {
-      query += ` AND (p.cellId IS NULL OR p.cellId IN (SELECT cellId FROM cell_members WHERE userId = ?)) `;
-      params.push(req.userId);
-    }
-
-    if (feedType === 'network') {
-      query += ` AND (
-        p.authorId IN (SELECT followingId FROM follows WHERE followerId = ?) OR
-        p.authorId IN (SELECT userId FROM cell_members WHERE cellId IN (SELECT cellId FROM cell_members WHERE userId = ?)) OR
-        p.authorId IN (SELECT userId FROM pannel_members WHERE pannelId IN (SELECT pannelId FROM pannel_members WHERE userId = ?)) OR
-        p.authorId IN (SELECT userId FROM community_members WHERE communityId IN (SELECT communityId FROM community_members WHERE userId = ?))
-      ) `;
-      params.push(req.userId, req.userId, req.userId, req.userId);
-    }
-
-    if (category && category !== 'Tous') {
-      query += ` AND p.category = ? `;
-      params.push(category);
-    }
-
-    if (search) {
-      query += ` AND (p.content LIKE ? OR u.name LIKE ?) `;
-      params.push(`%${search}%`, `%${search}%`);
-    }
-
-    if (country && country !== 'Tous') {
-      query += ` AND u.country = ? `;
-      params.push(country);
-    }
-
-    query += ` ORDER BY isBoosted DESC, p.createdAt DESC LIMIT ? OFFSET ?`;
-    params.push(limit, offset);
-
-    const posts = db.prepare(query).all(...params);
-    res.json(posts);
-  });
-
-  // 9.1 Increment Post Views
-  app.post('/api/posts/:id/boost', authenticate, (req: any, res) => {
-    const { amount } = req.body;
-    const postId = req.params.id;
-    
-    // Check if post exists and user is author
-    const post = db.prepare('SELECT authorId FROM posts WHERE id = ?').get(postId) as any;
-    if (!post) return res.status(404).json({ error: 'Post introuvable' });
-    if (post.authorId !== req.userId) return res.status(403).json({ error: 'Seul l\'auteur peut booster son post' });
-
-    try {
-      db.prepare('INSERT INTO post_boosts (postId, userId, amount) VALUES (?, ?, ?)').run(postId, req.userId, amount);
-      res.json({ success: true });
-    } catch (err) {
-      res.status(400).json({ error: 'Ce post est déjà boosté' });
-    }
-  });
-
-  app.post('/api/posts/:id/view', authenticate, (req: any, res) => {
-    const postId = req.params.id;
-    db.prepare('UPDATE posts SET views = views + 1 WHERE id = ?').run(postId);
-    res.json({ success: true });
-  });
-
-  // 9.2 Get All Countries from Users
-  app.get('/api/countries', authenticate, (req: any, res) => {
-    const countries = db.prepare("SELECT DISTINCT country FROM users WHERE country IS NOT NULL AND country != '' ORDER BY country ASC").all();
-    res.json(countries.map((c: any) => c.country));
-  });
-
-  // 10. Create Post
-  app.post('/api/posts', authenticate, (req: any, res) => {
-    try {
-      const { content, category, mediaUrls, cellId } = req.body;
-      if (!content && (!mediaUrls || mediaUrls.length === 0)) {
-        return res.status(400).json({ error: 'Le contenu ou un média est requis' });
-      }
-
-      // If cellId is provided, verify membership
-      if (cellId) {
-        const isMember = db.prepare('SELECT 1 FROM cell_members WHERE cellId = ? AND userId = ?').get(cellId, req.userId);
-        if (!isMember) return res.status(403).json({ error: 'Vous n\'êtes pas membre de cette cellule' });
-      }
-
-      const stmt = db.prepare('INSERT INTO posts (authorId, content, category, mediaUrls, cellId) VALUES (?, ?, ?, ?, ?)');
-      const info = stmt.run(req.userId, content || '', category || 'Tous', mediaUrls ? JSON.stringify(mediaUrls) : null, cellId || null);
-      const postId = info.lastInsertRowid;
-
-      // Handle mentions in post content
-      if (content) {
-        handleMentions(content, req.userId, Number(postId), 'post');
-      }
-
-      res.json({ id: postId });
-    } catch (err: any) {
-      console.error('Error creating post:', err);
-      res.status(500).json({ error: 'Erreur lors de la création du post' });
-    }
-  });
-
-  app.put('/api/posts/:id', authenticate, (req: any, res) => {
-    const post = db.prepare('SELECT authorId FROM posts WHERE id = ?').get(req.params.id) as any;
-    if (!post || post.authorId !== req.userId) return res.status(403).json({ error: 'Non autorisé' });
-    db.prepare('UPDATE posts SET content = ? WHERE id = ?').run(req.body.content, req.params.id);
-    
-    // Handle mentions in updated post
-    if (req.body.content) {
-      handleMentions(req.body.content, req.userId, Number(req.params.id), 'post');
-    }
-    
-    res.json({ message: 'Post mis à jour' });
-  });
-
-  app.delete('/api/posts/:id', authenticate, (req: any, res) => {
-    const post = db.prepare('SELECT authorId FROM posts WHERE id = ?').get(req.params.id) as any;
-    if (!post || post.authorId !== req.userId) return res.status(403).json({ error: 'Non autorisé' });
-    db.prepare('DELETE FROM posts WHERE id = ?').run(req.params.id);
-    db.prepare('DELETE FROM post_likes WHERE postId = ?').run(req.params.id);
-    db.prepare('DELETE FROM post_comments WHERE postId = ?').run(req.params.id);
-    res.json({ message: 'Post supprimé' });
-  });
-
-  // 10.1 Toggle Like Post
-  app.post('/api/posts/:id/like', authenticate, (req: any, res) => {
-    const postId = req.params.id;
-    const userId = req.userId;
-    const type = req.body.type || 'like';
-    
-    const existingLike = db.prepare('SELECT * FROM post_likes WHERE postId = ? AND userId = ?').get(postId, userId) as any;
-    
-    if (existingLike) {
-      if (existingLike.type === type) {
-        db.prepare('DELETE FROM post_likes WHERE postId = ? AND userId = ?').run(postId, userId);
-        res.json({ liked: false, type: null });
-      } else {
-        db.prepare('UPDATE post_likes SET type = ? WHERE postId = ? AND userId = ?').run(type, postId, userId);
-        res.json({ liked: true, type });
-      }
-    } else {
-      db.prepare('INSERT INTO post_likes (postId, userId, type) VALUES (?, ?, ?)').run(postId, userId, type);
-      
-      // Create notification for post author
-      const post = db.prepare('SELECT authorId FROM posts WHERE id = ?').get(postId) as any;
-      if (post && post.authorId !== userId) {
-        const liker = db.prepare('SELECT name FROM users WHERE id = ?').get(userId) as any;
-        const notificationContent = `${liker.name} a aimé votre publication.`;
-        const notifResult = db.prepare('INSERT INTO notifications (userId, type, content, relatedId) VALUES (?, ?, ?, ?)').run(
-          post.authorId, 'like', notificationContent, postId
-        );
-
-        // Emit real-time notification
-        io.to(`user_${post.authorId}`).emit('notification', {
-          id: notifResult.lastInsertRowid,
-          userId: post.authorId,
-          type: 'like',
-          content: notificationContent,
-          relatedId: Number(postId),
-          read: 0,
-          createdAt: new Date().toISOString()
-        });
-      }
-      
-      res.json({ liked: true, type });
-    }
-  });
-
-  // 10.2 Get Post Comments
-  app.get('/api/posts/:id/comments', authenticate, (req: any, res) => {
-    const comments = db.prepare(`
-      SELECT c.*, u.name as authorName, u.avatarUrl as authorAvatar 
-      FROM post_comments c
-      JOIN users u ON c.userId = u.id
-      WHERE c.postId = ?
-      ORDER BY c.createdAt ASC
-    `).all(req.params.id);
-    res.json(comments);
-  });
-
-  // 10.2.1 Get Post Reactions
-  app.get('/api/posts/:id/reactions', authenticate, (req: any, res) => {
-    const reactions = db.prepare(`
-      SELECT l.type, u.id as userId, u.name as userName, u.avatarUrl as userAvatar
-      FROM post_likes l
-      JOIN users u ON l.userId = u.id
-      WHERE l.postId = ?
-      ORDER BY l.createdAt DESC
-    `).all(req.params.id);
-    res.json(reactions);
-  });
-
-  // 10.3 Add Comment
-  app.post('/api/posts/:id/comments', authenticate, (req: any, res) => {
-    const { content } = req.body;
-    const postId = req.params.id;
-    const stmt = db.prepare('INSERT INTO post_comments (postId, userId, content) VALUES (?, ?, ?)');
-    const info = stmt.run(postId, req.userId, content);
-    const commentId = info.lastInsertRowid;
-
-    // Handle mentions in comment content
-    handleMentions(content, req.userId, Number(postId), 'comment');
-
-    // Create notification for post author
-    const post = db.prepare('SELECT authorId FROM posts WHERE id = ?').get(postId) as any;
-    if (post && post.authorId !== req.userId) {
-      const commenter = db.prepare('SELECT name FROM users WHERE id = ?').get(req.userId) as any;
-      const notificationContent = `${commenter.name} a commenté votre publication.`;
-      const notifResult = db.prepare('INSERT INTO notifications (userId, type, content, relatedId) VALUES (?, ?, ?, ?)').run(
-        post.authorId, 'comment', notificationContent, postId
-      );
-
-      // Emit real-time notification
-      io.to(`user_${post.authorId}`).emit('notification', {
-        id: notifResult.lastInsertRowid,
-        userId: post.authorId,
-        type: 'comment',
-        content: notificationContent,
-        relatedId: Number(postId),
-        read: 0,
-        createdAt: new Date().toISOString()
-      });
-    }
-
-    res.json({ id: info.lastInsertRowid });
-  });
-
-  // 10.3.1 Update Comment
-  app.put('/api/posts/:postId/comments/:commentId', authenticate, (req: any, res) => {
-    const { content } = req.body;
-    const { commentId } = req.params;
-    const userId = req.userId;
-
-    const comment = db.prepare('SELECT userId, postId FROM post_comments WHERE id = ?').get(commentId) as any;
-    if (!comment) return res.status(404).json({ error: 'Commentaire non trouvé' });
-    if (comment.userId !== userId) return res.status(403).json({ error: 'Non autorisé' });
-
-    db.prepare('UPDATE post_comments SET content = ? WHERE id = ?').run(content, commentId);
-
-    // Handle mentions in updated comment
-    if (content) {
-      handleMentions(content, userId, comment.postId, 'comment');
-    }
-
-    res.json({ success: true });
-  });
-
-  // 10.3.2 Delete Comment
-  app.delete('/api/posts/:postId/comments/:commentId', authenticate, (req: any, res) => {
-    const { commentId } = req.params;
-    const userId = req.userId;
-
-    const comment = db.prepare('SELECT userId FROM post_comments WHERE id = ?').get(commentId) as any;
-    if (!comment) return res.status(404).json({ error: 'Commentaire non trouvé' });
-    if (comment.userId !== userId) return res.status(403).json({ error: 'Non autorisé' });
-
-    db.prepare('DELETE FROM post_comments WHERE id = ?').run(commentId);
-    res.json({ success: true });
-  });
-
-  // 11. Create Service
-  app.post('/api/services', authenticate, (req: any, res) => {
-    const { title, description, availability, budget, type, companyName, location, contractType, fileUrl, category } = req.body;
-    const stmt = db.prepare('INSERT INTO services (providerId, title, description, availability, budget, type, companyName, location, contractType, fileUrl, category) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
-    const info = stmt.run(req.userId, title, description, availability, budget, type || 'projet', companyName, location, contractType, fileUrl, category);
-    res.json({ id: info.lastInsertRowid });
-  });
-
-  app.put('/api/services/:id', authenticate, (req: any, res) => {
-    const service = db.prepare('SELECT providerId FROM services WHERE id = ?').get(req.params.id) as any;
-    if (!service || service.providerId !== req.userId) return res.status(403).json({ error: 'Non autorisé' });
-    const { title, description, budget, availability, type, companyName, location, contractType, fileUrl, category } = req.body;
-    db.prepare('UPDATE services SET title = ?, description = ?, budget = ?, availability = ?, type = ?, companyName = ?, location = ?, contractType = ?, fileUrl = ?, category = ? WHERE id = ?').run(
-      title, description, budget, availability, type, companyName, location, contractType, fileUrl, category, req.params.id
-    );
-    res.json({ message: 'Service mis à jour' });
-  });
-
-  app.delete('/api/services/:id', authenticate, (req: any, res) => {
-    const service = db.prepare('SELECT providerId FROM services WHERE id = ?').get(req.params.id) as any;
-    if (!service || service.providerId !== req.userId) return res.status(403).json({ error: 'Non autorisé' });
-    db.prepare('DELETE FROM services WHERE id = ?').run(req.params.id);
-    db.prepare('DELETE FROM service_applications WHERE serviceId = ?').run(req.params.id);
-    res.json({ message: 'Service supprimé' });
-  });
-
-  // 10.4 Get Stories
-  app.get('/api/stories', authenticate, (req: any, res) => {
-    // Get stories from the last 24 hours from followed users OR own stories
-    const stories = db.prepare(`
-      SELECT DISTINCT s.*, u.name as authorName, u.avatarUrl as authorAvatar,
-             (SELECT COUNT(*) FROM story_views WHERE storyId = s.id) as viewsCount,
-             (SELECT COUNT(*) FROM story_reactions WHERE storyId = s.id) as reactionsCount,
-             EXISTS(SELECT 1 FROM story_views WHERE storyId = s.id AND userId = ?) as isViewed
-      FROM stories s
-      JOIN users u ON s.userId = u.id
-      LEFT JOIN follows f ON f.followingId = s.userId
-      WHERE (f.followerId = ? OR s.userId = ?) AND s.expiresAt > datetime('now')
-      ORDER BY s.createdAt DESC
-    `).all(req.userId, req.userId, req.userId);
-    res.json(stories);
-  });
-
-  // 10.4.1 Get Story Archives
-  app.get('/api/stories/archives', authenticate, (req: any, res) => {
-    const archives = db.prepare(`
-      SELECT DISTINCT s.*, u.name as authorName, u.avatarUrl as authorAvatar,
-             (SELECT COUNT(*) FROM story_views WHERE storyId = s.id) as viewsCount,
-             (SELECT COUNT(*) FROM story_reactions WHERE storyId = s.id) as reactionsCount,
-             1 as isViewed
-      FROM stories s
-      JOIN users u ON s.userId = u.id
-      LEFT JOIN story_views sv ON sv.storyId = s.id
-      WHERE s.userId = ? OR sv.userId = ?
-      ORDER BY s.createdAt DESC
-    `).all(req.userId, req.userId);
-    res.json(archives);
-  });
-
-  // 10.5 Create Story
-  app.post('/api/stories', authenticate, (req: any, res) => {
-    const { mediaUrl, mediaType } = req.body;
-    const stmt = db.prepare(`
-      INSERT INTO stories (userId, mediaUrl, mediaType, expiresAt)
-      VALUES (?, ?, ?, datetime('now', '+24 hours'))
-    `);
-    const info = stmt.run(req.userId, mediaUrl, mediaType || 'image');
-    res.json({ id: info.lastInsertRowid });
-  });
-
-  // 10.6 View Story
-  app.post('/api/stories/:id/view', authenticate, (req: any, res) => {
-    try {
-      db.prepare('INSERT INTO story_views (storyId, userId) VALUES (?, ?)').run(req.params.id, req.userId);
-      res.json({ success: true });
-    } catch (e) {
-      // Already viewed
-      res.json({ success: true });
-    }
-  });
-
-  // 10.8 Get Story Viewers
-  app.get('/api/stories/:id/viewers', authenticate, (req: any, res) => {
-    const viewers = db.prepare(`
-      SELECT u.id, u.name, u.avatarUrl
-      FROM story_views sv
-      JOIN users u ON sv.userId = u.id
-      WHERE sv.storyId = ?
-    `).all(req.params.id);
-    res.json(viewers);
-  });
-
-  // 10.9 Get Story Reactions
-  app.get('/api/stories/:id/reactions', authenticate, (req: any, res) => {
-    const reactions = db.prepare(`
-      SELECT u.id, u.name, u.avatarUrl, sr.emoji
-      FROM story_reactions sr
-      JOIN users u ON sr.userId = u.id
-      WHERE sr.storyId = ?
-    `).all(req.params.id);
-    res.json(reactions);
-  });
-
-  // 10.7 React to Story
-  app.post('/api/stories/:id/react', authenticate, (req: any, res) => {
-    const { emoji } = req.body;
-    db.prepare('INSERT INTO story_reactions (storyId, userId, emoji) VALUES (?, ?, ?)').run(req.params.id, req.userId, emoji);
-    res.json({ success: true });
-  });
-
-  // 12. Get Services
-  app.get('/api/services', authenticate, (req, res) => {
-    const services = db.prepare(`
-      SELECT s.*, u.name as providerName, u.avatarUrl as providerAvatar 
-      FROM services s 
-      JOIN users u ON s.providerId = u.id 
-      ORDER BY s.createdAt DESC
-    `).all();
-    res.json(services);
-  });
-
-  // 13. Apply to Service
-  app.post('/api/services/:id/apply', authenticate, (req: any, res) => {
-    const { message, contactDetails } = req.body;
-    const serviceId = req.params.id;
-    try {
-      db.prepare('INSERT INTO service_applications (serviceId, userId, message, contactDetails) VALUES (?, ?, ?, ?)').run(serviceId, req.userId, message, contactDetails);
-      
-      // Create notification for service provider
-      const service = db.prepare('SELECT providerId, title FROM services WHERE id = ?').get(serviceId) as any;
-      if (service && service.providerId !== req.userId) {
-        const applicant = db.prepare('SELECT name FROM users WHERE id = ?').get(req.userId) as any;
-        const notificationContent = `${applicant.name} a postulé à votre service: ${service.title}`;
-        const notifResult = db.prepare('INSERT INTO notifications (userId, type, content, relatedId) VALUES (?, ?, ?, ?)').run(
-          service.providerId, 'service_application', notificationContent, serviceId
-        );
-
-        // Emit real-time notification
-        io.to(`user_${service.providerId}`).emit('notification', {
-          id: notifResult.lastInsertRowid,
-          userId: service.providerId,
-          type: 'service_application',
-          content: notificationContent,
-          relatedId: Number(serviceId),
-          read: 0,
-          createdAt: new Date().toISOString()
-        });
-      }
-
-      res.json({ message: 'Candidature envoyée' });
-    } catch (e) {
-      res.status(400).json({ error: 'Vous avez déjà postulé à cette offre' });
-    }
-  });
-
-  // 14. Follow User
-  app.post('/api/users/:id/follow', authenticate, (req: any, res) => {
-    const followingId = req.params.id;
-    try {
-      db.prepare('INSERT INTO follows (followerId, followingId) VALUES (?, ?)').run(req.userId, followingId);
-      
-      // Create notification for followed user
-      const follower = db.prepare('SELECT name FROM users WHERE id = ?').get(req.userId) as any;
-      const notificationContent = `${follower.name} a commencé à vous suivre.`;
-      const notifResult = db.prepare('INSERT INTO notifications (userId, type, content, relatedId) VALUES (?, ?, ?, ?)').run(
-        followingId, 'follow', notificationContent, req.userId
-      );
-
-      // Emit real-time notification
-      io.to(`user_${followingId}`).emit('notification', {
-        id: notifResult.lastInsertRowid,
-        userId: Number(followingId),
-        type: 'follow',
-        content: notificationContent,
-        relatedId: req.userId,
-        read: 0,
-        createdAt: new Date().toISOString()
-      });
-
-      res.json({ message: 'Utilisateur suivi' });
-    } catch (e) {
-      res.status(400).json({ error: 'Déjà suivi' });
-    }
-  });
-
-  // 15. Get My Events
-  app.get('/api/users/me/events', authenticate, (req: any, res) => {
-    const events = db.prepare(`
-      SELECT e.* FROM events e
-      JOIN event_participants ep ON e.id = ep.eventId
-      WHERE ep.userId = ?
-      ORDER BY e.startDate ASC
-    `).all(req.userId);
-    res.json(events);
-  });
-
-  app.get('/api/users/:id/events', authenticate, (req: any, res) => {
-    const events = db.prepare(`
-      SELECT e.* FROM events e
-      JOIN event_participants ep ON e.id = ep.eventId
-      WHERE ep.userId = ?
-      ORDER BY e.startDate ASC
-    `).all(req.params.id);
-    res.json(events);
-  });
-
-  // 16. Get My Services (Created & Applied)
-  app.get('/api/users/me/services', authenticate, (req: any, res) => {
-    const created = db.prepare('SELECT * FROM services WHERE providerId = ? ORDER BY createdAt DESC').all(req.userId);
-    const applied = db.prepare(`
-      SELECT s.* FROM services s
-      JOIN service_applications sa ON s.id = sa.serviceId
-      WHERE sa.userId = ?
-      ORDER BY sa.createdAt DESC
-    `).all(req.userId);
-    res.json({ created, applied });
-  });
-
-  // 17. Get My Network (Following)
-  app.get('/api/users/me/following', authenticate, (req: any, res) => {
-    const following = db.prepare(`
-      SELECT u.id, u.name, u.profession, u.avatarUrl, u.company, u.badge 
-      FROM users u
-      JOIN follows f ON u.id = f.followingId
-      WHERE f.followerId = ?
-    `).all(req.userId);
-    res.json(following);
-  });
-
-  // 18. Get Conversations List (Updated to include rooms)
-  app.get('/api/conversations', authenticate, (req: any, res) => {
-    // 1-on-1 conversations (legacy/direct)
-    const directConversations = db.prepare(`
-      SELECT u.id, u.name, u.avatarUrl, MAX(m.createdAt) as lastMessageAt,
-             (SELECT content FROM messages WHERE ((senderId = u.id AND receiverId = ?) OR (senderId = ? AND receiverId = u.id)) AND roomId IS NULL ORDER BY createdAt DESC LIMIT 1) as lastMessage,
-             (SELECT COUNT(*) FROM messages WHERE senderId = u.id AND receiverId = ? AND read = 0 AND roomId IS NULL) as unreadCount,
-             'direct' as type
-      FROM users u
-      JOIN messages m ON u.id = m.senderId OR u.id = m.receiverId
-      WHERE (m.senderId = ? OR m.receiverId = ?) AND u.id != ? AND m.roomId IS NULL
-      GROUP BY u.id
-    `).all(req.userId, req.userId, req.userId, req.userId, req.userId, req.userId);
-
-    // Group conversations (rooms)
-    const roomConversations = db.prepare(`
-      SELECT cr.id, cr.name, cr.avatarUrl, MAX(m.createdAt) as lastMessageAt,
-             (SELECT content FROM messages WHERE roomId = cr.id ORDER BY createdAt DESC LIMIT 1) as lastMessage,
-             (SELECT COUNT(*) FROM messages WHERE roomId = cr.id AND read = 0 AND senderId != ?) as unreadCount,
-             cr.type
-      FROM chat_rooms cr
-      JOIN chat_room_members crm ON cr.id = crm.roomId
-      LEFT JOIN messages m ON cr.id = m.roomId
-      WHERE crm.userId = ?
-      GROUP BY cr.id
-    `).all(req.userId, req.userId);
-
-    const allConversations = [...directConversations, ...roomConversations].sort((a: any, b: any) => 
-      new Date(b.lastMessageAt || 0).getTime() - new Date(a.lastMessageAt || 0).getTime()
-    );
-
-    res.json(allConversations);
-  });
-
-  // 18.1 Create Chat Room
-  app.post('/api/chat-rooms', authenticate, (req: any, res) => {
-    const { name, type, memberIds, avatarUrl } = req.body;
-    const info = db.prepare('INSERT INTO chat_rooms (name, type, avatarUrl, creatorId) VALUES (?, ?, ?, ?)').run(
-      name || null, type || 'group', avatarUrl || null, req.userId
-    );
-    const roomId = info.lastInsertRowid;
-
-    // Add creator as member
-    db.prepare('INSERT INTO chat_room_members (roomId, userId) VALUES (?, ?)').run(roomId, req.userId);
-
-    // Add other members
-    if (memberIds && Array.isArray(memberIds)) {
-      const stmt = db.prepare('INSERT OR IGNORE INTO chat_room_members (roomId, userId) VALUES (?, ?)');
-      memberIds.forEach(id => stmt.run(roomId, id));
-    }
-
-    res.json({ id: roomId, name, type, avatarUrl });
-  });
-
-  // 18.2 Add Members to Room
-  app.post('/api/chat-rooms/:id/members', authenticate, (req: any, res) => {
-    const { userIds } = req.body;
-    const roomId = req.params.id;
-
-    if (!userIds || !Array.isArray(userIds)) return res.status(400).json({ error: 'userIds requis' });
-
-    const stmt = db.prepare('INSERT OR IGNORE INTO chat_room_members (roomId, userId) VALUES (?, ?)');
-    userIds.forEach(id => stmt.run(roomId, id));
-
-    res.json({ success: true });
-  });
-
-  // 18.3 Get Room Messages
-  app.get('/api/chat-rooms/:id/messages', authenticate, (req: any, res) => {
-    const roomId = req.params.id;
-    const messages = db.prepare(`
-      SELECT m.*, u.name as senderName, u.avatarUrl as senderAvatar,
-             (SELECT json_group_array(json_object('userId', userId, 'emoji', emoji)) 
-              FROM message_reactions WHERE messageId = m.id) as reactions,
-             (SELECT content FROM messages WHERE id = m.replyToId) as replyContent,
-             (SELECT name FROM users WHERE id = (SELECT senderId FROM messages WHERE id = m.replyToId)) as replySenderName
-      FROM messages m
-      JOIN users u ON m.senderId = u.id
-      WHERE m.roomId = ?
-      ORDER BY m.createdAt ASC
-    `).all(roomId);
-    
-    const parsedMessages = messages.map((m: any) => ({
-      ...m,
-      reactions: m.reactions ? JSON.parse(m.reactions) : []
-    }));
-    res.json(parsedMessages);
-  });
-
-  // 18.4 Send Room Message
-  app.post('/api/chat-rooms/:id/messages', authenticate, (req: any, res) => {
-    const roomId = req.params.id;
-    const { content, fileUrl, fileType, fileName, replyToId } = req.body;
-
-    const info = db.prepare('INSERT INTO messages (senderId, roomId, content, fileUrl, fileType, fileName, replyToId) VALUES (?, ?, ?, ?, ?, ?, ?)')
-      .run(req.userId, roomId, content || '', fileUrl || null, fileType || null, fileName || null, replyToId || null);
-
-    const sender = db.prepare('SELECT name, avatarUrl FROM users WHERE id = ?').get(req.userId) as any;
-    
-    let replyContent = null;
-    let replySenderName = null;
-    if (replyToId) {
-      const parentMsg = db.prepare('SELECT m.content, u.name FROM messages m JOIN users u ON m.senderId = u.id WHERE m.id = ?').get(replyToId) as any;
-      if (parentMsg) {
-        replyContent = parentMsg.content;
-        replySenderName = parentMsg.name;
-      }
-    }
-
-    const message = {
-      id: info.lastInsertRowid,
-      senderId: req.userId,
-      roomId: Number(roomId),
-      content: content || '',
-      fileUrl: fileUrl || null,
-      fileType: fileType || null,
-      fileName: fileName || null,
-      replyToId: replyToId || null,
-      replyContent,
-      replySenderName,
-      senderName: sender.name,
-      senderAvatar: sender.avatarUrl,
-      createdAt: new Date().toISOString(),
-      read: 0,
-      reactions: []
-    };
-
-    // Emit to all room members
-    const members = db.prepare('SELECT userId FROM chat_room_members WHERE roomId = ?').all(roomId) as any[];
-    members.forEach(m => {
-      io.to(`user_${m.userId}`).emit('message', message);
-    });
-
-    // Handle mentions in group message
-    if (content) {
-      handleMentions(content, req.userId, Number(roomId), 'message');
-    }
-
-    res.json(message);
-  });
-
-  // 18.5 Get Room Members
-  app.get('/api/chat-rooms/:id/members', authenticate, (req: any, res) => {
-    const members = db.prepare(`
-      SELECT u.id, u.name, u.avatarUrl, u.profession
-      FROM users u
-      JOIN chat_room_members crm ON u.id = crm.userId
-      WHERE crm.roomId = ?
-    `).all(req.params.id);
-    res.json(members);
-  });
-
-  // 18.6 Update Room Settings
-  app.put('/api/chat-rooms/:id', authenticate, (req: any, res) => {
-    const { name, avatarUrl } = req.body;
-    const room = db.prepare('SELECT * FROM chat_rooms WHERE id = ?').get(req.params.id) as any;
-    if (!room) return res.status(404).json({ error: 'Room not found' });
-    
-    db.prepare('UPDATE chat_rooms SET name = ?, avatarUrl = ? WHERE id = ?').run(
-      name !== undefined ? name : room.name,
-      avatarUrl !== undefined ? avatarUrl : room.avatarUrl,
-      req.params.id
-    );
-    res.json({ success: true });
-  });
-
-  // 19. Get Conversation with User
-  app.get('/api/messages/:userId', authenticate, (req: any, res) => {
-    console.log(`Fetching conversation with user: ${req.params.userId}, current user: ${req.userId}`);
-    const messages = db.prepare(`
-      SELECT m.*,
-             (SELECT json_group_array(json_object('userId', userId, 'emoji', emoji)) 
-              FROM message_reactions WHERE messageId = m.id) as reactions,
-             (SELECT content FROM messages WHERE id = m.replyToId) as replyContent,
-             (SELECT name FROM users WHERE id = (SELECT senderId FROM messages WHERE id = m.replyToId)) as replySenderName
-      FROM messages m 
-      WHERE (m.senderId = ? AND m.receiverId = ?) OR (m.senderId = ? AND m.receiverId = ?)
-      ORDER BY m.createdAt ASC
-    `).all(req.userId, req.params.userId, req.params.userId, req.userId);
-    
-    const parsedMessages = messages.map((m: any) => ({
-      ...m,
-      reactions: m.reactions ? JSON.parse(m.reactions) : []
-    }));
-    res.json(parsedMessages);
-  });
-
-  app.put('/api/messages/:id/pin', authenticate, (req: any, res) => {
-    const messageId = req.params.id;
-    const userId = req.userId;
-
-    const message = db.prepare('SELECT * FROM messages WHERE id = ?').get(messageId) as any;
-    if (!message) return res.status(404).json({ error: 'Message non trouvé' });
-
-    let allow = false;
-    if (message.roomId) {
-      const room = db.prepare('SELECT * FROM chat_rooms WHERE id = ?').get(message.roomId) as any;
-      if (room.creatorId === userId) allow = true;
-      else {
-        const membership = db.prepare('SELECT * FROM chat_room_members WHERE roomId = ? AND userId = ?').get(message.roomId, userId);
-        if (membership) allow = true; 
-      }
-    } else {
-      if (message.senderId === userId || message.receiverId === userId) allow = true;
-    }
-
-    if (!allow) return res.status(403).json({ error: 'Non autorisé' });
-
-    let pinnedCount = 0;
-    if (message.roomId) {
-      pinnedCount = (db.prepare('SELECT COUNT(*) as count FROM messages WHERE roomId = ? AND isPinned = 1').get(message.roomId) as any).count;
-    } else {
-      const pair = [message.senderId, message.receiverId].sort();
-      pinnedCount = (db.prepare('SELECT COUNT(*) as count FROM messages WHERE roomId IS NULL AND isPinned = 1 AND ((senderId = ? AND receiverId = ?) OR (senderId = ? AND receiverId = ?))').get(pair[0], pair[1], pair[1], pair[0]) as any).count;
-    }
-
-    if (pinnedCount >= 3) return res.status(400).json({ error: 'Maximum 3 messages épinglés' });
-
-    db.prepare('UPDATE messages SET isPinned = 1 WHERE id = ?').run(messageId);
-    res.json({ success: true });
-  });
-
-  app.put('/api/messages/:id/unpin', authenticate, (req: any, res) => {
-    const messageId = req.params.id;
-    db.prepare('UPDATE messages SET isPinned = 0 WHERE id = ?').run(messageId);
-    res.json({ success: true });
-  });
-
-  app.post('/api/messages/:id/react', authenticate, (req: any, res) => {
-    const { emoji } = req.body;
-    const messageId = req.params.id;
-    const userId = req.userId;
-
-    try {
-      const existing = db.prepare('SELECT emoji FROM message_reactions WHERE messageId = ? AND userId = ?').get(messageId, userId) as any;
-      
-      if (existing) {
-        if (existing.emoji === emoji) {
-          // Remove reaction if same emoji
-          db.prepare('DELETE FROM message_reactions WHERE messageId = ? AND userId = ?').run(messageId, userId);
-          return res.json({ action: 'removed', emoji });
-        } else {
-          // Update reaction if different emoji
-          db.prepare('UPDATE message_reactions SET emoji = ? WHERE messageId = ? AND userId = ?').run(emoji, messageId, userId);
-          return res.json({ action: 'updated', emoji });
-        }
-      } else {
-        // Add new reaction
-        db.prepare('INSERT INTO message_reactions (messageId, userId, emoji) VALUES (?, ?, ?)').run(messageId, userId, emoji);
-        return res.json({ action: 'added', emoji });
-      }
-    } catch (err: any) {
-      console.error(err);
-      res.status(500).json({ error: 'Erreur lors de la réaction' });
-    }
-  });
-
-  app.put('/api/messages/item/:id', authenticate, (req: any, res) => {
-    const { content } = req.body;
-    const messageId = req.params.id;
-    const userId = req.userId;
-
-    const message = db.prepare('SELECT senderId FROM messages WHERE id = ?').get(messageId) as any;
-    if (!message) return res.status(404).json({ error: 'Message non trouvé' });
-    if (message.senderId !== userId) return res.status(403).json({ error: 'Non autorisé' });
-
-    db.prepare('UPDATE messages SET content = ? WHERE id = ?').run(content, messageId);
-
-    // Handle mentions in updated message
-    if (content) {
-      const msg = db.prepare('SELECT roomId, receiverId FROM messages WHERE id = ?').get(messageId) as any;
-      const relatedId = msg.roomId || msg.receiverId || messageId;
-      handleMentions(content, userId, relatedId, 'message');
-    }
-
-    res.json({ success: true });
-  });
-
-  app.delete('/api/messages/item/:id', authenticate, (req: any, res) => {
-    const messageId = req.params.id;
-    const userId = req.userId;
-
-    const message = db.prepare('SELECT senderId FROM messages WHERE id = ?').get(messageId) as any;
-    if (!message) return res.status(404).json({ error: 'Message non trouvé' });
-    if (message.senderId !== userId) return res.status(403).json({ error: 'Non autorisé' });
-
-    db.prepare('DELETE FROM messages WHERE id = ?').run(messageId);
-    db.prepare('DELETE FROM message_reactions WHERE messageId = ?').run(messageId);
-    res.json({ success: true });
-  });
-
-  // 20. Send Message
-  app.post('/api/messages/:userId', authenticate, (req: any, res) => {
-    const { content, fileUrl, fileType, url, type, name, fileName, replyToId } = req.body;
-    const finalFileUrl = fileUrl || url;
-    const finalFileType = fileType || type;
-    const finalFileName = fileName || name;
-    
-    // Check if connected
-    const connection = db.prepare('SELECT status FROM connection_requests WHERE ((senderId = ? AND receiverId = ?) OR (senderId = ? AND receiverId = ?)) AND status = ?').get(req.userId, req.params.userId, req.params.userId, req.userId, 'accepted');
-    if (!connection && req.userId !== 1) { // Admin can bypass
-      return res.status(403).json({ error: 'Vous devez être connectés pour échanger des messages.' });
-    }
-    
-    const stmt = db.prepare('INSERT INTO messages (senderId, receiverId, content, fileUrl, fileType, fileName, replyToId) VALUES (?, ?, ?, ?, ?, ?, ?)');
-    const info = stmt.run(req.userId, req.params.userId, content || '', finalFileUrl || null, finalFileType || null, finalFileName || null, replyToId || null);
-    
-    let replyContent = null;
-    let replySenderName = null;
-    if (replyToId) {
-      const parentMsg = db.prepare('SELECT m.content, u.name FROM messages m JOIN users u ON m.senderId = u.id WHERE m.id = ?').get(replyToId) as any;
-      if (parentMsg) {
-        replyContent = parentMsg.content;
-        replySenderName = parentMsg.name;
-      }
-    }
-
-    const message = { 
-      id: info.lastInsertRowid, 
-      content: content || '', 
-      fileUrl: finalFileUrl || null,
-      fileType: finalFileType || null,
-      fileName: finalFileName || null,
-      replyToId: replyToId || null,
-      replyContent,
-      replySenderName,
-      senderId: req.userId, 
-      receiverId: Number(req.params.userId), 
-      createdAt: new Date().toISOString(),
-      read: 0,
-      reactions: []
-    };
-    
-    // Emit to receiver and sender (for multi-tab sync)
-    io.to(`user_${req.params.userId}`).emit('message', message);
-    io.to(`user_${req.userId}`).emit('message', message);
-    
-    // Handle mentions in direct message
-    if (content) {
-      handleMentions(content, req.userId, req.userId, 'message');
-    }
-
-    // Create notification for receiver
-    const sender = db.prepare('SELECT name FROM users WHERE id = ?').get(req.userId) as any;
-    const notificationContent = `Nouveau message de ${sender.name}`;
-    const notifResult = db.prepare('INSERT INTO notifications (userId, type, content, relatedId) VALUES (?, ?, ?, ?)').run(
-      req.params.userId, 'message', notificationContent, req.userId
-    );
-
-    // Emit real-time notification
-    io.to(`user_${req.params.userId}`).emit('notification', {
-      id: notifResult.lastInsertRowid,
-      userId: Number(req.params.userId),
-      type: 'message',
-      content: notificationContent,
-      relatedId: req.userId,
-      read: 0,
-      createdAt: new Date().toISOString()
-    });
-    
-    res.json(message);
-  });
-
-  // 21. Mark Messages as Read
-  app.put('/api/messages/:userId/read', authenticate, (req: any, res) => {
-    db.prepare('UPDATE messages SET read = 1 WHERE senderId = ? AND receiverId = ?').run(req.params.userId, req.userId);
-    res.json({ success: true });
-  });
-
-  // 22. Clear Chat History
-  app.delete('/api/messages/:userId/history', authenticate, (req: any, res) => {
-    db.prepare('DELETE FROM messages WHERE (senderId = ? AND receiverId = ?) OR (senderId = ? AND receiverId = ?)')
-      .run(req.userId, req.params.userId, req.params.userId, req.userId);
-    res.json({ success: true });
-  });
-
-  // 23. Delete Conversation (actually alias for Clear History as conversations are implicitly created by messages)
-  app.delete('/api/messages/:userId', authenticate, (req: any, res) => {
-    db.prepare('DELETE FROM messages WHERE (senderId = ? AND receiverId = ?) OR (senderId = ? AND receiverId = ?)')
-      .run(req.userId, req.params.userId, req.params.userId, req.userId);
-    res.json({ success: true });
-  });
-
-  // 24. Get My Cells
-  app.get('/api/cells/me', authenticate, (req: any, res) => {
-    const cells = db.prepare(`
-      SELECT c.*, 
-             (SELECT COUNT(*) FROM cell_members WHERE cellId = c.id) as membersCount,
-             cm.role as currentUserRole,
-             s.name as sponsorName
-      FROM cells c
-      JOIN cell_members cm ON c.id = cm.cellId
-      LEFT JOIN users s ON c.sponsorId = s.id
-      WHERE cm.userId = ?
-      ORDER BY c.createdAt DESC
-    `).all(req.userId);
-    res.json(cells);
-  });
-
-  // 23. Get All Cells
-  app.get('/api/cells/all', authenticate, (req: any, res) => {
-    const cells = db.prepare(`
-      SELECT c.*, 
-             (SELECT COUNT(*) FROM cell_members WHERE cellId = c.id) as membersCount,
-             (SELECT role FROM cell_members WHERE cellId = c.id AND userId = ?) as currentUserRole,
-             u.name as creatorName,
-             u.avatarUrl as creatorAvatar,
-             s.name as sponsorName
-      FROM cells c
-      JOIN users u ON c.creatorId = u.id
-      LEFT JOIN users s ON c.sponsorId = s.id
-      ORDER BY c.createdAt DESC
-    `).all(req.userId);
-    res.json((cells as any[]).map((cell: any) => {
-      if (cell.currentUserRole) return cell;
-      return {
-        id: cell.id,
-        name: cell.name,
-        coverUrl: cell.coverUrl,
-        membersCount: cell.membersCount
-      };
-    }));
-  });
-
-  // Create Cell
-  app.post('/api/cells', authenticate, (req: any, res) => {
-    const { name, description, sponsorId, coverUrl } = req.body;
-    if (!name) {
-      return res.status(400).json({ error: 'Le nom est requis' });
-    }
-    
-    try {
-      const cellInsert = db.prepare('INSERT INTO cells (name, description, sponsorId, creatorId, coverUrl) VALUES (?, ?, ?, ?, ?)');
-      const cellInfo = cellInsert.run(name, description || null, sponsorId || null, req.userId, coverUrl || null);
-      const cellId = cellInfo.lastInsertRowid;
-      
-      // Add creator as admin
-      db.prepare('INSERT INTO cell_members (cellId, userId, role) VALUES (?, ?, ?)').run(cellId, req.userId, 'admin');
-      
-      // Add sponsor as member if provided
-      if (sponsorId && sponsorId !== req.userId) {
-        db.prepare('INSERT OR IGNORE INTO cell_members (cellId, userId, role) VALUES (?, ?, ?)').run(cellId, sponsorId, 'member');
-        
-        // Create notification for sponsor
-        const creator = db.prepare('SELECT name FROM users WHERE id = ?').get(req.userId) as any;
-        const notificationContent = `${creator.name} vous a sélectionné comme parrain pour la cellule: ${name}`;
-        const notifResult = db.prepare('INSERT INTO notifications (userId, type, content, relatedId) VALUES (?, ?, ?, ?)').run(
-          sponsorId, 'cell_sponsor', notificationContent, cellId
-        );
-
-        // Emit real-time notification
-        io.to(`user_${sponsorId}`).emit('notification', {
-          id: notifResult.lastInsertRowid,
-          userId: Number(sponsorId),
-          type: 'cell_sponsor',
-          content: notificationContent,
-          relatedId: Number(cellId),
-          read: 0,
-          createdAt: new Date().toISOString()
-        });
-      }
-      
-      res.json({ success: true, id: cellId });
-    } catch (err) {
-      console.error(err);
-      res.status(500).json({ error: 'Erreur lors de la création de la cellule' });
-    }
-  });
-
-  // 24. Update Cell
-  app.put('/api/cells/:id', authenticate, (req: any, res) => {
-    const { name } = req.body;
-    const cell = db.prepare('SELECT * FROM cells WHERE id = ?').get(req.params.id) as any;
-    if (!cell || cell.creatorId !== req.userId) {
-      return res.status(403).json({ error: 'Seul le créateur peut modifier la cellule' });
-    }
-    db.prepare('UPDATE cells SET name = ? WHERE id = ?').run(name, req.params.id);
-    res.json({ success: true });
-  });
-
-  // 25. Add Member to Cell
-  app.post('/api/cells/:id/members', authenticate, (req: any, res) => {
-    const { userId } = req.body;
-    const cellId = req.params.id;
-    const cell = db.prepare('SELECT * FROM cells WHERE id = ?').get(cellId) as any;
-    if (!cell || cell.creatorId !== req.userId) {
-      return res.status(403).json({ error: 'Seul le créateur peut ajouter des membres' });
-    }
-    db.prepare('INSERT OR IGNORE INTO cell_members (cellId, userId) VALUES (?, ?)').run(cellId, userId);
-    
-    // Create notification for added user
-    const notificationContent = `Vous avez été ajouté au groupe: ${cell.name}`;
-    const notifResult = db.prepare('INSERT INTO notifications (userId, type, content, relatedId) VALUES (?, ?, ?, ?)').run(
-      userId, 'cell_add_member', notificationContent, cellId
-    );
-
-    // Emit real-time notification
-    io.to(`user_${userId}`).emit('notification', {
-      id: notifResult.lastInsertRowid,
-      userId: Number(userId),
-      type: 'cell_add_member',
-      content: notificationContent,
-      relatedId: Number(cellId),
-      read: 0,
-      createdAt: new Date().toISOString()
-    });
-
-    res.json({ success: true });
-  });
-
-  // 25.1 Update Cell
-  app.put('/api/cells/:id', authenticate, (req: any, res) => {
-    const { name, description, coverUrl } = req.body;
-    const cell = db.prepare('SELECT * FROM cells WHERE id = ?').get(req.params.id) as any;
-    if (!cell || cell.creatorId !== req.userId) {
-      return res.status(403).json({ error: 'Non autorisé' });
-    }
-    db.prepare('UPDATE cells SET name = ?, description = ?, coverUrl = ? WHERE id = ?').run(name, description, coverUrl, req.params.id);
-    res.json({ success: true });
-  });
-
-  // 26. Get Cell Members
-  app.get('/api/cells/:id/members', authenticate, (req: any, res) => {
-    const members = db.prepare(`
-      SELECT u.id, u.name, u.avatarUrl, u.profession, cm.role, cm.joinedAt
-      FROM users u
-      JOIN cell_members cm ON u.id = cm.userId
-      WHERE cm.cellId = ?
-      ORDER BY cm.joinedAt ASC
-    `).all(req.params.id);
-    res.json(members);
-  });
-
-  // 27. Delete Cell
-  app.delete('/api/cells/:id', authenticate, (req: any, res) => {
-    const cell = db.prepare('SELECT * FROM cells WHERE id = ?').get(req.params.id) as any;
-    if (!cell) {
-      return res.status(404).json({ error: 'Cellule introuvable' });
-    }
-
-    // Check if user is creator, global admin, or cell admin
-    const user = db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId) as any;
-    const cellMember = db.prepare('SELECT role FROM cell_members WHERE cellId = ? AND userId = ?').get(req.params.id, req.userId) as any;
-    
-    const isGlobalAdmin = user?.role === 'admin';
-    const isCreator = cell.creatorId === req.userId;
-    const isCellAdmin = cellMember?.role === 'admin';
-
-    if (!isCreator && !isGlobalAdmin && !isCellAdmin) {
-      return res.status(403).json({ error: 'Vous n\'avez pas les permissions pour supprimer cette cellule' });
-    }
-    
-    // Delete cell and its members
-    db.prepare('DELETE FROM cell_members WHERE cellId = ?').run(req.params.id);
-    db.prepare('DELETE FROM cells WHERE id = ?').run(req.params.id);
-    // Also delete posts associated with the cell
-    db.prepare('DELETE FROM posts WHERE cellId = ?').run(req.params.id);
-    
-    res.json({ success: true });
-  });
-
-  // 28. Get All Companies
-  app.get('/api/companies', authenticate, (req: any, res) => {
-    const companies = db.prepare(`
-      SELECT c.*, 
-      (SELECT COUNT(*) FROM favorite_companies WHERE companyId = c.id) as followers,
-      (SELECT AVG(rating) FROM reviews WHERE targetType = 'company' AND targetId = c.id) as averageRating,
-      (SELECT COUNT(*) FROM reviews WHERE targetType = 'company' AND targetId = c.id) as reviewCount
-      FROM companies c
-    `).all();
-    res.json(companies);
-  });
-
-  // 28.1 Get New Companies
-  app.get('/api/companies/new', authenticate, (req: any, res) => {
-    const companies = db.prepare(`
-      SELECT c.*, 
-      (SELECT COUNT(*) FROM favorite_companies WHERE companyId = c.id) as followers,
-      (SELECT AVG(rating) FROM reviews WHERE targetType = 'company' AND targetId = c.id) as averageRating,
-      (SELECT COUNT(*) FROM reviews WHERE targetType = 'company' AND targetId = c.id) as reviewCount
-      FROM companies c 
-      ORDER BY c.id DESC LIMIT 10
-    `).all();
-    res.json(companies);
-  });
-
-  // Get Promotional Products
-  app.get('/api/products/promotions', authenticate, (req: any, res) => {
-    const products = db.prepare(`
-      SELECT p.*, c.name as companyName, c.logoUrl as companyLogo,
-      (SELECT 1 FROM favorite_products WHERE productId = p.id AND userId = ?) as isFavorite,
-      (SELECT COUNT(*) FROM favorite_products WHERE productId = p.id) as favoritesCount,
-      (SELECT AVG(rating) FROM reviews WHERE targetType = 'product' AND targetId = p.id) as averageRating,
-      (SELECT COUNT(*) FROM reviews WHERE targetType = 'product' AND targetId = p.id) as reviewCount
-      FROM company_catalog p
-      JOIN companies c ON p.companyId = c.id
-      WHERE p.tag = 'Promotion' OR p.tag = 'Offre flash'
-      ORDER BY RANDOM()
-    `).all(req.userId);
-    res.json(products);
-  });
-
-  // Get Recent Products
-  app.get('/api/products/recent', authenticate, (req: any, res) => {
-    const products = db.prepare(`
-      SELECT p.*, c.name as companyName, c.logoUrl as companyLogo,
-      (SELECT 1 FROM favorite_products WHERE productId = p.id AND userId = ?) as isFavorite,
-      (SELECT COUNT(*) FROM favorite_products WHERE productId = p.id) as favoritesCount,
-      (SELECT AVG(rating) FROM reviews WHERE targetType = 'product' AND targetId = p.id) as averageRating,
-      (SELECT COUNT(*) FROM reviews WHERE targetType = 'product' AND targetId = p.id) as reviewCount
-      FROM company_catalog p
-      JOIN companies c ON p.companyId = c.id
-      ORDER BY p.id DESC LIMIT 12
-    `).all(req.userId);
-    res.json(products);
-  });
-
-  // Get Trending Companies (based on followers/favorites)
-  app.get('/api/companies/trending', authenticate, (req: any, res) => {
-    const companies = db.prepare(`
-      SELECT c.*, 
-      (SELECT COUNT(*) FROM favorite_companies WHERE companyId = c.id) as followers,
-      (SELECT AVG(rating) FROM reviews WHERE targetType = 'company' AND targetId = c.id) as averageRating,
-      (SELECT COUNT(*) FROM reviews WHERE targetType = 'company' AND targetId = c.id) as reviewCount
-      FROM companies c 
-      ORDER BY followers DESC LIMIT 10
-    `).all();
-    res.json(companies);
-  });
-
-  // 29. Create Company
-  app.post('/api/companies', authenticate, (req: any, res) => {
-    const { name, sector, description, address, whatsapp, facebook, twitter, linkedin, logoUrl, coverUrl, isShop, specialty, categories } = req.body;
-    
-    // Restriction: Manager cannot create own shop
-    const isManager = db.prepare('SELECT 1 FROM companies WHERE managerId = ?').get(req.userId);
-    if (isManager) {
-      return res.status(403).json({ error: 'Un gestionnaire ne peut pas créer sa propre boutique tant qu\'il occupe ce poste.' });
-    }
-
-    const stmt = db.prepare('INSERT INTO companies (ownerId, name, sector, description, address, whatsapp, facebook, twitter, linkedin, logoUrl, coverUrl, isShop, specialty, categories) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
-    const info = stmt.run(req.userId, name, sector, description, address, whatsapp, facebook, twitter, linkedin, logoUrl, coverUrl, isShop || 0, specialty, categories);
-    res.json({ id: info.lastInsertRowid });
-  });
-
-  // 30. Update Company
-  app.put('/api/companies/:id', authenticate, (req: any, res) => {
-    const { name, sector, description, address, whatsapp, facebook, twitter, linkedin, logoUrl, coverUrl, isShop, specialty, categories } = req.body;
-    const company = db.prepare('SELECT ownerId, managerId FROM companies WHERE id = ?').get(req.params.id) as any;
-    if (!company || (company.ownerId !== req.userId && company.managerId !== req.userId)) {
-      return res.status(403).json({ error: 'Seul le propriétaire ou le gestionnaire peut modifier l\'entreprise' });
-    }
-    db.prepare('UPDATE companies SET name = ?, sector = ?, description = ?, address = ?, whatsapp = ?, facebook = ?, twitter = ?, linkedin = ?, logoUrl = ?, coverUrl = ?, isShop = ?, specialty = ?, categories = ? WHERE id = ?')
-      .run(name, sector, description, address, whatsapp, facebook, twitter, linkedin, logoUrl, coverUrl, isShop || 0, specialty, categories, req.params.id);
-    res.json({ success: true });
-  });
-
-  // 30.1 Update Company Manager
-  app.put('/api/companies/:id/manager', authenticate, (req: any, res) => {
-    const { managerId } = req.body;
-    const company = db.prepare('SELECT ownerId, name, managerId as currentManagerId FROM companies WHERE id = ?').get(req.params.id) as any;
-    if (!company) return res.status(404).json({ error: 'Entreprise non trouvée' });
-    if (company.ownerId !== req.userId) {
-      return res.status(403).json({ error: 'Seul le propriétaire peut désigner un gestionnaire' });
-    }
-
-    // If revoking
-    if (!managerId && company.currentManagerId) {
-      const owner = db.prepare('SELECT name FROM users WHERE id = ?').get(req.userId) as any;
-      const content = `${owner.name} a révoqué votre rôle de gestionnaire pour sa boutique "${company.name}".`;
-      const notif = db.prepare('INSERT INTO notifications (userId, type, content, relatedId) VALUES (?, ?, ?, ?)').run(company.currentManagerId, 'manager_revoked', content, req.params.id);
-      
-      io.to(`user_${company.currentManagerId}`).emit('notification', {
-        id: notif.lastInsertRowid,
-        userId: company.currentManagerId,
-        type: 'manager_revoked',
-        content,
-        relatedId: Number(req.params.id),
-        read: 0,
-        createdAt: new Date().toISOString()
-      });
-    }
-
-    db.prepare('UPDATE companies SET managerId = ? WHERE id = ?').run(managerId || null, req.params.id);
-    
-    if (managerId) {
-      const owner = db.prepare('SELECT name FROM users WHERE id = ?').get(req.userId) as any;
-      const content = `${owner.name} vous a désigné comme gestionnaire pour sa boutique.`;
-      const notif = db.prepare('INSERT INTO notifications (userId, type, content, relatedId) VALUES (?, ?, ?, ?)').run(managerId, 'company_manager', content, req.params.id);
-      
-      io.to(`user_${managerId}`).emit('notification', {
-        id: notif.lastInsertRowid,
-        userId: managerId,
-        type: 'company_manager',
-        content,
-        relatedId: Number(req.params.id),
-        read: 0,
-        createdAt: new Date().toISOString()
-      });
-    }
-
-    res.json({ success: true });
-  });
-
-  // 30.2 Resign as Company Manager
-  app.post('/api/companies/:id/resign-manager', authenticate, (req: any, res) => {
-    const companyId = req.params.id;
-    const company = db.prepare('SELECT ownerId, name FROM companies WHERE id = ? AND managerId = ?').get(companyId, req.userId) as any;
-    
-    if (!company) {
-      return res.status(403).json({ error: 'Vous n\'êtes pas le gestionnaire de cette boutique.' });
-    }
-
-    db.prepare('UPDATE companies SET managerId = NULL WHERE id = ?').run(companyId);
-
-    const user = db.prepare('SELECT name FROM users WHERE id = ?').get(req.userId) as any;
-    const content = `${user.name} a renoncé à son rôle de gestionnaire pour votre boutique "${company.name}".`;
-    const notif = db.prepare('INSERT INTO notifications (userId, type, content, relatedId) VALUES (?, ?, ?, ?)').run(company.ownerId, 'manager_resigned', content, companyId);
-    
-    io.to(`user_${company.ownerId}`).emit('notification', {
-      id: notif.lastInsertRowid,
-      userId: company.ownerId,
-      type: 'manager_resigned',
-      content,
-      relatedId: Number(companyId),
-      read: 0,
-      createdAt: new Date().toISOString()
-    });
-
-    res.json({ success: true });
-  });
-
-  // 31. Delete Company
-  app.delete('/api/companies/:id', authenticate, (req: any, res) => {
-    const company = db.prepare('SELECT * FROM companies WHERE id = ?').get(req.params.id) as any;
-    if (!company || company.ownerId !== req.userId) {
-      return res.status(403).json({ error: 'Seul le propriétaire peut supprimer l\'entreprise' });
-    }
-    db.prepare('DELETE FROM company_catalog WHERE companyId = ?').run(req.params.id);
-    db.prepare('DELETE FROM companies WHERE id = ?').run(req.params.id);
-    res.json({ success: true });
-  });
-
-  // 32. Create Ad
-  app.post('/api/ads', authenticate, (req: any, res) => {
-    const { companyId, goal, content, targeting, budget, duration } = req.body;
-    const company = db.prepare('SELECT ownerId, managerId FROM companies WHERE id = ?').get(companyId) as any;
-    if (!company || (company.ownerId !== req.userId && company.managerId !== req.userId)) {
-      return res.status(403).json({ error: 'Seul le propriétaire ou le gestionnaire peut créer une publicité' });
-    }
-    const stmt = db.prepare('INSERT INTO ads (companyId, goal, content, targeting, budget, duration) VALUES (?, ?, ?, ?, ?, ?)');
-    const info = stmt.run(companyId, goal, JSON.stringify(content), JSON.stringify(targeting), budget, duration);
-    res.json({ id: info.lastInsertRowid });
-  });
-
-  // 33. Get Ads for Company
-  app.get('/api/ads/:companyId', authenticate, (req: any, res) => {
-    const ads = db.prepare('SELECT * FROM ads WHERE companyId = ? ORDER BY createdAt DESC').all(req.params.companyId) as any[];
-    res.json(ads.map(ad => ({
-      ...ad,
-      content: JSON.parse(ad.content as string),
-      targeting: JSON.parse(ad.targeting as string)
-    })));
-  });
-
-  // Shop Orders & Insights
-  app.get('/api/companies/:id/orders', authenticate, (req: any, res) => {
-    const company = db.prepare('SELECT ownerId, managerId FROM companies WHERE id = ?').get(req.params.id) as any;
-    if (!company || (company.ownerId !== req.userId && company.managerId !== req.userId)) {
-      return res.status(403).json({ error: 'Non autorisé' });
-    }
-    const orders = db.prepare(`
-      SELECT o.*, u.name as customerName, u.whatsapp as customerWhatsapp, p.name as productName
-      FROM shop_orders o
-      JOIN users u ON o.customerId = u.id
-      JOIN company_catalog p ON o.productId = p.id
-      WHERE o.companyId = ?
-      ORDER BY o.createdAt DESC
-    `).all(req.params.id);
-    res.json(orders);
-  });
-
-  app.post('/api/companies/:id/orders', authenticate, (req: any, res) => {
-    const { productId, quantity, totalPrice } = req.body;
-    const companyId = req.params.id;
-    
-    try {
-      db.prepare('BEGIN TRANSACTION').run();
-      
-      // 1. Check stock
-      const stock = db.prepare('SELECT * FROM stocks WHERE productId = ?').get(productId) as any;
-      
-      let newQuantity: number | undefined;
-      
-      // 2. Decrement stock
-      if (stock) {
-        newQuantity = stock.quantity - quantity;
-        db.prepare('UPDATE stocks SET quantity = ?, lastUpdated = CURRENT_TIMESTAMP WHERE productId = ?').run(newQuantity, productId);
-      }
-      
-      // Check for low stock alert
-      if (stock && newQuantity !== undefined && newQuantity <= stock.minQuantity) {
-        const product = db.prepare('SELECT name FROM company_catalog WHERE id = ?').get(productId) as any;
-        const company = db.prepare('SELECT ownerId, managerId FROM companies WHERE id = ?').get(companyId) as any;
-        const notificationContent = `Stock bas pour '${product.name}': il reste ${newQuantity} unités.`;
-        const notifType = 'stock_alert';
-
-        const owners = [company.ownerId, company.managerId].filter(id => id && id !== req.userId);
-        owners.forEach(userId => {
-            db.prepare('INSERT INTO notifications (userId, type, content, relatedId) VALUES (?, ?, ?, ?)').run(
-                userId, notifType, notificationContent, productId
-            );
-            io.to(`user_${userId}`).emit('notification', {
-                id: (db.prepare('SELECT last_insert_rowid() AS id').get() as any).id,
-                userId: userId,
-                type: notifType,
-                content: notificationContent,
-                relatedId: Number(productId),
-                read: 0,
-                createdAt: new Date().toISOString()
-            });
-        });
-      }
-      
-      // 3. Create order
-      const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.userId) as any;
-      const stmt = db.prepare('INSERT INTO shop_orders (companyId, customerId, productId, quantity, totalPrice, customerName, customerWhatsapp) VALUES (?, ?, ?, ?, ?, ?, ?)');
-      const info = stmt.run(companyId, req.userId, productId, quantity, totalPrice, user.name, user.whatsapp);
-      
-      db.prepare('COMMIT').run();
-
-      const orderId = info.lastInsertRowid;
-      const order = db.prepare(`
-        SELECT o.*, u.name as customerName, u.whatsapp as customerWhatsapp, p.name as productName
-        FROM shop_orders o
-        JOIN users u ON o.customerId = u.id
-        JOIN company_catalog p ON o.productId = p.id
-        WHERE o.id = ?
-      `).get(orderId);
-
-      // Create notification for company owner and manager
-      const company = db.prepare('SELECT ownerId, managerId, name FROM companies WHERE id = ?').get(companyId) as any;
-      if (company) {
-        const notificationContent = `Nouvelle commande pour ${company.name}: ${(order as any).productName} (x${quantity})`;
-        
-        // Notify Owner
-        if (company.ownerId !== req.userId) {
-          const notifOwner = db.prepare('INSERT INTO notifications (userId, type, content, relatedId) VALUES (?, ?, ?, ?)').run(
-            company.ownerId, 'shop_order', notificationContent, orderId
-          );
-          io.to(`user_${company.ownerId}`).emit('notification', {
-            id: notifOwner.lastInsertRowid,
-            userId: company.ownerId,
-            type: 'shop_order',
-            content: notificationContent,
-            relatedId: Number(orderId),
-            read: 0,
-            createdAt: new Date().toISOString()
-          });
-        }
-
-        // Notify Manager if exists
-        if (company.managerId && company.managerId !== req.userId) {
-          const notifManager = db.prepare('INSERT INTO notifications (userId, type, content, relatedId) VALUES (?, ?, ?, ?)').run(
-            company.managerId, 'shop_order', notificationContent, orderId
-          );
-          io.to(`user_${company.managerId}`).emit('notification', {
-            id: notifManager.lastInsertRowid,
-            userId: company.managerId,
-            type: 'shop_order',
-            content: notificationContent,
-            relatedId: Number(orderId),
-            read: 0,
-            createdAt: new Date().toISOString()
-          });
-        }
-      }
-
-      io.emit('new_shop_order', { companyId, order });
-      res.json({ id: orderId });
-    } catch (err) {
-      db.prepare('ROLLBACK').run();
-      console.error(err);
-      res.status(500).json({ error: 'Erreur lors de la commande.' });
-    }
-  });
-
-  app.put('/api/companies/:companyId/catalog/:productId', authenticate, (req: any, res) => {
-    const { name, description, price, category, imageUrls, tag, tagValue } = req.body;
-    const company = db.prepare('SELECT ownerId, managerId FROM companies WHERE id = ?').get(req.params.companyId) as any;
-    if (!company || (company.ownerId !== req.userId && company.managerId !== req.userId)) {
-      return res.status(403).json({ error: 'Non autorisé' });
-    }
-    db.prepare('UPDATE company_catalog SET name = ?, description = ?, price = ?, category = ?, imageUrls = ?, tag = ?, tagValue = ? WHERE id = ? AND companyId = ?')
-      .run(name, description, price, category, JSON.stringify(imageUrls), tag || null, tagValue || null, req.params.productId, req.params.companyId);
-    res.json({ success: true });
-  });
-
-  app.put('/api/orders/:id/status', authenticate, (req: any, res) => {
-    const { status } = req.body;
-    const order = db.prepare('SELECT o.*, c.ownerId, c.managerId FROM shop_orders o JOIN companies c ON o.companyId = c.id WHERE o.id = ?').get(req.params.id) as any;
-    if (!order || (order.ownerId !== req.userId && order.managerId !== req.userId)) {
-      return res.status(403).json({ error: 'Non autorisé' });
-    }
-    db.prepare('UPDATE shop_orders SET status = ? WHERE id = ?').run(status, req.params.id);
-    io.emit('shop_order_status_updated', { orderId: req.params.id, status, companyId: order.companyId });
-    res.json({ success: true });
-  });
-
-  app.get('/api/companies/:id/insights', authenticate, (req: any, res) => {
-    const company = db.prepare('SELECT ownerId, managerId FROM companies WHERE id = ?').get(req.params.id) as any;
-    if (!company || (company.ownerId !== req.userId && company.managerId !== req.userId)) {
-      return res.status(403).json({ error: 'Non autorisé' });
-    }
-    
-    const totalSales = db.prepare("SELECT SUM(totalPrice) as total FROM shop_orders WHERE companyId = ? AND status != 'cancelled'").get(req.params.id) as any;
-    const ordersCount = db.prepare('SELECT COUNT(*) as count FROM shop_orders WHERE companyId = ?').get(req.params.id) as any;
-    const customersCount = db.prepare('SELECT COUNT(DISTINCT customerId) as count FROM shop_orders WHERE companyId = ?').get(req.params.id) as any;
-    
-    const salesByDay = db.prepare(`
-      SELECT date(createdAt) as date, SUM(totalPrice) as amount
-      FROM shop_orders
-      WHERE companyId = ? AND status != 'cancelled'
-      GROUP BY date(createdAt)
-      ORDER BY date ASC
-      LIMIT 30
-    `).all(req.params.id);
-
-    const topProducts = db.prepare(`
-      SELECT p.name, SUM(o.quantity) as totalQuantity, SUM(o.totalPrice) as totalRevenue
-      FROM shop_orders o
-      JOIN company_catalog p ON o.productId = p.id
-      WHERE o.companyId = ? AND o.status != 'cancelled'
-      GROUP BY p.id
-      ORDER BY totalQuantity DESC
-      LIMIT 5
-    `).all(req.params.id);
-
-    const peakSalesDay = db.prepare(`
-      SELECT date(createdAt) as date, SUM(totalPrice) as amount
-      FROM shop_orders
-      WHERE companyId = ? AND status != 'cancelled'
-      GROUP BY date(createdAt)
-      ORDER BY amount DESC
-      LIMIT 1
-    `).get(req.params.id);
-
-    res.json({
-      totalSales: totalSales.total || 0,
-      ordersCount: ordersCount.count || 0,
-      customersCount: customersCount.count || 0,
-      salesByDay,
-      topProducts,
-      peakSalesDay
-    });
-  });
-
-  app.get('/api/companies/:id/catalog', authenticate, (req: any, res) => {
-    const catalog = db.prepare(`
-      SELECT p.*, 
-      (SELECT 1 FROM favorite_products WHERE productId = p.id AND userId = ?) as isFavorite,
-      (SELECT COUNT(*) FROM favorite_products WHERE productId = p.id) as favoritesCount,
-      (SELECT AVG(rating) FROM reviews WHERE targetType = 'product' AND targetId = p.id) as averageRating,
-      (SELECT COUNT(*) FROM reviews WHERE targetType = 'product' AND targetId = p.id) as reviewCount,
-      (SELECT quantity FROM stocks WHERE productId = p.id) as quantity
-      FROM company_catalog p WHERE companyId = ?
-    `).all(req.userId, req.params.id);
-    res.json(catalog);
-  });
-
-  app.post('/api/companies/:id/catalog', authenticate, (req: any, res) => {
-    const company = db.prepare('SELECT ownerId, managerId FROM companies WHERE id = ?').get(req.params.id) as any;
-    if (!company || (company.ownerId !== req.userId && company.managerId !== req.userId)) {
-      return res.status(403).json({ error: 'Non autorisé' });
-    }
-    const { name, description, price, category, imageUrls, tag, tagValue } = req.body;
-    const result = db.prepare('INSERT INTO company_catalog (companyId, name, description, price, category, imageUrls, tag, tagValue) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(req.params.id, name, description, price, category, JSON.stringify(imageUrls), tag || null, tagValue || null);
-    res.json({ id: result.lastInsertRowid });
-  });
-
-  app.delete('/api/companies/:id/catalog/:productId', authenticate, (req: any, res) => {
-    const company = db.prepare('SELECT ownerId, managerId FROM companies WHERE id = ?').get(req.params.id) as any;
-    if (!company || (company.ownerId !== req.userId && company.managerId !== req.userId)) {
-      return res.status(403).json({ error: 'Non autorisé' });
-    }
-    db.prepare('DELETE FROM company_catalog WHERE id = ? AND companyId = ?').run(req.params.productId, req.params.id);
-    res.json({ success: true });
-  });
-
-  app.get('/api/companies/:id/stock', authenticate, (req: any, res) => {
-    const stock = db.prepare(`
-      SELECT s.*, c.name as productName 
-      FROM stocks s 
-      JOIN company_catalog c ON s.productId = c.id
-      WHERE c.companyId = ?
-    `).all(req.params.id);
-    res.json(stock);
-  });
-  
-  app.get('/api/credit-institutions', authenticate, (req: any, res) => {
-    const institutions = db.prepare('SELECT * FROM credit_institutions ORDER BY name ASC').all();
-    res.json(institutions);
-  });
-
-  app.post('/api/credit-institutions', authenticate, (req: any, res) => {
-    const { name, type, description, terms, eligibility, targets, processingTime, logoUrl, coverUrl, address, city, country, isConfirmed } = req.body;
-    
-    if (!isConfirmed) {
-      return res.status(403).json({ error: "Confirmation réglementaire requise." });
-    }
-
-    const result = db.prepare(`
-      INSERT INTO credit_institutions (creatorId, name, type, description, terms, eligibility, targets, processingTime, logoUrl, coverUrl, address, city, country, isHabilitated)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
-    `).run(req.userId, name, type, description, terms, eligibility, targets, processingTime, logoUrl, coverUrl, address, city, country);
-
-    res.json({ id: result.lastInsertRowid, success: true });
-  });
-
-  app.get('/api/credit-institutions/my', authenticate, (req: any, res) => {
-    const institutions = db.prepare('SELECT * FROM credit_institutions WHERE creatorId = ?').all(req.userId);
-    res.json(institutions);
-  });
-
-  app.put('/api/credit-institutions/:id', authenticate, (req: any, res) => {
-    const { name, type, description, terms, eligibility, targets, processingTime, logoUrl, coverUrl, address, city, country } = req.body;
-    
-    const institution = db.prepare('SELECT creatorId FROM credit_institutions WHERE id = ?').get(req.params.id) as any;
-    if (!institution || institution.creatorId !== req.userId) {
-      return res.status(403).json({ error: "Non autorisé" });
-    }
-
-    db.prepare(`
-      UPDATE credit_institutions 
-      SET name = ?, type = ?, description = ?, terms = ?, eligibility = ?, targets = ?, processingTime = ?, logoUrl = ?, coverUrl = ?, address = ?, city = ?, country = ?
-      WHERE id = ?
-    `).run(name, type, description, terms, eligibility, targets, processingTime, logoUrl, coverUrl, address, city, country, req.params.id);
-
-    res.json({ success: true });
-  });
-
-  app.get('/api/credit-institutions/:id/requests', authenticate, (req: any, res) => {
-    const institution = db.prepare('SELECT creatorId FROM credit_institutions WHERE id = ?').get(req.params.id) as any;
-    if (!institution || institution.creatorId !== req.userId) {
-      return res.status(403).json({ error: "Non autorisé" });
-    }
-
-    const requests = db.prepare(`
-      SELECT fr.*, u.name as userName, c.name as companyName 
-      FROM funding_requests fr
-      JOIN users u ON fr.userId = u.id
-      JOIN companies c ON fr.companyId = c.id
-      WHERE fr.institutionId = ?
-      ORDER BY fr.createdAt DESC
-    `).all(req.params.id);
-
-    res.json(requests);
-  });
-
-  app.post('/api/companies/:id/funding-request', authenticate, (req: any, res) => {
-    const { fundingType, amount, reason, institutionId, strategicData } = req.body;
-    const companyId = req.params.id;
-    const userId = req.userId;
-
-    const result = db.prepare(`
-      INSERT INTO funding_requests (userId, companyId, institutionId, fundingType, amount, reason, strategicData)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(userId, companyId, institutionId, fundingType, amount, reason, JSON.stringify(strategicData));
-
-    res.json({ id: result.lastInsertRowid, success: true });
-  });
-
-  app.put('/api/funding-requests/:id/status', authenticate, (req: any, res) => {
-    const { status } = req.body;
-    
-    // Check if user owns the institution specified in the request
-    const request = db.prepare(`
-      SELECT ci.creatorId 
-      FROM funding_requests fr
-      JOIN credit_institutions ci ON fr.institutionId = ci.id
-      WHERE fr.id = ?
-    `).get(req.params.id) as any;
-
-    if (!request || request.creatorId !== req.userId) {
-      return res.status(403).json({ error: "Non autorisé" });
-    }
-
-    db.prepare('UPDATE funding_requests SET status = ? WHERE id = ?').run(status, req.params.id);
-    res.json({ success: true });
-  });
-
-  app.get('/api/funding-requests/my', authenticate, (req: any, res) => {
-     const requests = db.prepare(`
-      SELECT fr.*, ci.name as institutionName, ci.type as institutionType
-      FROM funding_requests fr
-      LEFT JOIN credit_institutions ci ON fr.institutionId = ci.id
-      WHERE fr.userId = ?
-      ORDER BY fr.createdAt DESC
-    `).all(req.userId);
-    res.json(requests);
-  });
-
-  app.get('/api/companies/:companyId/stock-movements/:productId', authenticate, (req: any, res) => {
-    const company = db.prepare('SELECT ownerId, managerId FROM companies WHERE id = ?').get(req.params.companyId) as any;
-    if (!company || (company.ownerId !== req.userId && company.managerId !== req.userId)) {
-      return res.status(403).json({ error: 'Non autorisé' });
-    }
-    const movements = db.prepare('SELECT * FROM stock_movements WHERE productId = ? ORDER BY createdAt DESC').all(req.params.productId);
-    res.json(movements);
-  });
-  
-  app.put('/api/companies/:companyId/stock/:productId', authenticate, (req: any, res) => {
-    const company = db.prepare('SELECT ownerId, managerId FROM companies WHERE id = ?').get(req.params.companyId) as any;
-    if (!company || (company.ownerId !== req.userId && company.managerId !== req.userId)) {
-      return res.status(403).json({ error: 'Non autorisé' });
-    }
-    const { quantity, minQuantity, reason, costPrice } = req.body;
-    
-    try {
-      db.prepare('BEGIN TRANSACTION').run();
-      
-      const currentStock = db.prepare('SELECT quantity FROM stocks WHERE productId = ?').get(req.params.productId) as any;
-      const oldQuantity = currentStock ? currentStock.quantity : 0;
-      const diff = quantity - oldQuantity;
-
-      db.prepare(`
-        INSERT INTO stocks (productId, quantity, minQuantity, costPrice)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(productId) DO UPDATE SET
-          quantity = excluded.quantity,
-          minQuantity = excluded.minQuantity,
-          costPrice = excluded.costPrice,
-          lastUpdated = CURRENT_TIMESTAMP
-      `).run(req.params.productId, quantity, minQuantity || 5, costPrice || 0);
-      
-      if (diff !== 0) {
-          db.prepare('INSERT INTO stock_movements (productId, quantity, type, reason) VALUES (?, ?, ?, ?)').run(
-              req.params.productId,
-              Math.abs(diff),
-              diff > 0 ? 'purchase' : 'adjustment',
-              reason || 'Manual adjustment'
-          );
-      }
-      
-      // Check for low stock alert
-      if (quantity <= (minQuantity || 5)) {
-        const product = db.prepare('SELECT name, companyId FROM company_catalog WHERE id = ?').get(req.params.productId) as any;
-        const companyData = db.prepare('SELECT ownerId, managerId FROM companies WHERE id = ?').get(product.companyId) as any;
-        
-        const notificationContent = `Stock bas pour '${product.name}': il reste ${quantity} unités.`;
-        const notifType = 'stock_alert';
-
-        const owners = [companyData.ownerId, companyData.managerId].filter(id => id && id !== req.userId);
-        owners.forEach(userId => {
-            db.prepare('INSERT INTO notifications (userId, type, content, relatedId) VALUES (?, ?, ?, ?)').run(
-                userId, notifType, notificationContent, req.params.productId
-            );
-            io.to(`user_${userId}`).emit('notification', {
-                id: (db.prepare('SELECT last_insert_rowid() AS id').get() as any).id,
-                userId: userId,
-                type: notifType,
-                content: notificationContent,
-                relatedId: Number(req.params.productId),
-                read: 0,
-                createdAt: new Date().toISOString()
-            });
-        });
-      }
-      
-      db.prepare('COMMIT').run();
-      res.json({ success: true });
-    } catch (err) {
-      db.prepare('ROLLBACK').run();
-      console.error(err);
-      res.status(500).json({ error: 'Erreur lors de la mise à jour du stock.' });
-    }
-  });
-
-  // 27. Churches API
-  app.get('/api/churches', authenticate, (req, res) => {
-    const churches = db.prepare('SELECT * FROM churches ORDER BY name ASC').all();
-    res.json(churches);
-  });
-
-  app.post('/api/churches', authenticate, (req: any, res) => {
-    const { name, pastor, hq, description, programs, coverUrl } = req.body;
-    const result = db.prepare('INSERT INTO churches (name, pastor, hq, description, programs, coverUrl, creatorId) VALUES (?, ?, ?, ?, ?, ?, ?)').run(
-      name, pastor, hq, description, programs, coverUrl, req.userId
-    );
-    res.json({ id: result.lastInsertRowid });
-  });
-
-  app.put('/api/churches/:id', authenticate, (req: any, res) => {
-    const { name, pastor, hq, description, programs, coverUrl } = req.body;
-    const church = db.prepare('SELECT * FROM churches WHERE id = ?').get(req.params.id) as any;
-    if (!church || church.creatorId !== req.userId) {
-      return res.status(403).json({ error: 'Non autorisé' });
-    }
-    db.prepare('UPDATE churches SET name = ?, pastor = ?, hq = ?, description = ?, programs = ?, coverUrl = ? WHERE id = ?').run(
-      name, pastor, hq, description, programs, coverUrl, req.params.id
-    );
-    res.json({ success: true });
-  });
-
-  app.delete('/api/churches/:id', authenticate, (req: any, res) => {
-    const church = db.prepare('SELECT * FROM churches WHERE id = ?').get(req.params.id) as any;
-    if (!church || church.creatorId !== req.userId) {
-      return res.status(403).json({ error: 'Non autorisé' });
-    }
-    db.prepare('DELETE FROM churches WHERE id = ?').run(req.params.id);
-    res.json({ success: true });
-  });
-
-  app.post('/api/users/me/claim-church', authenticate, (req: any, res) => {
-    const { churchName } = req.body;
-    db.prepare('UPDATE users SET church = ? WHERE id = ?').run(churchName, req.userId);
-    res.json({ success: true });
-  });
-
-  // --- Review Routes ---
-  app.get('/api/reviews/:targetType/:targetId', authenticate, (req: any, res) => {
-    const { targetType, targetId } = req.params;
-    const reviews = db.prepare(`
-      SELECT r.*, u.name as userName, u.avatarUrl as userAvatar
-      FROM reviews r
-      JOIN users u ON r.userId = u.id
-      WHERE r.targetType = ? AND r.targetId = ?
-      ORDER BY r.createdAt DESC
-    `).all(targetType, targetId);
-    
-    const stats = db.prepare(`
-      SELECT AVG(rating) as averageRating, COUNT(*) as reviewCount
-      FROM reviews
-      WHERE targetType = ? AND targetId = ?
-    `).get(targetType, targetId) as any;
-    
-    res.json({
-      reviews,
-      stats: {
-        averageRating: stats.averageRating || 0,
-        reviewCount: stats.reviewCount || 0
-      }
-    });
-  });
-
-  app.post('/api/reviews', authenticate, (req: any, res) => {
-    const { targetType, targetId, rating, comment } = req.body;
-    
-    if (!targetType || !targetId || !rating) {
-      return res.status(400).json({ error: 'Données manquantes' });
-    }
-    
-    if (rating < 1 || rating > 5) {
-      return res.status(400).json({ error: 'La note doit être entre 1 et 5' });
-    }
-
-    // Check if user already reviewed
-    const existing = db.prepare('SELECT id FROM reviews WHERE userId = ? AND targetType = ? AND targetId = ?').get(req.userId, targetType, targetId);
-    if (existing) {
-      db.prepare('UPDATE reviews SET rating = ?, comment = ?, createdAt = CURRENT_TIMESTAMP WHERE id = ?')
-        .run(rating, comment, (existing as any).id);
-      return res.json({ success: true, updated: true });
-    }
-
-    const stmt = db.prepare('INSERT INTO reviews (userId, targetType, targetId, rating, comment) VALUES (?, ?, ?, ?, ?)');
-    stmt.run(req.userId, targetType, targetId, rating, comment);
-    res.json({ success: true });
-  });
-
-  // ============================================================
-  // 🔐 ADMIN ROUTES
-  // ============================================================
-
-  // Middleware admin
-  const requireAdmin = (req: any, res: any, next: any) => {
-    const user = db.prepare('SELECT role FROM users WHERE id = ?').get(req.userId) as any;
-    if (!user || user.role !== 'admin') {
+  const requireAdmin      = (req: any, res: any, next: any) => {
+    if (req.userRole !== 'admin' && req.userRole !== 'moderator')
       return res.status(403).json({ error: 'Accès réservé aux administrateurs' });
-    }
+    next();
+  };
+  const requireSuperAdmin = (req: any, res: any, next: any) => {
+    if (req.userRole !== 'admin')
+      return res.status(403).json({ error: 'Accès super-admin requis' });
     next();
   };
 
-  // Middleware bloqué si banni (ajouté dans authenticate)
-  // On vérifie le statut à chaque requête sensible
-
-  // GET /api/admin/stats — tableau de bord
-  app.get('/api/admin/stats', authenticate, requireAdmin, (req: any, res) => {
-    const totalUsers = (db.prepare('SELECT COUNT(*) as c FROM users').get() as any).c;
-    const activeUsers = (db.prepare("SELECT COUNT(*) as c FROM users WHERE status = 'active'").get() as any).c;
-    const bannedUsers = (db.prepare("SELECT COUNT(*) as c FROM users WHERE status = 'banned'").get() as any).c;
-    const totalPosts = (db.prepare('SELECT COUNT(*) as c FROM posts').get() as any).c;
-    const pendingReports = (db.prepare("SELECT COUNT(*) as c FROM reports WHERE status = 'pending'").get() as any).c;
-    const newUsersToday = (db.prepare("SELECT COUNT(*) as c FROM users WHERE date(createdAt) = date('now')").get() as any).c;
-    const newUsersWeek = (db.prepare("SELECT COUNT(*) as c FROM users WHERE createdAt >= datetime('now', '-7 days')").get() as any).c;
-    res.json({ totalUsers, activeUsers, bannedUsers, totalPosts, pendingReports, newUsersToday, newUsersWeek });
+  // ════════════════════════════════════════════════════════════════════════
+  // 🔍 HEALTH CHECK
+  // ════════════════════════════════════════════════════════════════════════
+  app.get('/api/health', async (_, res) => {
+    try {
+      await pool.query('SELECT 1');
+      res.json({ status: 'ok', db: 'postgresql', time: new Date() });
+    } catch {
+      res.status(500).json({ status: 'error', db: 'disconnected' });
+    }
   });
 
-  // GET /api/admin/users — liste tous les utilisateurs
-  app.get('/api/admin/users', authenticate, requireAdmin, (req: any, res) => {
-    const { search, status, role } = req.query as any;
-    let query = 'SELECT id, email, name, country, role, status, badge, bannedReason, createdAt FROM users WHERE 1=1';
-    const params: any[] = [];
-    if (search) { query += ' AND (name LIKE ? OR email LIKE ?)'; params.push(`%${search}%`, `%${search}%`); }
-    if (status) { query += ' AND status = ?'; params.push(status); }
-    if (role) { query += ' AND role = ?'; params.push(role); }
-    query += ' ORDER BY createdAt DESC';
-    const users = db.prepare(query).all(...params);
-    res.json(users);
+  // ════════════════════════════════════════════════════════════════════════
+  // 🔐 AUTH — Connexion / Inscription par OTP
+  // ════════════════════════════════════════════════════════════════════════
+  app.post('/api/auth/request-otp', async (req, res) => {
+    const { email, isRegister } = req.body;
+    const ip = req.ip ?? '';
+    if (!email || !isValidEmail(email)) return res.status(400).json({ error: 'Email invalide' });
+    try {
+      const user = await db.one(`SELECT id FROM users WHERE email=$1`, [email]);
+      if (isRegister && user)  return res.status(400).json({ error: 'Compte déjà existant. Connectez-vous.' });
+      if (!isRegister && !user) return res.status(400).json({ error: 'Aucun compte trouvé. Inscrivez-vous.' });
+      const code = Math.floor(100000 + Math.random() * 900000).toString();
+      const exp  = new Date(Date.now() + 10 * 60000);
+      await pool.query(
+        `INSERT INTO otps(email, code, "expiresAt") VALUES($1,$2,$3) ON CONFLICT(email) DO UPDATE SET code=$2,"expiresAt"=$3`,
+        [email, code, exp]
+      );
+      await sendOTPEmail(email, code);
+      await logAction('INFO', 'otp_requested', undefined, ip, email);
+      res.json({ message: 'Code envoyé', ...(IS_DEV && { devCode: code }) });
+    } catch (e: any) {
+      errorTracker.capture(e, 'request-otp');
+      res.status(500).json({ error: 'Erreur serveur' });
+    }
   });
 
-  // PUT /api/admin/users/:id/role — changer le rôle
-  app.put('/api/admin/users/:id/role', authenticate, requireAdmin, (req: any, res) => {
-    const { role } = req.body;
-    if (!['user', 'moderator', 'admin'].includes(role)) return res.status(400).json({ error: 'Rôle invalide' });
-    db.prepare('UPDATE users SET role = ? WHERE id = ?').run(role, req.params.id);
-    db.prepare('INSERT INTO admin_logs (adminId, action, targetId, details) VALUES (?, ?, ?, ?)').run(req.userId, 'change_role', req.params.id, `New role: ${role}`);
+  app.post('/api/auth/verify-otp', async (req, res) => {
+    const { email, code, isRegister, country, referralCode } = req.body;
+    const ip = req.ip ?? '';
+    if (!email || !isValidEmail(email)) return res.status(400).json({ error: 'Email invalide' });
+    try {
+      const otp = await db.one(`SELECT * FROM otps WHERE email=$1`, [email]);
+      if (!otp || otp.code !== code || new Date(otp.expiresAt) < new Date()) {
+        await logAction('WARN', 'otp_failed', undefined, ip, email);
+        return res.status(400).json({ error: 'Code invalide ou expiré' });
+      }
+      let user = await db.one(`SELECT * FROM users WHERE email=$1`, [email]);
+      if (isRegister) {
+        if (user) return res.status(400).json({ error: 'Compte déjà existant' });
+        let refBy = null;
+        if (referralCode) {
+          const ref = await db.one(`SELECT id FROM users WHERE "referralCode"=$1`, [referralCode]);
+          if (ref) refBy = ref.id;
+        }
+        const rc = Math.random().toString(36).substring(2, 8).toUpperCase();
+        user = await db.one(
+          `INSERT INTO users(email,"referralCode","referredBy",country) VALUES($1,$2,$3,$4) RETURNING *`,
+          [email, rc, refBy, country ?? null]
+        );
+        await logAction('INFO', 'user_registered', user.id, ip, email);
+      } else {
+        if (!user) return res.status(400).json({ error: 'Aucun compte trouvé' });
+        await logAction('INFO', 'user_login', user.id, ip, email);
+      }
+      await pool.query(`DELETE FROM otps WHERE email=$1`, [email]);
+      const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '30d' });
+      res.json({ token, user });
+    } catch (e: any) {
+      errorTracker.capture(e, 'verify-otp');
+      res.status(500).json({ error: 'Erreur serveur' });
+    }
+  });
+
+  // ════════════════════════════════════════════════════════════════════════
+  // 👤 UTILISATEURS
+  // ════════════════════════════════════════════════════════════════════════
+  app.get('/api/users/me', authenticate, async (req: any, res) => {
+    try {
+      const u = await db.one(`SELECT * FROM users WHERE id=$1`, [req.userId]);
+      if (!u) return res.status(404).json({ error: 'Introuvable' });
+      try { u.notificationPreferences = JSON.parse(u.notificationpreferences); } catch { u.notificationPreferences = {}; }
+      const conn = await db.one(`SELECT COUNT(*) as n FROM follows WHERE "followerId"=$1 OR "followingId"=$1`, [req.userId]);
+      const badges: string[] = [];
+      if (conn.n >= 100) badges.push('Super Connecteur');
+      if (conn.n >= 50)  badges.push('Réseauteur Actif');
+      if (conn.n >= 10)  badges.push('Sociable');
+      u.badges = badges;
+      res.json(u);
+    } catch (e: any) { errorTracker.capture(e, 'get-me'); res.status(500).json({ error: 'Erreur' }); }
+  });
+
+  app.put('/api/users/me', authenticate, async (req: any, res) => {
+    const { name,profession,bio,company,avatarUrl,coverUrl,phone,location,website,church,groups,interests,skills,marketing,goals,notificationPreferences,visibility,country } = req.body;
+    await pool.query(
+      `UPDATE users SET name=$1,profession=$2,bio=$3,company=$4,"avatarUrl"=$5,"coverUrl"=$6,phone=$7,location=$8,website=$9,church=$10,groups=$11,interests=$12,skills=$13,marketing=$14,goals=$15,"notificationPreferences"=$16,visibility=$17,country=$18 WHERE id=$19`,
+      [name,profession,bio,company,avatarUrl,coverUrl,phone,location,website,church,groups,interests,skills,marketing,goals,notificationPreferences?JSON.stringify(notificationPreferences):null,visibility,country,req.userId]
+    );
     res.json({ success: true });
   });
 
-  // PUT /api/admin/users/:id/ban — bannir un utilisateur
-  app.put('/api/admin/users/:id/ban', authenticate, requireAdmin, (req: any, res) => {
-    const { reason } = req.body;
-    if (Number(req.params.id) === req.userId) return res.status(400).json({ error: 'Impossible de se bannir soi-même' });
-    db.prepare("UPDATE users SET status = 'banned', bannedReason = ? WHERE id = ?").run(reason || 'Violation des règles', req.params.id);
-    db.prepare('INSERT INTO admin_logs (adminId, action, targetId, details) VALUES (?, ?, ?, ?)').run(req.userId, 'ban_user', req.params.id, reason);
+  app.delete('/api/users/me', authenticate, async (req: any, res) => {
+    const id = req.userId;
+    try {
+      await pool.query('BEGIN');
+      const tables = ['community_members','follows','connection_requests','notifications','certifications','cell_members','post_likes','post_comments','event_participants','event_likes','pannel_members','pannel_evaluations','pannel_badges','pannel_progress','pannel_forum','service_applications','story_views','story_reactions'];
+      for (const t of tables) {
+        try { await pool.query(`DELETE FROM ${t} WHERE "userId"=$1`, [id]); } catch {}
+      }
+      try { await pool.query(`DELETE FROM follows WHERE "followerId"=$1 OR "followingId"=$1`, [id]); } catch {}
+      try { await pool.query(`DELETE FROM connection_requests WHERE "senderId"=$1 OR "receiverId"=$1`, [id]); } catch {}
+      const owned: Record<string,string> = { posts:'"authorId"', events:'"creatorId"', services:'"providerId"', stories:'"userId"', companies:'"ownerId"', cells:'"creatorId"', churches:'"creatorId"', pannels:'"ownerId"', transactions:'"userId"' };
+      for (const [t, col] of Object.entries(owned)) {
+        try { await pool.query(`DELETE FROM ${t} WHERE ${col}=$1`, [id]); } catch {}
+      }
+      await pool.query(`DELETE FROM users WHERE id=$1`, [id]);
+      await pool.query('COMMIT');
+      res.json({ success: true });
+    } catch (e) { await pool.query('ROLLBACK'); res.status(500).json({ error: 'Erreur suppression' }); }
+  });
+
+  app.get('/api/users/search', authenticate, async (req: any, res) => {
+    const q = req.query.q;
+    if (!q) return res.json([]);
+    res.json(await db.all(`SELECT id,name,"avatarUrl" FROM users WHERE name ILIKE $1 LIMIT 10`, [`%${q}%`]));
+  });
+
+  app.get('/api/users', authenticate, async (req: any, res) => {
+    const { country, profession } = req.query as any;
+    let q = `SELECT id,name,profession,"avatarUrl",country,badge,company,role FROM users WHERE status='active'`;
+    const p: any[] = []; let i = 1;
+    if (country && country !== 'Tous') { q += ` AND country=$${i++}`; p.push(country); }
+    if (profession) { q += ` AND profession ILIKE $${i++}`; p.push(`%${profession}%`); }
+    q += ' ORDER BY "createdAt" DESC LIMIT 100';
+    res.json(await db.all(q, p));
+  });
+
+  app.get('/api/users/:id', authenticate, async (req: any, res) => {
+    const u = await db.one(`SELECT id,name,profession,bio,company,"avatarUrl","coverUrl",country,badge,role,"createdAt" FROM users WHERE id=$1`, [req.params.id]);
+    if (!u) return res.status(404).json({ error: 'Introuvable' });
+    res.json(u);
+  });
+
+  app.post('/api/users/:id/follow', authenticate, async (req: any, res) => {
+    try {
+      await pool.query(`INSERT INTO follows("followerId","followingId") VALUES($1,$2)`, [req.userId, req.params.id]);
+      const f = await db.one(`SELECT name FROM users WHERE id=$1`, [req.userId]);
+      const n = await db.one(`INSERT INTO notifications("userId",type,content,"relatedId") VALUES($1,'follow',$2,$3) RETURNING *`, [req.params.id, `${f.name} a commencé à vous suivre.`, req.userId]);
+      io.to(`user_${req.params.id}`).emit('notification', { ...n, read: 0 });
+      res.json({ success: true });
+    } catch { res.status(400).json({ error: 'Déjà suivi' }); }
+  });
+
+  app.post('/api/users/:id/connect', authenticate, async (req: any, res) => {
+    try { await pool.query(`INSERT INTO connection_requests("senderId","receiverId") VALUES($1,$2)`, [req.userId, req.params.id]); res.json({ success: true }); }
+    catch { res.status(400).json({ error: 'Déjà envoyé' }); }
+  });
+
+  app.get('/api/users/me/following',        authenticate, async (req: any, res) => res.json(await db.all(`SELECT u.id,u.name,u.profession,u."avatarUrl",u.company,u.badge FROM users u JOIN follows f ON u.id=f."followingId" WHERE f."followerId"=$1`, [req.userId])));
+  app.get('/api/users/me/connections',      authenticate, async (req: any, res) => res.json(await db.all(`SELECT u.id,u.name,u.profession,u."avatarUrl" FROM users u WHERE u.id IN(SELECT "senderId" FROM connection_requests WHERE "receiverId"=$1 AND status='accepted' UNION SELECT "receiverId" FROM connection_requests WHERE "senderId"=$1 AND status='accepted')`, [req.userId])));
+  app.get('/api/users/me/network-requests', authenticate, async (req: any, res) => res.json(await db.all(`SELECT cr.*,u.name,u."avatarUrl",u.profession FROM connection_requests cr JOIN users u ON cr."senderId"=u.id WHERE cr."receiverId"=$1 AND cr.status='pending'`, [req.userId])));
+  app.get('/api/users/me/certifications',   authenticate, async (req: any, res) => res.json(await db.all(`SELECT * FROM certifications WHERE "userId"=$1 ORDER BY "dateObtained" DESC`, [req.userId])));
+  app.post('/api/users/me/certifications',  authenticate, async (req: any, res) => { const {name,organization,dateObtained}=req.body; res.json(await db.one(`INSERT INTO certifications("userId",name,organization,"dateObtained") VALUES($1,$2,$3,$4) RETURNING *`, [req.userId,name,organization,dateObtained])); });
+  app.delete('/api/users/me/certifications/:id', authenticate, async (req: any, res) => { await pool.query(`DELETE FROM certifications WHERE id=$1 AND "userId"=$2`, [req.params.id, req.userId]); res.json({ success: true }); });
+  app.get('/api/users/me/transactions',     authenticate, async (req: any, res) => res.json(await db.all(`SELECT * FROM transactions WHERE "userId"=$1 ORDER BY date DESC`, [req.userId])));
+  app.post('/api/users/me/transactions',    authenticate, async (req: any, res) => { const {date,description,category,amount,type}=req.body; const tx=await db.one(`INSERT INTO transactions("userId",date,description,category,amount,type) VALUES($1,$2,$3,$4,$5,$6) RETURNING *`,[req.userId,date,description,category,amount,type]); io.to(`user_${req.userId}`).emit('transaction_update',tx); res.json(tx); });
+  app.get('/api/users/me/favorite-companies', authenticate, async (req: any, res) => res.json(await db.all(`SELECT c.* FROM companies c JOIN favorite_companies fc ON c.id=fc."companyId" WHERE fc."userId"=$1`, [req.userId])));
+  app.get('/api/users/me/favorite-products',  authenticate, async (req: any, res) => res.json(await db.all(`SELECT p.*,c.name as "companyName" FROM company_catalog p JOIN companies c ON p."companyId"=c.id JOIN favorite_products fp ON p.id=fp."productId" WHERE fp."userId"=$1`, [req.userId])));
+  app.get('/api/users/me/events',   authenticate, async (req: any, res) => res.json(await db.all(`SELECT e.* FROM events e JOIN event_participants ep ON e.id=ep."eventId" WHERE ep."userId"=$1 ORDER BY e."startDate" ASC`, [req.userId])));
+  app.get('/api/users/:id/events',  authenticate, async (req: any, res) => res.json(await db.all(`SELECT e.* FROM events e JOIN event_participants ep ON e.id=ep."eventId" WHERE ep."userId"=$1`, [req.params.id])));
+  app.get('/api/users/me/services', authenticate, async (req: any, res) => { const cr=await db.all(`SELECT * FROM services WHERE "providerId"=$1 ORDER BY "createdAt" DESC`,[req.userId]); const ap=await db.all(`SELECT s.* FROM services s JOIN service_applications sa ON s.id=sa."serviceId" WHERE sa."userId"=$1`,[req.userId]); res.json({created:cr,applied:ap}); });
+  app.post('/api/users/me/claim-church', authenticate, async (req: any, res) => { await pool.query(`UPDATE users SET church=$1 WHERE id=$2`, [req.body.churchName, req.userId]); res.json({ success: true }); });
+
+  // ════════════════════════════════════════════════════════════════════════
+  // 📝 PUBLICATIONS (Posts)
+  // ════════════════════════════════════════════════════════════════════════
+  app.get('/api/posts', authenticate, async (req: any, res) => {
+    try {
+      const page=parseInt(req.query.page)||1; const limit=parseInt(req.query.limit)||10; const offset=(page-1)*limit;
+      const {category,country,feedType,search}=req.query as any; const authorId=req.query.authorId?parseInt(req.query.authorId):null;
+      let q=`SELECT p.*,u.name as "authorName",u."avatarUrl" as "authorAvatar",u.profession as "authorProfession",u.country as "authorCountry",(SELECT COUNT(*) FROM post_likes WHERE "postId"=p.id) as "likesCount",(SELECT COUNT(*) FROM post_comments WHERE "postId"=p.id) as "commentsCount",(SELECT type FROM post_likes WHERE "postId"=p.id AND "userId"=$1) as "myReactionType",EXISTS(SELECT 1 FROM post_boosts WHERE "postId"=p.id) as "isBoosted" FROM posts p JOIN users u ON p."authorId"=u.id WHERE 1=1`;
+      const p:any[]=[req.userId]; let i=2;
+      if(authorId){q+=` AND p."authorId"=$${i++}`;p.push(authorId);}
+      if(feedType==='network'){q+=` AND p."authorId" IN(SELECT "followingId" FROM follows WHERE "followerId"=$${i++})`;p.push(req.userId);}
+      if(category&&category!=='Tous'){q+=` AND p.category=$${i++}`;p.push(category);}
+      if(country&&country!=='Tous'){q+=` AND u.country=$${i++}`;p.push(country);}
+      if(search){q+=` AND(p.content ILIKE $${i} OR u.name ILIKE $${i})`;p.push(`%${search}%`);i++;}
+      q+=` ORDER BY "isBoosted" DESC,p."createdAt" DESC LIMIT $${i++} OFFSET $${i++}`;p.push(limit,offset);
+      res.json(await db.all(q,p));
+    } catch(e:any){errorTracker.capture(e,'get-posts');res.status(500).json({error:'Erreur'});}
+  });
+
+  app.post('/api/posts', authenticate, async (req: any, res) => {
+    const { content, category, mediaUrls, cellId } = req.body;
+    if (!content && (!mediaUrls || !mediaUrls.length)) return res.status(400).json({ error: 'Contenu requis' });
+    const post = await db.one(`INSERT INTO posts("authorId",content,category,"mediaUrls","cellId") VALUES($1,$2,$3,$4,$5) RETURNING *`, [req.userId,content||'',category||'Tous',mediaUrls?JSON.stringify(mediaUrls):null,cellId||null]);
+    res.json(post);
+  });
+
+  app.put('/api/posts/:id', authenticate, async (req: any, res) => {
+    const p = await db.one(`SELECT "authorId" FROM posts WHERE id=$1`, [req.params.id]);
+    if (!p || p.authorid !== req.userId) return res.status(403).json({ error: 'Non autorisé' });
+    await pool.query(`UPDATE posts SET content=$1 WHERE id=$2`, [req.body.content, req.params.id]);
     res.json({ success: true });
   });
 
-  // PUT /api/admin/users/:id/unban — débannir
-  app.put('/api/admin/users/:id/unban', authenticate, requireAdmin, (req: any, res) => {
-    db.prepare("UPDATE users SET status = 'active', bannedReason = NULL WHERE id = ?").run(req.params.id);
-    db.prepare('INSERT INTO admin_logs (adminId, action, targetId, details) VALUES (?, ?, ?, ?)').run(req.userId, 'unban_user', req.params.id, null);
+  app.delete('/api/posts/:id', authenticate, async (req: any, res) => {
+    const p = await db.one(`SELECT "authorId" FROM posts WHERE id=$1`, [req.params.id]);
+    if (!p || p.authorid !== req.userId) return res.status(403).json({ error: 'Non autorisé' });
+    await pool.query(`DELETE FROM posts WHERE id=$1`, [req.params.id]);
     res.json({ success: true });
   });
 
-  // DELETE /api/admin/users/:id — supprimer un utilisateur
-  app.delete('/api/admin/users/:id', authenticate, requireAdmin, (req: any, res) => {
-    if (Number(req.params.id) === req.userId) return res.status(400).json({ error: 'Impossible de se supprimer soi-même' });
-    db.prepare('DELETE FROM users WHERE id = ?').run(req.params.id);
-    db.prepare('INSERT INTO admin_logs (adminId, action, targetId, details) VALUES (?, ?, ?, ?)').run(req.userId, 'delete_user', req.params.id, null);
-    res.json({ success: true });
+  app.post('/api/posts/:id/like', authenticate, async (req: any, res) => {
+    const { type = 'like' } = req.body;
+    const ex = await db.one(`SELECT * FROM post_likes WHERE "postId"=$1 AND "userId"=$2`, [req.params.id, req.userId]);
+    if (ex) {
+      if (ex.type === type) { await pool.query(`DELETE FROM post_likes WHERE "postId"=$1 AND "userId"=$2`, [req.params.id, req.userId]); return res.json({ liked: false }); }
+      await pool.query(`UPDATE post_likes SET type=$1 WHERE "postId"=$2 AND "userId"=$3`, [type, req.params.id, req.userId]);
+      return res.json({ liked: true, type });
+    }
+    await pool.query(`INSERT INTO post_likes("postId","userId",type) VALUES($1,$2,$3)`, [req.params.id, req.userId, type]);
+    res.json({ liked: true, type });
   });
 
-  // GET /api/admin/reports — voir les signalements
-  app.get('/api/admin/reports', authenticate, requireAdmin, (req: any, res) => {
-    const reports = db.prepare(`
-      SELECT r.*, u.name as reporterName, u.email as reporterEmail
-      FROM reports r
-      JOIN users u ON r.reporterId = u.id
-      ORDER BY r.createdAt DESC
-    `).all();
-    res.json(reports);
+  app.get('/api/posts/:id/comments',  authenticate, async (req: any, res) => res.json(await db.all(`SELECT c.*,u.name as "authorName",u."avatarUrl" as "authorAvatar" FROM post_comments c JOIN users u ON c."userId"=u.id WHERE c."postId"=$1 ORDER BY c."createdAt" ASC`, [req.params.id])));
+  app.get('/api/posts/:id/reactions', authenticate, async (req: any, res) => res.json(await db.all(`SELECT l.type,u.id as "userId",u.name,u."avatarUrl" FROM post_likes l JOIN users u ON l."userId"=u.id WHERE l."postId"=$1`, [req.params.id])));
+  app.post('/api/posts/:id/comments', authenticate, async (req: any, res) => { const c=await db.one(`INSERT INTO post_comments("postId","userId",content) VALUES($1,$2,$3) RETURNING *`,[req.params.id,req.userId,req.body.content]); res.json(c); });
+  app.put('/api/posts/:postId/comments/:commentId', authenticate, async (req: any, res) => { const c=await db.one(`SELECT "userId" FROM post_comments WHERE id=$1`,[req.params.commentId]); if(!c||c.userid!==req.userId) return res.status(403).json({error:'Non autorisé'}); await pool.query(`UPDATE post_comments SET content=$1 WHERE id=$2`,[req.body.content,req.params.commentId]); res.json({success:true}); });
+  app.delete('/api/posts/:postId/comments/:commentId', authenticate, async (req: any, res) => { await pool.query(`DELETE FROM post_comments WHERE id=$1 AND "userId"=$2`,[req.params.commentId,req.userId]); res.json({success:true}); });
+  app.post('/api/posts/:id/view',  authenticate, async (req: any, res) => { await pool.query(`UPDATE posts SET views=views+1 WHERE id=$1`,[req.params.id]); res.json({success:true}); });
+  app.post('/api/posts/:id/boost', authenticate, async (req: any, res) => { try { await pool.query(`INSERT INTO post_boosts("postId","userId",amount) VALUES($1,$2,$3)`,[req.params.id,req.userId,req.body.amount]); res.json({success:true}); } catch { res.status(400).json({error:'Déjà boosté'}); } });
+
+  // ════════════════════════════════════════════════════════════════════════
+  // 🔔 NOTIFICATIONS
+  // ════════════════════════════════════════════════════════════════════════
+  app.get('/api/notifications',       authenticate, async (req: any, res) => res.json(await db.all(`SELECT * FROM notifications WHERE "userId"=$1 ORDER BY "createdAt" DESC LIMIT 50`, [req.userId])));
+  app.put('/api/notifications/:id/read', authenticate, async (req: any, res) => { await pool.query(`UPDATE notifications SET read=TRUE WHERE id=$1 AND "userId"=$2`,[req.params.id,req.userId]); res.json({success:true}); });
+
+  // ════════════════════════════════════════════════════════════════════════
+  // 📅 ÉVÉNEMENTS
+  // ════════════════════════════════════════════════════════════════════════
+  app.get('/api/events',     authenticate, async (_, res) => res.json(await db.all(`SELECT e.*,u.name as "creatorName",(SELECT COUNT(*) FROM event_participants WHERE "eventId"=e.id) as "participantsCount" FROM events e JOIN users u ON e."creatorId"=u.id ORDER BY e."startDate" ASC`, [])));
+  app.post('/api/events',    authenticate, async (req: any, res) => { const {title,description,imageUrl,country,city,location,latitude,longitude,startDate,endDate,category,price,visualUrl}=req.body; res.json(await db.one(`INSERT INTO events(title,description,"imageUrl",country,city,location,latitude,longitude,"startDate","endDate",category,"creatorId",price,"visualUrl") VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`,[title,description,imageUrl,country,city,location,latitude,longitude,startDate,endDate,category,req.userId,price||0,visualUrl])); });
+  app.get('/api/events/:id', authenticate, async (req: any, res) => { const e=await db.one(`SELECT e.*,u.name as "creatorName",(SELECT COUNT(*) FROM event_participants WHERE "eventId"=e.id) as "participantsCount",EXISTS(SELECT 1 FROM event_participants WHERE "eventId"=e.id AND "userId"=$1) as "isParticipating" FROM events e JOIN users u ON e."creatorId"=u.id WHERE e.id=$2`,[req.userId,req.params.id]); if(!e) return res.status(404).json({error:'Non trouvé'}); res.json(e); });
+  app.put('/api/events/:id', authenticate, async (req: any, res) => { const e=await db.one(`SELECT "creatorId" FROM events WHERE id=$1`,[req.params.id]); if(!e||e.creatorid!==req.userId) return res.status(403).json({error:'Non autorisé'}); const {title,description,imageUrl,country,city,location,startDate,endDate,category}=req.body; await pool.query(`UPDATE events SET title=$1,description=$2,"imageUrl"=$3,country=$4,city=$5,location=$6,"startDate"=$7,"endDate"=$8,category=$9 WHERE id=$10`,[title,description,imageUrl,country,city,location,startDate,endDate,category,req.params.id]); res.json({success:true}); });
+  app.delete('/api/events/:id', authenticate, async (req: any, res) => { const e=await db.one(`SELECT "creatorId" FROM events WHERE id=$1`,[req.params.id]); if(!e||e.creatorid!==req.userId) return res.status(403).json({error:'Non autorisé'}); await pool.query(`DELETE FROM events WHERE id=$1`,[req.params.id]); res.json({success:true}); });
+  app.post('/api/events/:id/participate',  authenticate, async (req: any, res) => { try { await pool.query(`INSERT INTO event_participants("eventId","userId") VALUES($1,$2)`,[req.params.id,req.userId]); res.json({success:true}); } catch { res.status(400).json({error:'Déjà participant'}); } });
+  app.delete('/api/events/:id/participate',authenticate, async (req: any, res) => { await pool.query(`DELETE FROM event_participants WHERE "eventId"=$1 AND "userId"=$2`,[req.params.id,req.userId]); res.json({success:true}); });
+  app.get('/api/events/:id/participants',  authenticate, async (req: any, res) => res.json(await db.all(`SELECT u.id,u.name,u."avatarUrl" FROM event_participants ep JOIN users u ON ep."userId"=u.id WHERE ep."eventId"=$1`,[req.params.id])));
+  app.get('/api/events/:id/comments',      authenticate, async (req: any, res) => res.json(await db.all(`SELECT c.*,u.name as "userName",u."avatarUrl" as "userAvatar" FROM event_comments c JOIN users u ON c."userId"=u.id WHERE c."eventId"=$1 ORDER BY c."createdAt" DESC`,[req.params.id])));
+  app.post('/api/events/:id/comments',     authenticate, async (req: any, res) => { if(!req.body.content) return res.status(400).json({error:'Contenu requis'}); res.json(await db.one(`INSERT INTO event_comments("eventId","userId",content) VALUES($1,$2,$3) RETURNING *`,[req.params.id,req.userId,req.body.content])); });
+  app.post('/api/events/:id/favorite',     authenticate, async (req: any, res) => { try { await pool.query(`INSERT INTO favorite_events("userId","eventId") VALUES($1,$2) ON CONFLICT DO NOTHING`,[req.userId,req.params.id]); } catch {} res.json({success:true}); });
+  app.post('/api/events/:id/share',        authenticate, async (req: any, res) => { await pool.query(`UPDATE events SET "shares_count"="shares_count"+1 WHERE id=$1`,[req.params.id]); res.json({success:true}); });
+  app.post('/api/events/:id/invite',       authenticate, async (req: any, res) => { const {userIds}=req.body; if(!Array.isArray(userIds)) return res.status(400).json({error:'userIds requis'}); const ev=await db.one(`SELECT title FROM events WHERE id=$1`,[req.params.id]); const s=await db.one(`SELECT name FROM users WHERE id=$1`,[req.userId]); for(const uid of userIds){const n=await db.one(`INSERT INTO notifications("userId",type,content,"relatedId") VALUES($1,'event_invite',$2,$3) RETURNING *`,[uid,`${s.name} vous invite: ${ev.title}`,req.params.id]);io.to(`user_${uid}`).emit('notification',{...n,read:0});} res.json({success:true}); });
+
+  // ════════════════════════════════════════════════════════════════════════
+  // 💼 SERVICES
+  // ════════════════════════════════════════════════════════════════════════
+  app.get('/api/services',     authenticate, async (_, res) => res.json(await db.all(`SELECT s.*,u.name as "providerName",u."avatarUrl" as "providerAvatar" FROM services s JOIN users u ON s."providerId"=u.id ORDER BY s."createdAt" DESC`, [])));
+  app.post('/api/services',    authenticate, async (req: any, res) => { const {title,description,availability,budget,type,companyName,location,contractType,fileUrl,category}=req.body; res.json(await db.one(`INSERT INTO services("providerId",title,description,availability,budget,type,"companyName",location,"contractType","fileUrl",category) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,[req.userId,title,description,availability,budget,type||'projet',companyName,location,contractType,fileUrl,category])); });
+  app.put('/api/services/:id', authenticate, async (req: any, res) => { const s=await db.one(`SELECT "providerId" FROM services WHERE id=$1`,[req.params.id]); if(!s||s.providerid!==req.userId) return res.status(403).json({error:'Non autorisé'}); const {title,description,budget,availability,type,companyName,location,contractType,fileUrl,category}=req.body; await pool.query(`UPDATE services SET title=$1,description=$2,budget=$3,availability=$4,type=$5,"companyName"=$6,location=$7,"contractType"=$8,"fileUrl"=$9,category=$10 WHERE id=$11`,[title,description,budget,availability,type,companyName,location,contractType,fileUrl,category,req.params.id]); res.json({success:true}); });
+  app.delete('/api/services/:id',          authenticate, async (req: any, res) => { await pool.query(`DELETE FROM services WHERE id=$1 AND "providerId"=$2`,[req.params.id,req.userId]); res.json({success:true}); });
+  app.post('/api/services/:id/apply',      authenticate, async (req: any, res) => { const {message,contactDetails}=req.body; try { await pool.query(`INSERT INTO service_applications("serviceId","userId",message,"contactDetails") VALUES($1,$2,$3,$4)`,[req.params.id,req.userId,message,contactDetails]); res.json({success:true}); } catch { res.status(400).json({error:'Déjà postulé'}); } });
+  app.get('/api/services/:id/applications',authenticate, async (req: any, res) => res.json(await db.all(`SELECT sa.*,u.name,u."avatarUrl",u.email FROM service_applications sa JOIN users u ON sa."userId"=u.id WHERE sa."serviceId"=$1`,[req.params.id])));
+  app.put('/api/services/:serviceId/applications/:applicationId', authenticate, async (req: any, res) => { await pool.query(`UPDATE service_applications SET status=$1 WHERE "serviceId"=$2`,[req.body.status,req.params.serviceId]); res.json({success:true}); });
+
+  // ════════════════════════════════════════════════════════════════════════
+  // 🏢 ENTREPRISES & BOUTIQUES
+  // ════════════════════════════════════════════════════════════════════════
+  app.get('/api/companies',          authenticate, async (_, res) => res.json(await db.all(`SELECT c.*,u.name as "ownerName" FROM companies c JOIN users u ON c."ownerId"=u.id ORDER BY c."createdAt" DESC`, [])));
+  app.get('/api/companies/new',      authenticate, async (_, res) => res.json(await db.all(`SELECT * FROM companies ORDER BY "createdAt" DESC LIMIT 10`, [])));
+  app.get('/api/companies/trending', authenticate, async (_, res) => res.json(await db.all(`SELECT c.*,(SELECT COUNT(*) FROM favorite_companies WHERE "companyId"=c.id) as fav FROM companies c ORDER BY fav DESC LIMIT 10`, [])));
+  app.post('/api/companies',   authenticate, async (req: any, res) => { const {name,sector,description,address,whatsapp,facebook,twitter,linkedin,logoUrl,coverUrl,isShop,specialty,categories,country,city}=req.body; res.json(await db.one(`INSERT INTO companies("ownerId",name,sector,description,address,whatsapp,facebook,twitter,linkedin,"logoUrl","coverUrl","isShop",specialty,categories,country,city) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`,[req.userId,name,sector,description,address,whatsapp,facebook,twitter,linkedin,logoUrl,coverUrl,isShop||0,specialty,categories,country,city])); });
+  app.put('/api/companies/:id', authenticate, async (req: any, res) => { const {name,sector,description,address,whatsapp,logoUrl,coverUrl,isShop,specialty,categories,country,city}=req.body; await pool.query(`UPDATE companies SET name=$1,sector=$2,description=$3,address=$4,whatsapp=$5,"logoUrl"=$6,"coverUrl"=$7,"isShop"=$8,specialty=$9,categories=$10,country=$11,city=$12 WHERE id=$13 AND "ownerId"=$14`,[name,sector,description,address,whatsapp,logoUrl,coverUrl,isShop,specialty,categories,country,city,req.params.id,req.userId]); res.json({success:true}); });
+  app.delete('/api/companies/:id', authenticate, async (req: any, res) => { await pool.query(`DELETE FROM companies WHERE id=$1 AND "ownerId"=$2`,[req.params.id,req.userId]); res.json({success:true}); });
+  app.post('/api/companies/:id/favorite',   authenticate, async (req: any, res) => { try { await pool.query(`INSERT INTO favorite_companies("userId","companyId") VALUES($1,$2) ON CONFLICT DO NOTHING`,[req.userId,req.params.id]); } catch {} res.json({success:true}); });
+  app.delete('/api/companies/:id/favorite', authenticate, async (req: any, res) => { await pool.query(`DELETE FROM favorite_companies WHERE "userId"=$1 AND "companyId"=$2`,[req.userId,req.params.id]); res.json({success:true}); });
+  app.get('/api/companies/:id/catalog',     authenticate, async (req: any, res) => res.json(await db.all(`SELECT * FROM company_catalog WHERE "companyId"=$1`,[req.params.id])));
+  app.post('/api/companies/:id/catalog',    authenticate, async (req: any, res) => { const {name,description,price,imageUrl,category,tag,tagValue}=req.body; res.json(await db.one(`INSERT INTO company_catalog("companyId",name,description,price,"imageUrl",category,tag,"tagValue") VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,[req.params.id,name,description,price,imageUrl,category,tag,tagValue])); });
+  app.put('/api/companies/:companyId/catalog/:productId',    authenticate, async (req: any, res) => { const {name,description,price,imageUrl,category}=req.body; await pool.query(`UPDATE company_catalog SET name=$1,description=$2,price=$3,"imageUrl"=$4,category=$5 WHERE id=$6 AND "companyId"=$7`,[name,description,price,imageUrl,category,req.params.productId,req.params.companyId]); res.json({success:true}); });
+  app.delete('/api/companies/:companyId/catalog/:productId', authenticate, async (req: any, res) => { await pool.query(`DELETE FROM company_catalog WHERE id=$1 AND "companyId"=$2`,[req.params.productId,req.params.companyId]); res.json({success:true}); });
+  app.post('/api/products/:id/favorite',   authenticate, async (req: any, res) => { try { await pool.query(`INSERT INTO favorite_products("userId","productId") VALUES($1,$2) ON CONFLICT DO NOTHING`,[req.userId,req.params.id]); } catch {} res.json({success:true}); });
+  app.delete('/api/products/:id/favorite', authenticate, async (req: any, res) => { await pool.query(`DELETE FROM favorite_products WHERE "userId"=$1 AND "productId"=$2`,[req.userId,req.params.id]); res.json({success:true}); });
+  app.post('/api/products/:id/share', authenticate, async (req: any, res) => { await pool.query(`UPDATE company_catalog SET "shares_count"="shares_count"+1 WHERE id=$1`,[req.params.id]); res.json({success:true}); });
+  app.get('/api/products/recent',     authenticate, async (_, res) => res.json(await db.all(`SELECT p.*,c.name as "companyName" FROM company_catalog p JOIN companies c ON p."companyId"=c.id ORDER BY p."createdAt" DESC LIMIT 20`,[])));
+  app.get('/api/products/promotions', authenticate, async (_, res) => res.json(await db.all(`SELECT p.*,c.name as "companyName" FROM company_catalog p JOIN companies c ON p."companyId"=c.id WHERE p.tag='promo' LIMIT 20`,[])));
+  app.get('/api/companies/:id/stock',authenticate, async (req: any, res) => res.json(await db.all(`SELECT s.*,p.name as "productName" FROM stocks s JOIN company_catalog p ON s."productId"=p.id WHERE p."companyId"=$1`,[req.params.id])));
+  app.put('/api/companies/:companyId/stock/:productId', authenticate, async (req: any, res) => { const {quantity,minQuantity,costPrice}=req.body; await pool.query(`INSERT INTO stocks("productId",quantity,"minQuantity","costPrice","lastUpdated") VALUES($1,$2,$3,$4,NOW()) ON CONFLICT("productId") DO UPDATE SET quantity=$2,"minQuantity"=$3,"costPrice"=$4,"lastUpdated"=NOW()`,[req.params.productId,quantity,minQuantity||5,costPrice||0]); res.json({success:true}); });
+  app.get('/api/companies/:id/orders',    authenticate, async (req: any, res) => res.json(await db.all(`SELECT o.*,p.name as "productName",u.name as "customerNameUser" FROM shop_orders o JOIN company_catalog p ON o."productId"=p.id JOIN users u ON o."customerId"=u.id WHERE o."companyId"=$1 ORDER BY o."createdAt" DESC`,[req.params.id])));
+  app.post('/api/companies/:id/orders',   authenticate, async (req: any, res) => { const {productId,quantity,totalPrice,customerName,customerWhatsapp}=req.body; res.json(await db.one(`INSERT INTO shop_orders("companyId","customerId","productId",quantity,"totalPrice","customerName","customerWhatsapp") VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *`,[req.params.id,req.userId,productId,quantity||1,totalPrice,customerName,customerWhatsapp])); });
+  app.put('/api/orders/:orderId/status',  authenticate, async (req: any, res) => { await pool.query(`UPDATE shop_orders SET status=$1 WHERE id=$2`,[req.body.status,req.params.orderId]); res.json({success:true}); });
+  app.get('/api/companies/:id/insights',  authenticate, async (req: any, res) => { const o=await db.one(`SELECT COUNT(*) as c,SUM("totalPrice") as rev FROM shop_orders WHERE "companyId"=$1`,[req.params.id]); const p=await db.one(`SELECT COUNT(*) as c FROM company_catalog WHERE "companyId"=$1`,[req.params.id]); res.json({totalOrders:o.c,totalRevenue:o.rev||0,totalProducts:p.c}); });
+  app.post('/api/companies/:id/funding-request', authenticate, async (req: any, res) => { const {fundingType,amount,reason,institutionId,strategicData}=req.body; res.json(await db.one(`INSERT INTO funding_requests("userId","companyId","institutionId","fundingType",amount,reason,"strategicData") VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *`,[req.userId,req.params.id,institutionId||null,fundingType,amount,reason,strategicData?JSON.stringify(strategicData):null])); });
+  app.get('/api/funding-requests/my', authenticate, async (req: any, res) => res.json(await db.all(`SELECT fr.*,c.name as "companyName" FROM funding_requests fr JOIN companies c ON fr."companyId"=c.id WHERE fr."userId"=$1 ORDER BY fr."createdAt" DESC`,[req.userId])));
+  app.put('/api/companies/:id/manager',      authenticate, async (req: any, res) => { await pool.query(`UPDATE companies SET "managerId"=$1 WHERE id=$2 AND "ownerId"=$3`,[req.body.managerId||null,req.params.id,req.userId]); res.json({success:true}); });
+  app.post('/api/companies/:id/resign-manager', authenticate, async (req: any, res) => { await pool.query(`UPDATE companies SET "managerId"=NULL WHERE id=$1 AND "managerId"=$2`,[req.params.id,req.userId]); res.json({success:true}); });
+
+  // ════════════════════════════════════════════════════════════════════════
+  // 💬 MESSAGERIE
+  // ════════════════════════════════════════════════════════════════════════
+  app.get('/api/conversations', authenticate, async (req: any, res) => {
+    const direct = await db.all(`SELECT u.id,u.name,u."avatarUrl",MAX(m."createdAt") as "lastMessageAt",(SELECT content FROM messages WHERE(("senderId"=u.id AND "receiverId"=$1) OR("senderId"=$1 AND "receiverId"=u.id)) AND "roomId" IS NULL ORDER BY "createdAt" DESC LIMIT 1) as "lastMessage",(SELECT COUNT(*) FROM messages WHERE "senderId"=u.id AND "receiverId"=$1 AND read=0 AND "roomId" IS NULL) as "unreadCount",'direct' as type FROM users u JOIN messages m ON u.id=m."senderId" OR u.id=m."receiverId" WHERE(m."senderId"=$1 OR m."receiverId"=$1) AND u.id!=$1 AND m."roomId" IS NULL GROUP BY u.id,u.name,u."avatarUrl"`, [req.userId]);
+    const rooms  = await db.all(`SELECT cr.id,cr.name,cr."avatarUrl",MAX(m."createdAt") as "lastMessageAt",(SELECT content FROM messages WHERE "roomId"=cr.id ORDER BY "createdAt" DESC LIMIT 1) as "lastMessage",(SELECT COUNT(*) FROM messages WHERE "roomId"=cr.id AND read=0 AND "senderId"!=$1) as "unreadCount",cr.type FROM chat_rooms cr JOIN chat_room_members crm ON cr.id=crm."roomId" LEFT JOIN messages m ON cr.id=m."roomId" WHERE crm."userId"=$1 GROUP BY cr.id`, [req.userId]);
+    res.json([...direct, ...rooms].sort((a: any, b: any) => new Date(b.lastMessageAt || 0).getTime() - new Date(a.lastMessageAt || 0).getTime()));
+  });
+  app.get('/api/messages/:userId',    authenticate, async (req: any, res) => res.json(await db.all(`SELECT m.*,u.name as "senderName",u."avatarUrl" as "senderAvatar" FROM messages m JOIN users u ON m."senderId"=u.id WHERE(m."senderId"=$1 AND m."receiverId"=$2) OR(m."senderId"=$2 AND m."receiverId"=$1) ORDER BY m."createdAt" ASC`,[req.userId,req.params.userId])));
+  app.post('/api/messages/:userId',   authenticate, async (req: any, res) => { const {content,fileUrl,fileType,fileName}=req.body; const msg=await db.one(`INSERT INTO messages("senderId","receiverId",content,"fileUrl","fileType","fileName") VALUES($1,$2,$3,$4,$5,$6) RETURNING *`,[req.userId,req.params.userId,content||'',fileUrl,fileType,fileName]); const s=await db.one(`SELECT name,"avatarUrl" FROM users WHERE id=$1`,[req.userId]); const full={...msg,senderName:s.name,senderAvatar:s.avatarurl}; io.to(`user_${req.params.userId}`).emit('new_message',full); res.json(full); });
+  app.put('/api/messages/:userId/read',  authenticate, async (req: any, res) => { await pool.query(`UPDATE messages SET read=1 WHERE "senderId"=$1 AND "receiverId"=$2`,[req.params.userId,req.userId]); res.json({success:true}); });
+  app.delete('/api/messages/:userId/history', authenticate, async (req: any, res) => { await pool.query(`DELETE FROM messages WHERE("senderId"=$1 AND "receiverId"=$2) OR("senderId"=$2 AND "receiverId"=$1)`,[req.userId,req.params.userId]); res.json({success:true}); });
+  app.delete('/api/messages/:userId',    authenticate, async (req: any, res) => { await pool.query(`DELETE FROM messages WHERE("senderId"=$1 AND "receiverId"=$2) OR("senderId"=$2 AND "receiverId"=$1)`,[req.userId,req.params.userId]); res.json({success:true}); });
+  app.delete('/api/messages/item/:id',   authenticate, async (req: any, res) => { await pool.query(`DELETE FROM messages WHERE id=$1 AND "senderId"=$2`,[req.params.id,req.userId]); res.json({success:true}); });
+  app.put('/api/messages/item/:id',      authenticate, async (req: any, res) => { await pool.query(`UPDATE messages SET content=$1 WHERE id=$2 AND "senderId"=$3`,[req.body.content,req.params.id,req.userId]); res.json({success:true}); });
+  app.put('/api/messages/:id/pin',       authenticate, async (req: any, res) => { await pool.query(`UPDATE messages SET "isPinned"=TRUE WHERE id=$1`,[req.params.id]); res.json({success:true}); });
+  app.put('/api/messages/:id/unpin',     authenticate, async (req: any, res) => { await pool.query(`UPDATE messages SET "isPinned"=FALSE WHERE id=$1`,[req.params.id]); res.json({success:true}); });
+  app.post('/api/messages/:id/react',    authenticate, async (req: any, res) => { try { await pool.query(`INSERT INTO message_reactions("messageId","userId",emoji) VALUES($1,$2,$3) ON CONFLICT("messageId","userId") DO UPDATE SET emoji=$3`,[req.params.id,req.userId,req.body.emoji]); } catch {} res.json({success:true}); });
+  app.post('/api/chat-rooms',            authenticate, async (req: any, res) => { const {name,type,memberIds,avatarUrl}=req.body; const room=await db.one(`INSERT INTO chat_rooms(name,type,"avatarUrl","creatorId") VALUES($1,$2,$3,$4) RETURNING *`,[name||null,type||'group',avatarUrl||null,req.userId]); await pool.query(`INSERT INTO chat_room_members("roomId","userId") VALUES($1,$2)`,[room.id,req.userId]); if(Array.isArray(memberIds)) for(const id of memberIds) { try { await pool.query(`INSERT INTO chat_room_members("roomId","userId") VALUES($1,$2) ON CONFLICT DO NOTHING`,[room.id,id]); } catch {} } res.json(room); });
+  app.post('/api/chat-rooms/:id/members',authenticate, async (req: any, res) => { const {userIds}=req.body; if(Array.isArray(userIds)) for(const id of userIds) { try { await pool.query(`INSERT INTO chat_room_members("roomId","userId") VALUES($1,$2) ON CONFLICT DO NOTHING`,[req.params.id,id]); } catch {} } res.json({success:true}); });
+  app.get('/api/chat-rooms/:id/messages',authenticate, async (req: any, res) => res.json(await db.all(`SELECT m.*,u.name as "senderName",u."avatarUrl" as "senderAvatar" FROM messages m JOIN users u ON m."senderId"=u.id WHERE m."roomId"=$1 ORDER BY m."createdAt" ASC`,[req.params.id])));
+  app.post('/api/chat-rooms/:id/messages',authenticate, async (req: any, res) => { const {content,fileUrl,fileType,fileName,replyToId}=req.body; const msg=await db.one(`INSERT INTO messages("senderId","roomId",content,"fileUrl","fileType","fileName","replyToId") VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *`,[req.userId,req.params.id,content||'',fileUrl,fileType,fileName,replyToId||null]); const s=await db.one(`SELECT name,"avatarUrl" FROM users WHERE id=$1`,[req.userId]); const full={...msg,senderName:s.name,senderAvatar:s.avatarurl}; io.to(`room_${req.params.id}`).emit('new_room_message',full); res.json(full); });
+  app.get('/api/chat-rooms/:id/members', authenticate, async (req: any, res) => res.json(await db.all(`SELECT u.id,u.name,u."avatarUrl" FROM chat_room_members crm JOIN users u ON crm."userId"=u.id WHERE crm."roomId"=$1`,[req.params.id])));
+  app.put('/api/chat-rooms/:id',         authenticate, async (req: any, res) => { const {name,avatarUrl}=req.body; await pool.query(`UPDATE chat_rooms SET name=$1,"avatarUrl"=$2 WHERE id=$3 AND "creatorId"=$4`,[name,avatarUrl,req.params.id,req.userId]); res.json({success:true}); });
+
+  // ════════════════════════════════════════════════════════════════════════
+  // 📖 STORIES
+  // ════════════════════════════════════════════════════════════════════════
+  app.get('/api/stories',         authenticate, async (req: any, res) => res.json(await db.all(`SELECT DISTINCT s.*,u.name as "authorName",u."avatarUrl" as "authorAvatar",(SELECT COUNT(*) FROM story_views WHERE "storyId"=s.id) as "viewsCount",EXISTS(SELECT 1 FROM story_views WHERE "storyId"=s.id AND "userId"=$1) as "isViewed" FROM stories s JOIN users u ON s."userId"=u.id LEFT JOIN follows f ON f."followingId"=s."userId" WHERE(f."followerId"=$1 OR s."userId"=$1) AND s."expiresAt">NOW() ORDER BY s."createdAt" DESC`,[req.userId])));
+  app.post('/api/stories',        authenticate, async (req: any, res) => { const {mediaUrl,mediaType}=req.body; res.json(await db.one(`INSERT INTO stories("userId","mediaUrl","mediaType","expiresAt") VALUES($1,$2,$3,NOW()+INTERVAL '24 hours') RETURNING *`,[req.userId,mediaUrl,mediaType||'image'])); });
+  app.get('/api/stories/archives',authenticate, async (req: any, res) => res.json(await db.all(`SELECT s.*,u.name as "authorName",u."avatarUrl" as "authorAvatar" FROM stories s JOIN users u ON s."userId"=u.id WHERE s."userId"=$1 ORDER BY s."createdAt" DESC`,[req.userId])));
+  app.post('/api/stories/:id/view', authenticate, async (req: any, res) => { try { await pool.query(`INSERT INTO story_views("storyId","userId") VALUES($1,$2) ON CONFLICT DO NOTHING`,[req.params.id,req.userId]); } catch {} res.json({success:true}); });
+  app.post('/api/stories/:id/react',authenticate, async (req: any, res) => { await pool.query(`INSERT INTO story_reactions("storyId","userId",emoji) VALUES($1,$2,$3)`,[req.params.id,req.userId,req.body.emoji]); res.json({success:true}); });
+
+  // ════════════════════════════════════════════════════════════════════════
+  // 🎓 PANNELS (Formation)
+  // ════════════════════════════════════════════════════════════════════════
+  app.get('/api/pannels',     authenticate, async (req: any, res) => res.json(await db.all(`SELECT p.*,u.name as "ownerName",(SELECT COUNT(*) FROM pannel_members WHERE "pannelId"=p.id) as "membersCount",(SELECT role FROM pannel_members WHERE "pannelId"=p.id AND "userId"=$1) as "userRole" FROM pannels p JOIN users u ON p."ownerId"=u.id`,[req.userId])));
+  app.get('/api/pannels/my',  authenticate, async (req: any, res) => res.json(await db.all(`SELECT p.*,u.name as "ownerName",(SELECT COUNT(*) FROM pannel_members WHERE "pannelId"=p.id) as "membersCount",pm.role as "userRole" FROM pannels p JOIN pannel_members pm ON p.id=pm."pannelId" JOIN users u ON p."ownerId"=u.id WHERE pm."userId"=$1`,[req.userId])));
+  app.get('/api/pannels/:id', authenticate, async (req: any, res) => { const p=await db.one(`SELECT p.*,u.name as "ownerName",(SELECT role FROM pannel_members WHERE "pannelId"=p.id AND "userId"=$1) as "userRole" FROM pannels p JOIN users u ON p."ownerId"=u.id WHERE p.id=$2`,[req.userId,req.params.id]); if(!p) return res.status(404).json({error:'Non trouvé'}); res.json(p); });
+  app.post('/api/pannels',    authenticate, async (req: any, res) => { const {name,description,theme,logoUrl,coverUrl}=req.body; const r=await db.one(`INSERT INTO pannels(name,description,theme,"ownerId","logoUrl","coverUrl") VALUES($1,$2,$3,$4,$5,$6) RETURNING *`,[name,description,theme,req.userId,logoUrl,coverUrl]); await pool.query(`INSERT INTO pannel_members("pannelId","userId",role) VALUES($1,$2,'admin')`,[r.id,req.userId]); res.json(r); });
+  app.put('/api/pannels/:id', authenticate, async (req: any, res) => { const {name,description,theme,logoUrl,coverUrl}=req.body; await pool.query(`UPDATE pannels SET name=$1,description=$2,theme=$3,"logoUrl"=$4,"coverUrl"=$5 WHERE id=$6`,[name,description,theme,logoUrl,coverUrl,req.params.id]); res.json({success:true}); });
+  app.delete('/api/pannels/:id',authenticate, async (req: any, res) => { await pool.query(`DELETE FROM pannels WHERE id=$1 AND "ownerId"=$2`,[req.params.id,req.userId]); res.json({success:true}); });
+  app.post('/api/pannels/:id/join',       authenticate, async (req: any, res) => { try { await pool.query(`INSERT INTO pannel_members("pannelId","userId") VALUES($1,$2)`,[req.params.id,req.userId]); res.json({success:true}); } catch { res.status(400).json({error:'Déjà membre'}); } });
+  app.post('/api/pannels/:id/add-member', authenticate, async (req: any, res) => { try { await pool.query(`INSERT INTO pannel_members("pannelId","userId") VALUES($1,$2)`,[req.params.id,req.body.userId]); res.json({success:true}); } catch { res.status(400).json({error:'Déjà membre'}); } });
+  app.delete('/api/pannels/:id/members/:userId',  authenticate, async (req: any, res) => { await pool.query(`DELETE FROM pannel_members WHERE "pannelId"=$1 AND "userId"=$2`,[req.params.id,req.params.userId]); res.json({success:true}); });
+  app.get('/api/pannels/:id/members',             authenticate, async (req: any, res) => res.json(await db.all(`SELECT pm.*,u.name,u."avatarUrl",u.profession FROM pannel_members pm JOIN users u ON pm."userId"=u.id WHERE pm."pannelId"=$1`,[req.params.id])));
+  app.put('/api/pannels/:id/members/:userId/role',authenticate, async (req: any, res) => { await pool.query(`UPDATE pannel_members SET role=$1 WHERE "pannelId"=$2 AND "userId"=$3`,[req.body.role,req.params.id,req.params.userId]); res.json({success:true}); });
+  app.get('/api/pannels/:id/courses',   authenticate, async (req: any, res) => res.json(await db.all(`SELECT pc.*,(SELECT status FROM pannel_progress WHERE "courseId"=pc.id AND "userId"=$1) as "progressStatus" FROM pannel_courses pc WHERE pc."pannelId"=$2 ORDER BY pc."createdAt" DESC`,[req.userId,req.params.id])));
+  app.post('/api/pannels/:id/courses',  authenticate, async (req: any, res) => { const {title,description,duration,fileUrl,fileType,url,type}=req.body; const fu=fileUrl||url; const ft=fileType||type; if(!title||!fu||!ft) return res.status(400).json({error:'Titre, fichier et type requis'}); await pool.query(`INSERT INTO pannel_courses("pannelId",title,description,duration,"fileUrl","fileType") VALUES($1,$2,$3,$4,$5,$6)`,[req.params.id,title,description,duration,fu,ft]); res.json({success:true}); });
+  app.delete('/api/pannels/:id/courses/:courseId',              authenticate, async (req: any, res) => { await pool.query(`DELETE FROM pannel_courses WHERE id=$1 AND "pannelId"=$2`,[req.params.courseId,req.params.id]); res.json({success:true}); });
+  app.post('/api/pannels/:id/courses/:courseId/learn',          authenticate, async (req: any, res) => { const {status,position,notes,stickyNotes}=req.body; await pool.query(`INSERT INTO pannel_progress("pannelId","userId","courseId",status,position,notes,"stickyNotes","updatedAt") VALUES($1,$2,$3,$4,$5,$6,$7,NOW()) ON CONFLICT("pannelId","userId","courseId") DO UPDATE SET status=$4,position=$5,notes=$6,"stickyNotes"=$7,"updatedAt"=NOW()`,[req.params.id,req.userId,req.params.courseId,status||'en_cours',position||0,notes,stickyNotes]); res.json({success:true}); });
+  app.get('/api/pannels/:id/courses/:courseId/progress',        authenticate, async (req: any, res) => res.json(await db.one(`SELECT * FROM pannel_progress WHERE "pannelId"=$1 AND "userId"=$2 AND "courseId"=$3`,[req.params.id,req.userId,req.params.courseId]) || {}));
+  app.get('/api/pannels/:id/courses/:courseId/comments',        authenticate, async (req: any, res) => res.json(await db.all(`SELECT c.*,u.name as "userName",u."avatarUrl" as "userAvatar" FROM pannel_course_comments c JOIN users u ON c."userId"=u.id WHERE c."courseId"=$1 ORDER BY c."createdAt" ASC`,[req.params.courseId])));
+  app.post('/api/pannels/:id/courses/:courseId/comments',       authenticate, async (req: any, res) => { await pool.query(`INSERT INTO pannel_course_comments("courseId","userId",content) VALUES($1,$2,$3)`,[req.params.courseId,req.userId,req.body.content]); res.json({success:true}); });
+  app.post('/api/pannels/:id/courses/:courseId/favorite',       authenticate, async (_, res) => res.json({ success: true }));
+  app.get('/api/pannels/:id/evaluations',  authenticate, async (req: any, res) => res.json(await db.all(`SELECT * FROM pannel_evaluations WHERE "pannelId"=$1`,[req.params.id])));
+  app.post('/api/pannels/:id/evaluations', authenticate, async (req: any, res) => { const {courseTitle,grade,feedback,userId}=req.body; await pool.query(`INSERT INTO pannel_evaluations("pannelId","userId","courseTitle",grade,feedback) VALUES($1,$2,$3,$4,$5)`,[req.params.id,userId||req.userId,courseTitle,grade,feedback]); res.json({success:true}); });
+  app.get('/api/pannels/:id/badges',  authenticate, async (req: any, res) => res.json(await db.all(`SELECT * FROM pannel_badges WHERE "pannelId"=$1 AND "userId"=$2`,[req.params.id,req.userId])));
+  app.post('/api/pannels/:id/badges', authenticate, async (req: any, res) => { await pool.query(`INSERT INTO pannel_badges("pannelId","userId","badgeType") VALUES($1,$2,$3)`,[req.params.id,req.userId,req.body.badgeType]); res.json({success:true}); });
+  app.get('/api/pannels/:id/stats',   authenticate, async (req: any, res) => { const m=await db.one(`SELECT COUNT(*) as c FROM pannel_members WHERE "pannelId"=$1`,[req.params.id]); const co=await db.one(`SELECT COUNT(*) as c FROM pannel_courses WHERE "pannelId"=$1`,[req.params.id]); res.json({membersCount:m.c,coursesCount:co.c}); });
+  app.get('/api/pannels/:id/forum',   authenticate, async (req: any, res) => res.json(await db.all(`SELECT f.*,u.name as "userName",u."avatarUrl" as "userAvatar" FROM pannel_forum f JOIN users u ON f."userId"=u.id WHERE f."pannelId"=$1 ORDER BY f."createdAt" ASC`,[req.params.id])));
+  app.post('/api/pannels/:id/forum',  authenticate, async (req: any, res) => { if(!req.body.content) return res.status(400).json({error:'Contenu requis'}); await pool.query(`INSERT INTO pannel_forum("pannelId","userId",content) VALUES($1,$2,$3)`,[req.params.id,req.userId,req.body.content]); res.json({success:true}); });
+  app.get('/api/courses/all', authenticate, async (req: any, res) => res.json(await db.all(`SELECT c.*,p.name as "pannelName",(SELECT status FROM pannel_progress WHERE "courseId"=c.id AND "userId"=$1) as "progressStatus" FROM pannel_courses c JOIN pannels p ON c."pannelId"=p.id ORDER BY c."createdAt" DESC`,[req.userId])));
+
+  // ════════════════════════════════════════════════════════════════════════
+  // 🏘️  CELLULES & COMMUNAUTÉS
+  // ════════════════════════════════════════════════════════════════════════
+  app.get('/api/cells/me',  authenticate, async (req: any, res) => res.json(await db.all(`SELECT c.* FROM cells c JOIN cell_members cm ON c.id=cm."cellId" WHERE cm."userId"=$1`,[req.userId])));
+  app.get('/api/cells/all', authenticate, async (_, res) => res.json(await db.all(`SELECT c.*,u.name as "creatorName",(SELECT COUNT(*) FROM cell_members WHERE "cellId"=c.id) as "membersCount" FROM cells c JOIN users u ON c."creatorId"=u.id ORDER BY c."createdAt" DESC`,[])));
+  app.post('/api/cells',    authenticate, async (req: any, res) => { const {name,description,coverUrl,city,country}=req.body; const r=await db.one(`INSERT INTO cells(name,description,"creatorId","coverUrl",city,country) VALUES($1,$2,$3,$4,$5,$6) RETURNING *`,[name,description,req.userId,coverUrl,city,country]); await pool.query(`INSERT INTO cell_members("cellId","userId",role) VALUES($1,$2,'admin')`,[r.id,req.userId]); res.json(r); });
+  app.put('/api/cells/:id', authenticate, async (req: any, res) => { const {name,description,coverUrl}=req.body; await pool.query(`UPDATE cells SET name=$1,description=$2,"coverUrl"=$3 WHERE id=$4 AND "creatorId"=$5`,[name,description,coverUrl,req.params.id,req.userId]); res.json({success:true}); });
+  app.delete('/api/cells/:id', authenticate, async (req: any, res) => { await pool.query(`DELETE FROM cells WHERE id=$1 AND "creatorId"=$2`,[req.params.id,req.userId]); res.json({success:true}); });
+  app.post('/api/cells/:id/members',authenticate, async (req: any, res) => { try { await pool.query(`INSERT INTO cell_members("cellId","userId") VALUES($1,$2)`,[req.params.id,req.body.userId]); res.json({success:true}); } catch { res.status(400).json({error:'Déjà membre'}); } });
+  app.get('/api/cells/:id/members', authenticate, async (req: any, res) => res.json(await db.all(`SELECT u.id,u.name,u."avatarUrl",cm.role FROM cell_members cm JOIN users u ON cm."userId"=u.id WHERE cm."cellId"=$1`,[req.params.id])));
+
+  // ════════════════════════════════════════════════════════════════════════
+  // ⛪ CHURCHES
+  // ════════════════════════════════════════════════════════════════════════
+  app.get('/api/churches',    authenticate, async (_, res) => res.json(await db.all(`SELECT * FROM churches ORDER BY "createdAt" DESC`,[])));
+  app.post('/api/churches',   authenticate, async (req: any, res) => { const {name,pastor,hq,description,coverUrl,latitude,longitude,city,country}=req.body; res.json(await db.one(`INSERT INTO churches(name,pastor,hq,description,"coverUrl",latitude,longitude,city,country,"creatorId") VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,[name,pastor,hq,description,coverUrl,latitude,longitude,city,country,req.userId])); });
+  app.put('/api/churches/:id',authenticate, async (req: any, res) => { const {name,pastor,hq,description,coverUrl}=req.body; await pool.query(`UPDATE churches SET name=$1,pastor=$2,hq=$3,description=$4,"coverUrl"=$5 WHERE id=$6 AND "creatorId"=$7`,[name,pastor,hq,description,coverUrl,req.params.id,req.userId]); res.json({success:true}); });
+  app.delete('/api/churches/:id',authenticate, async (req: any, res) => { await pool.query(`DELETE FROM churches WHERE id=$1 AND "creatorId"=$2`,[req.params.id,req.userId]); res.json({success:true}); });
+
+  // ════════════════════════════════════════════════════════════════════════
+  // 🏦 INSTITUTIONS DE CRÉDIT
+  // ════════════════════════════════════════════════════════════════════════
+  app.get('/api/credit-institutions',     authenticate, async (_, res) => res.json(await db.all(`SELECT ci.*,u.name as "creatorName" FROM credit_institutions ci JOIN users u ON ci."creatorId"=u.id ORDER BY ci."createdAt" DESC`,[])));
+  app.get('/api/credit-institutions/my',  authenticate, async (req: any, res) => res.json(await db.all(`SELECT * FROM credit_institutions WHERE "creatorId"=$1`,[req.userId])));
+  app.post('/api/credit-institutions',    authenticate, async (req: any, res) => { const {name,type,description,eligibilityConditions,offers,city,country,logoUrl}=req.body; if(!name||!type) return res.status(400).json({error:'Nom et type obligatoires'}); res.json(await db.one(`INSERT INTO credit_institutions("creatorId",name,type,description,eligibility,terms,city,country,"logoUrl") VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,[req.userId,name,type,description,eligibilityConditions,offers,city,country,logoUrl])); });
+  app.put('/api/credit-institutions/:id', authenticate, async (req: any, res) => { const {name,type,description,eligibility,terms,city,country,logoUrl}=req.body; await pool.query(`UPDATE credit_institutions SET name=$1,type=$2,description=$3,eligibility=$4,terms=$5,city=$6,country=$7,"logoUrl"=$8 WHERE id=$9 AND "creatorId"=$10`,[name,type,description,eligibility,terms,city,country,logoUrl,req.params.id,req.userId]); res.json({success:true}); });
+  app.get('/api/credit-institutions/:id/requests', authenticate, async (req: any, res) => res.json(await db.all(`SELECT fr.*,u.name as "userName",c.name as "companyName" FROM funding_requests fr JOIN users u ON fr."userId"=u.id JOIN companies c ON fr."companyId"=c.id WHERE fr."institutionId"=$1`,[req.params.id])));
+
+  // ════════════════════════════════════════════════════════════════════════
+  // ✅ TÂCHES
+  // ════════════════════════════════════════════════════════════════════════
+  app.get('/api/tasks',    authenticate, async (req: any, res) => res.json(await db.all(`SELECT * FROM tasks WHERE "userId"=$1 ORDER BY "createdAt" DESC`,[req.userId])));
+  app.post('/api/tasks',   authenticate, async (req: any, res) => { const {title,description,dueDate,reminderTime,status,priority,category,assignedUserId}=req.body; res.json(await db.one(`INSERT INTO tasks("userId",title,description,"dueDate","reminderTime",status,priority,category,"assignedUserId") VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,[req.userId,title,description,dueDate,reminderTime,status||'todo',priority||'medium',category||'Général',assignedUserId||null])); });
+  app.put('/api/tasks/:id',authenticate, async (req: any, res) => { const {status,title,description,dueDate,reminderTime,priority,category}=req.body; await pool.query(`UPDATE tasks SET status=$1,title=$2,description=$3,"dueDate"=$4,"reminderTime"=$5,priority=$6,category=$7 WHERE id=$8 AND "userId"=$9`,[status,title,description,dueDate,reminderTime,priority,category,req.params.id,req.userId]); res.json({success:true}); });
+  app.delete('/api/tasks/:id',authenticate, async (req: any, res) => { await pool.query(`DELETE FROM tasks WHERE id=$1 AND "userId"=$2`,[req.params.id,req.userId]); res.json({success:true}); });
+  app.post('/api/tasks/:taskId/subtasks', authenticate, async (req: any, res) => res.json(await db.one(`INSERT INTO task_subtasks("taskId",title) VALUES($1,$2) RETURNING *`,[req.params.taskId,req.body.title])));
+  app.get('/api/tasks/:taskId/subtasks',  authenticate, async (req: any, res) => res.json(await db.all(`SELECT * FROM task_subtasks WHERE "taskId"=$1`,[req.params.taskId])));
+  app.put('/api/subtasks/:id',            authenticate, async (req: any, res) => { await pool.query(`UPDATE task_subtasks SET status=$1 WHERE id=$2`,[req.body.status,req.params.id]); res.json({success:true}); });
+
+  // ════════════════════════════════════════════════════════════════════════
+  // 🌍 DIVERS
+  // ════════════════════════════════════════════════════════════════════════
+  app.get('/api/countries',                       authenticate, async (_, res) => { const r=await db.all(`SELECT DISTINCT country FROM users WHERE country IS NOT NULL AND country!='' ORDER BY country`,[]); res.json(r.map((c:any)=>c.country)); });
+  app.get('/api/reviews/:targetType/:targetId',   authenticate, async (req: any, res) => res.json(await db.all(`SELECT r.*,u.name,u."avatarUrl" FROM reviews r JOIN users u ON r."userId"=u.id WHERE r."targetType"=$1 AND r."targetId"=$2 ORDER BY r."createdAt" DESC`,[req.params.targetType,req.params.targetId])));
+  app.post('/api/reviews',                        authenticate, async (req: any, res) => { const {targetType,targetId,rating,comment}=req.body; res.json(await db.one(`INSERT INTO reviews("userId","targetType","targetId",rating,comment) VALUES($1,$2,$3,$4,$5) RETURNING *`,[req.userId,targetType,targetId,rating,comment])); });
+  app.post('/api/ads',                            authenticate, async (req: any, res) => { const {companyId,goal,content,targeting,budget,duration}=req.body; res.json(await db.one(`INSERT INTO ads("companyId",goal,content,targeting,budget,duration) VALUES($1,$2,$3,$4,$5,$6) RETURNING *`,[companyId,goal,content,targeting,budget,duration])); });
+  app.get('/api/ads/:companyId',                  authenticate, async (req: any, res) => res.json(await db.all(`SELECT * FROM ads WHERE "companyId"=$1`,[req.params.companyId])));
+  app.post('/api/reports',                        authenticate, async (req: any, res) => { const {targetType,targetId,reason}=req.body; if(!targetType||!targetId||!reason) return res.status(400).json({error:'Données manquantes'}); await pool.query(`INSERT INTO reports("reporterId","targetType","targetId",reason) VALUES($1,$2,$3,$4)`,[req.userId,targetType,targetId,reason]); res.json({success:true}); });
+
+  // ════════════════════════════════════════════════════════════════════════
+  // 📤 UPLOAD IMAGES (Cloudinary)
+  // ════════════════════════════════════════════════════════════════════════
+  app.post('/api/upload', authenticate, async (req: any, res) => {
+    try {
+      const { data, folder = 'freebara' } = req.body;
+      if (!data) return res.status(400).json({ error: 'Données image manquantes' });
+      const url = await uploadToCloudinary(data, folder);
+      await logAction('INFO', 'image_uploaded', req.userId, req.ip, folder);
+      res.json({ url });
+    } catch (e: any) {
+      errorTracker.capture(e, 'upload');
+      res.status(500).json({ error: 'Erreur upload: ' + e.message });
+    }
   });
 
-  // PUT /api/admin/reports/:id — traiter un signalement
-  app.put('/api/admin/reports/:id', authenticate, requireAdmin, (req: any, res) => {
-    const { status } = req.body;
-    db.prepare('UPDATE reports SET status = ? WHERE id = ?').run(status, req.params.id);
-    res.json({ success: true });
+  // ════════════════════════════════════════════════════════════════════════
+  // 🛡️  PANEL ADMIN (Sécurisé)
+  // ════════════════════════════════════════════════════════════════════════
+  app.get('/api/admin/stats',     authenticate, requireAdmin,      async (_, res) => {
+    const [u,a,b,p,r,t,w] = await Promise.all([
+      db.one(`SELECT COUNT(*) as c FROM users`),
+      db.one(`SELECT COUNT(*) as c FROM users WHERE status='active'`),
+      db.one(`SELECT COUNT(*) as c FROM users WHERE status='banned'`),
+      db.one(`SELECT COUNT(*) as c FROM posts`),
+      db.one(`SELECT COUNT(*) as c FROM reports WHERE status='pending'`),
+      db.one(`SELECT COUNT(*) as c FROM users WHERE "createdAt"::date=CURRENT_DATE`),
+      db.one(`SELECT COUNT(*) as c FROM users WHERE "createdAt">=NOW()-INTERVAL '7 days'`),
+    ]);
+    res.json({ totalUsers:u.c, activeUsers:a.c, bannedUsers:b.c, totalPosts:p.c, pendingReports:r.c, newUsersToday:t.c, newUsersWeek:w.c });
+  });
+  app.get('/api/admin/users',     authenticate, requireAdmin,      async (req: any, res) => { const {search,status,role}=req.query as any; let q=`SELECT id,email,name,country,role,status,badge,"bannedReason","createdAt" FROM users WHERE 1=1`; const p:any[]=[]; let i=1; if(search){q+=` AND(name ILIKE $${i} OR email ILIKE $${i})`;p.push(`%${search}%`);i++;} if(status){q+=` AND status=$${i++}`;p.push(status);} if(role){q+=` AND role=$${i++}`;p.push(role);} q+=` ORDER BY "createdAt" DESC`; res.json(await db.all(q,p)); });
+  app.put('/api/admin/users/:id/role',  authenticate, requireSuperAdmin, async (req: any, res) => { const {role}=req.body; if(!['user','moderator','admin'].includes(role)) return res.status(400).json({error:'Rôle invalide'}); await pool.query(`UPDATE users SET role=$1 WHERE id=$2`,[role,req.params.id]); await pool.query(`INSERT INTO admin_logs("adminId",action,"targetId",details) VALUES($1,'change_role',$2,$3)`,[req.userId,req.params.id,`→${role}`]); await logAction('ADMIN','change_role',req.userId,req.ip,`User ${req.params.id}→${role}`); res.json({success:true}); });
+  app.put('/api/admin/users/:id/ban',   authenticate, requireAdmin,      async (req: any, res) => { if(Number(req.params.id)===req.userId) return res.status(400).json({error:'Impossible de se bannir'}); const {reason}=req.body; await pool.query(`UPDATE users SET status='banned',"bannedReason"=$1 WHERE id=$2`,[reason||'Violation des règles',req.params.id]); await pool.query(`INSERT INTO admin_logs("adminId",action,"targetId",details) VALUES($1,'ban_user',$2,$3)`,[req.userId,req.params.id,reason]); await logAction('ADMIN','ban_user',req.userId,req.ip,`User ${req.params.id}: ${reason}`); res.json({success:true}); });
+  app.put('/api/admin/users/:id/unban', authenticate, requireAdmin,      async (req: any, res) => { await pool.query(`UPDATE users SET status='active',"bannedReason"=NULL WHERE id=$1`,[req.params.id]); await pool.query(`INSERT INTO admin_logs("adminId",action,"targetId") VALUES($1,'unban_user',$2)`,[req.userId,req.params.id]); res.json({success:true}); });
+  app.delete('/api/admin/users/:id',    authenticate, requireSuperAdmin, async (req: any, res) => { if(Number(req.params.id)===req.userId) return res.status(400).json({error:'Impossible'}); await pool.query(`DELETE FROM users WHERE id=$1`,[req.params.id]); await pool.query(`INSERT INTO admin_logs("adminId",action,"targetId") VALUES($1,'delete_user',$2)`,[req.userId,req.params.id]); await logAction('ADMIN','delete_user',req.userId,req.ip,`User ${req.params.id}`); res.json({success:true}); });
+  app.get('/api/admin/reports',         authenticate, requireAdmin,      async (_, res) => res.json(await db.all(`SELECT r.*,u.name as "reporterName",u.email as "reporterEmail" FROM reports r JOIN users u ON r."reporterId"=u.id ORDER BY r."createdAt" DESC`,[])));
+  app.put('/api/admin/reports/:id',     authenticate, requireAdmin,      async (req: any, res) => { await pool.query(`UPDATE reports SET status=$1 WHERE id=$2`,[req.body.status,req.params.id]); res.json({success:true}); });
+  app.delete('/api/admin/posts/:id',    authenticate, requireAdmin,      async (req: any, res) => { await pool.query(`DELETE FROM posts WHERE id=$1`,[req.params.id]); await pool.query(`INSERT INTO admin_logs("adminId",action,"targetId") VALUES($1,'delete_post',$2)`,[req.userId,req.params.id]); res.json({success:true}); });
+  app.get('/api/admin/logs',            authenticate, requireAdmin,      async (_, res) => res.json(await db.all(`SELECT al.*,u.name as "adminName" FROM admin_logs al JOIN users u ON al."adminId"=u.id ORDER BY al."createdAt" DESC LIMIT 200`,[])));
+  app.get('/api/admin/db-logs',         authenticate, requireSuperAdmin, async (_, res) => res.json(await db.all(`SELECT * FROM db_logs ORDER BY "createdAt" DESC LIMIT 500`,[])));
+  app.get('/api/admin/errors',          authenticate, requireSuperAdmin, (_, res) => res.json(errorTracker.errors));
+  app.post('/api/admin/backup',         authenticate, requireSuperAdmin, async (req: any, res) => {
+    try {
+      const [users, posts, companies] = await Promise.all([
+        db.all(`SELECT id,email,name,country,role,status,"createdAt" FROM users`, []),
+        db.all(`SELECT id,"authorId",content,"createdAt" FROM posts ORDER BY "createdAt" DESC LIMIT 5000`, []),
+        db.all(`SELECT * FROM companies`, []),
+      ]);
+      await logAction('ADMIN', 'backup_triggered', req.userId, req.ip, `${users.length} users`);
+      res.json({ success: true, timestamp: new Date(), counts: { users: users.length, posts: posts.length, companies: companies.length }, data: { users, posts, companies } });
+    } catch { res.status(500).json({ error: 'Backup échoué' }); }
+  });
+  app.get('/api/admin/health-full', authenticate, requireSuperAdmin, async (_, res) => {
+    const dbOk = await pool.query('SELECT 1').then(() => true).catch(() => false);
+    const users = await db.one(`SELECT COUNT(*) as c FROM users`);
+    res.json({
+      status: dbOk ? 'healthy' : 'degraded',
+      db: dbOk ? 'connected' : 'error',
+      uptime: Math.floor(process.uptime()) + 's',
+      memory: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + 'MB',
+      users: users.c,
+      recentErrors: errorTracker.errors.slice(0, 5),
+      env: { cloudinary: !!process.env.CLOUDINARY_URL, smtp: !!process.env.SMTP_USER, jwt: !!process.env.JWT_SECRET },
+    });
   });
 
-  // DELETE /api/admin/posts/:id — supprimer un post (modération)
-  app.delete('/api/admin/posts/:id', authenticate, requireAdmin, (req: any, res) => {
-    db.prepare('DELETE FROM posts WHERE id = ?').run(req.params.id);
-    db.prepare('INSERT INTO admin_logs (adminId, action, targetId, details) VALUES (?, ?, ?, ?)').run(req.userId, 'delete_post', req.params.id, null);
-    res.json({ success: true });
+  // ════════════════════════════════════════════════════════════════════════
+  // 🔌 SOCKET.IO (Temps réel)
+  // ════════════════════════════════════════════════════════════════════════
+  io.use((socket, next) => {
+    try {
+      const token = socket.handshake.auth.token;
+      if (!token) return next(new Error('Auth error'));
+      jwt.verify(token, JWT_SECRET, (err: any, decoded: any) => {
+        if (err || !decoded?.userId) return next(new Error('Auth error'));
+        (socket as any).userId = decoded.userId;
+        next();
+      });
+    } catch { next(new Error('Auth error')); }
   });
 
-  // GET /api/admin/logs — historique des actions admin
-  app.get('/api/admin/logs', authenticate, requireAdmin, (req: any, res) => {
-    const logs = db.prepare(`
-      SELECT al.*, u.name as adminName FROM admin_logs al
-      JOIN users u ON al.adminId = u.id
-      ORDER BY al.createdAt DESC LIMIT 100
-    `).all();
-    res.json(logs);
+  io.on('connection', (socket: any) => {
+    console.log(`🔌 User ${socket.userId} connecté`);
+    socket.join(`user_${socket.userId}`);
+    socket.on('disconnect',       () => console.log(`❌ User ${socket.userId} déconnecté`));
+    socket.on('join_room',        (roomId: any) => socket.join(`room_${roomId}`));
+    socket.on('pin_message',      (d: any) => io.emit('message_pinned', d));
+    socket.on('unpin_message',    (d: any) => io.emit('message_unpinned', d));
+    socket.on('message_reaction', (d: any) => io.emit('message_reaction_updated', d));
+    socket.on('message_edit',     (d: any) => io.emit('message_updated', d));
+    socket.on('message_delete',   (d: any) => io.emit('message_deleted', d));
   });
 
-  // POST /api/reports — signaler un contenu (utilisateur normal)
-  app.post('/api/reports', authenticate, (req: any, res) => {
-    const { targetType, targetId, reason } = req.body;
-    if (!targetType || !targetId || !reason) return res.status(400).json({ error: 'Données manquantes' });
-    db.prepare('INSERT INTO reports (reporterId, targetType, targetId, reason) VALUES (?, ?, ?, ?)').run(req.userId, targetType, targetId, reason);
-    res.json({ success: true });
+  // ════════════════════════════════════════════════════════════════════════
+  // 📁 FICHIERS STATIQUES (Frontend React)
+  // ════════════════════════════════════════════════════════════════════════
+  const distPath = path.join(__dirname, 'dist');
+  app.use(express.static(distPath));
+  app.get('*', (req, res) => {
+    if (req.path.startsWith('/api/')) return res.status(404).json({ error: 'Route non trouvée' });
+    res.sendFile(path.join(distPath, 'index.html'));
   });
 
-  // Catch-all for API 404s
-  app.all('/api/*', (req, res) => {
-    res.status(404).json({ error: 'API route not found' });
+  // ════════════════════════════════════════════════════════════════════════
+  // 💾 BACKUP AUTOMATIQUE (toutes les 24h)
+  // ════════════════════════════════════════════════════════════════════════
+  const autoBackup = async () => {
+    try {
+      const u = await db.one(`SELECT COUNT(*) as c FROM users`);
+      await logAction('INFO', 'auto_backup_check', undefined, undefined, `${u.c} users en base`);
+      console.log(`💾 Auto-backup: ${u.c} utilisateurs en base`);
+    } catch (e: any) { errorTracker.capture(e, 'auto_backup'); }
+  };
+  setInterval(autoBackup, 24 * 60 * 60 * 1000);
+
+  // ════════════════════════════════════════════════════════════════════════
+  // 🚀 DÉMARRAGE
+  // ════════════════════════════════════════════════════════════════════════
+  httpServer.listen(PORT, '0.0.0.0', () => {
+    console.log('\n════════════════════════════════════════');
+    console.log(`✅  FreeBara Server lancé sur le port ${PORT}`);
+    console.log(`🗄️   Base de données : PostgreSQL`);
+    console.log(`🔐  JWT Secret      : ${JWT_SECRET.substring(0, 12)}...`);
+    console.log(`📧  SMTP Email      : ${process.env.SMTP_USER ?? '⚠️  Non configuré'}`);
+    console.log(`🖼️   Cloudinary      : ${process.env.CLOUDINARY_URL ? '✅ Configuré' : '⚠️  Non configuré'}`);
+    console.log(`🛡️   Admin panel     : /api/admin/*`);
+    console.log(`📊  Monitoring      : /api/admin/health-full`);
+    console.log(`💾  Backup          : POST /api/admin/backup`);
+    console.log('════════════════════════════════════════\n');
   });
 
-  // FRONTEND (PRODUCTION CLEAN)
-
-
-const buildPath = path.join(process.cwd(), 'dist');
-
-app.use(express.static(buildPath));
-
-app.get('*', (req, res) => {
-  if (req.path.startsWith('/api/')) {
-    return res.status(404).json({ message: 'API route not found' });
-  }
-
-  res.sendFile(path.join(buildPath, 'index.html'));
-});
-
-
-  const PORT = process.env.PORT || 3000;
-  httpServer.listen(PORT, () => {
-    console.log(`🚀 Server running on port ${PORT}`);
+  // Arrêt propre
+  process.on('SIGTERM', async () => {
+    console.log('🛑 SIGTERM reçu — fermeture propre...');
+    await pool.end();
+    process.exit(0);
   });
-
-  } catch (error) {
-    console.error('Failed to start server:', error);
-    process.exit(1);
-  }
 }
 
-startServer();
+startServer().catch((e) => {
+  console.error('❌ Erreur critique au démarrage:', e);
+  process.exit(1);
+});

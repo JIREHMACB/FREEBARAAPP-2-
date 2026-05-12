@@ -17,14 +17,8 @@ interface AdminPost {
 status: string;
 }
 interface Stats {
-  totalUsers: number;
-  activeUsers: number;
-  bannedUsers: number;
-  totalPosts: number;
-  reportedPosts: number;
-  totalCompanies: number;
-  newUsersToday: number;
-  newUsersWeek: number;
+  totalUsers: number; activeUsers: number; bannedUsers: number; totalPosts: number;reportedPosts: number;
+  totalCompanies: number;newUsersToday: number;newUsersWeek: number;
 }
 
 // ── API admin ────────────────────────────────────────────────
