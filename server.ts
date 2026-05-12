@@ -13,7 +13,7 @@ import { fileURLToPath } from 'url';
 import dotenv            from 'dotenv';
 import * as path         from 'path';
 import jwt               from 'jsonwebtoken';
-import nodemailer        from 'nodemailer';
+import { Resend } from "resend";
 import pkg               from 'pg';
 const { Pool } = pkg;
 
@@ -92,33 +92,45 @@ const uploadToCloudinary = async (base64Data: string, folder = 'freebara'): Prom
 };
 
 // ─── EMAIL (OTP) ──────────────────────────────────────────────────────────────
-const isValidEmail = (e: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
 
-const sendOTPEmail = async (email: string, code: string) => {
-  if (!process.env.SMTP_USER || !process.env.SMTP_PASS) {
+
+const resend = new Resend(process.env.RESEND_API_KEY);
+
+const isValidEmail = (e: string) =>
+  /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
+
+export const sendOTPEmail = async (email: string, code: string) => {
+  if (!process.env.RESEND_API_KEY) {
     console.log(`\n📧 [DEV MODE] OTP pour ${email} : ${code}\n`);
     return;
   }
-  const transporter = nodemailer.createTransport({
-    host: process.env.SMTP_HOST ?? 'smtp.gmail.com',
-    port: parseInt(process.env.SMTP_PORT ?? '587'),
-    secure: false,
-    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
-  });
-  await transporter.sendMail({
-    from: `"FreeBara" <${process.env.SMTP_USER}>`,
-    to: email,
-    subject: 'Votre code de connexion FreeBara',
-    html: `
-      <div style="font-family:sans-serif;max-width:480px;margin:auto;padding:32px;background:#f8fafc;border-radius:16px;">
-        <img src="https://www.freebara.com/logo__2_.png" alt="FreeBara" style="height:40px;margin-bottom:24px;" />
-        <h2 style="color:#155be3;margin:0 0 8px;">Code de vérification</h2>
-        <p style="color:#64748b;margin:0 0 24px;">Utilisez ce code pour accéder à FreeBara :</p>
-        <div style="background:#fff;border:2px solid #e2e8f0;border-radius:12px;padding:24px;text-align:center;font-size:36px;font-weight:900;letter-spacing:10px;color:#0f172a;">${code}</div>
-        <p style="color:#94a3b8;font-size:12px;margin-top:20px;">⏱ Expire dans 10 minutes. Ne partagez jamais ce code.</p>
-      </div>
-    `,
-  });
+
+  try {
+    await resend.emails.send({
+      from: "FreeBara <onboarding@resend.dev>",
+      to: email,
+      subject: "Votre code de connexion FreeBara",
+      html: `
+        <div style="font-family:sans-serif;max-width:480px;margin:auto;padding:32px;background:#f8fafc;border-radius:16px;">
+          <img src="https://www.freebara.com/logo__2_.png" alt="FreeBara" style="height:40px;margin-bottom:24px;" />
+          <h2 style="color:#155be3;margin:0 0 8px;">Code de vérification</h2>
+          <p style="color:#64748b;margin:0 0 24px;">Utilisez ce code pour accéder à FreeBara :</p>
+
+          <div style="background:#fff;border:2px solid #e2e8f0;border-radius:12px;padding:24px;text-align:center;font-size:36px;font-weight:900;letter-spacing:10px;color:#0f172a;">
+            ${code}
+          </div>
+
+          <p style="color:#94a3b8;font-size:12px;margin-top:20px;">
+            ⏱ Expire dans 10 minutes. Ne partagez jamais ce code.
+          </p>
+        </div>
+      `,
+    });
+
+    console.log("📧 Email OTP envoyé avec succès à", email);
+  } catch (error) {
+    console.error("❌ Erreur Resend:", error);
+  }
 };
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1301,7 +1313,8 @@ app.get("*", (req, res) => {
     console.log(`✅  FreeBara Server lancé sur le port ${PORT}`);
     console.log(`🗄️   Base de données : PostgreSQL`);
     console.log(`🔐  JWT Secret      : ${JWT_SECRET.substring(0, 12)}...`);
-    console.log(`📧  SMTP Email      : ${process.env.SMTP_USER ?? '⚠️  Non configuré'}`);
+    console.log(`📧  Email Service   : Resend`);
+    console.log(`🔑  Resend API Key  : ${process.env.RESEND_API_KEY ? '✔ Configuré' : '⚠️ Non configuré'}`); 
     console.log(`🖼️   Cloudinary      : ${process.env.CLOUDINARY_URL ? '✅ Configuré' : '⚠️  Non configuré'}`);
     console.log(`🛡️   Admin panel     : /api/admin/*`);
     console.log(`📊  Monitoring      : /api/admin/health-full`);
