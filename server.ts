@@ -702,6 +702,15 @@ async function startServer() {
     res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
     next();
   });
+  import fs from "fs";
+
+// 🟢 SERVIR LE FRONTEND (Vite build)
+app.use(express.static(__dirname));
+
+// 🟢 FALLBACK REACT / VITE ROUTER
+app.get("*", (req, res) => {
+  res.sendFile(path.join(__dirname, "index.html"));
+});
 
   // Rate limiting (anti-abus)
   const rlMap = new Map<string, { count: number; reset: number }>();
