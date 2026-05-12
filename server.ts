@@ -93,17 +93,26 @@ const uploadToCloudinary = async (base64Data: string, folder = 'freebara'): Prom
 
 // ─── EMAIL (OTP) ──────────────────────────────────────────────────────────────
 
+const apiKey = process.env.RESEND_API_KEY;
 
-const resend = new Resend(process.env.RESEND_API_KEY);
+// ⚠️ sécurité : éviter crash serveur
+if (!apiKey) {
+  console.warn("⚠️ RESEND_API_KEY manquant - emails désactivés");
+}
+
+const resend = apiKey ? new Resend(apiKey) : null;
 
 const isValidEmail = (e: string) =>
   /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
 
 export const sendOTPEmail = async (email: string, code: string) => {
-  if (!process.env.RESEND_API_KEY) {
+  // mode dev si pas de config
+  if (!resend) {
     console.log(`\n📧 [DEV MODE] OTP pour ${email} : ${code}\n`);
     return;
   }
+
+  if (!apiKey) return;
 
   try {
     await resend.emails.send({
