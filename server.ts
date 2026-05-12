@@ -702,8 +702,7 @@ async function startServer() {
     res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
     next();
   });
-  import fs from "fs";
-
+ 
 // 🟢 SERVIR LE FRONTEND (Vite build)
 app.use(express.static(__dirname));
 
