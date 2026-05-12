@@ -15,6 +15,25 @@ import * as path         from 'path';
 import jwt               from 'jsonwebtoken';
 import { Resend } from "resend";
 import pkg               from 'pg';
+
+const app = express();
+
+// ─── CORS (IMPORTANT POUR FRONTEND) ─────────────────────────────
+app.use(cors({
+  origin: [
+    "https://www.freebara.com",
+    "https://freebara.com",
+    "http://localhost:5173"
+  ],
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"]
+}));
+
+app.options("*", cors());
+
+// ─── JSON BODY PARSER ────────────────────────────────────────────
+app.use(express.json());
 const { Pool } = pkg;
 
 dotenv.config();
@@ -93,6 +112,7 @@ const uploadToCloudinary = async (base64Data: string, folder = 'freebara'): Prom
 
 // ─── EMAIL (OTP) ──────────────────────────────────────────────────────────────
 
+
 const apiKey = process.env.RESEND_API_KEY;
 
 // ⚠️ sécurité : éviter crash serveur
@@ -106,24 +126,32 @@ const isValidEmail = (e: string) =>
   /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
 
 export const sendOTPEmail = async (email: string, code: string) => {
+  // sécurité email
+  if (!isValidEmail(email)) {
+    console.error("❌ Email invalide :", email);
+    return;
+  }
+
   // mode dev si pas de config
   if (!resend) {
     console.log(`\n📧 [DEV MODE] OTP pour ${email} : ${code}\n`);
     return;
   }
 
-  if (!apiKey) return;
-
   try {
-    await resend.emails.send({
+    const result = await resend.emails.send({
       from: "FreeBara <onboarding@resend.dev>",
       to: email,
       subject: "Votre code de connexion FreeBara",
       html: `
         <div style="font-family:sans-serif;max-width:480px;margin:auto;padding:32px;background:#f8fafc;border-radius:16px;">
           <img src="https://www.freebara.com/logo__2_.png" alt="FreeBara" style="height:40px;margin-bottom:24px;" />
+          
           <h2 style="color:#155be3;margin:0 0 8px;">Code de vérification</h2>
-          <p style="color:#64748b;margin:0 0 24px;">Utilisez ce code pour accéder à FreeBara :</p>
+          
+          <p style="color:#64748b;margin:0 0 24px;">
+            Utilisez ce code pour accéder à FreeBara :
+          </p>
 
           <div style="background:#fff;border:2px solid #e2e8f0;border-radius:12px;padding:24px;text-align:center;font-size:36px;font-weight:900;letter-spacing:10px;color:#0f172a;">
             ${code}
@@ -137,11 +165,11 @@ export const sendOTPEmail = async (email: string, code: string) => {
     });
 
     console.log("📧 Email OTP envoyé avec succès à", email);
+    console.log("📨 Resend response:", result);
   } catch (error) {
     console.error("❌ Erreur Resend:", error);
   }
 };
-
 // ════════════════════════════════════════════════════════════════════════════
 // 🗄️  INITIALISATION BASE DE DONNÉES
 // ════════════════════════════════════════════════════════════════════════════
