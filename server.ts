@@ -712,6 +712,17 @@ async function initDB() {
       "createdAt" TIMESTAMP DEFAULT NOW()
     );
   `);
+  await pool.query(`
+  CREATE TABLE IF NOT EXISTS services (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT,
+    price REAL DEFAULT 0,
+    category TEXT,
+    "companyId" INTEGER,
+    "createdAt" TIMESTAMP DEFAULT NOW()
+  );
+`);
 
   console.log('✅ Toutes les tables PostgreSQL sont prêtes');
 }
