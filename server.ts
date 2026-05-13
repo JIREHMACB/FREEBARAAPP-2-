@@ -756,8 +756,14 @@ async function startServer() {
 app.use(express.static(__dirname));
 
 // 🟢 FALLBACK REACT / VITE ROUTER
-app.get("*", (req, res) => {
-  res.sendFile(path.join(__dirname, "index.html"));
+app.use(express.static(path.join(__dirname, "dist")));
+
+app.get("*", (req, res, next) => {
+  if (req.path.startsWith("/api")) {
+    return next();
+  }
+
+  res.sendFile(path.join(__dirname, "dist", "index.html"));
 });
 
   // Rate limiting (anti-abus)
