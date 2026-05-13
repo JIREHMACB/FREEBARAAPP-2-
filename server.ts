@@ -140,7 +140,7 @@ export const sendOTPEmail = async (email: string, code: string) => {
 
   try {
     const result = await resend.emails.send({
-      from: "FreeBara <onboarding@resend.dev>",
+     from: "onboarding@resend.dev",
       to: email,
       subject: "Votre code de connexion FreeBara",
       html: `
@@ -1323,12 +1323,23 @@ app.get("*", (req, res) => {
   // ════════════════════════════════════════════════════════════════════════
   // 📁 FICHIERS STATIQUES (Frontend React)
   // ════════════════════════════════════════════════════════════════════════
+
   const distPath = path.join(__dirname, 'dist');
-  app.use(express.static(distPath));
-  app.get('*', (req, res) => {
-    if (req.path.startsWith('/api/')) return res.status(404).json({ error: 'Route non trouvée' });
-    res.sendFile(path.join(distPath, 'index.html'));
-  });
+
+app.use(express.static(distPath));
+
+// React catch-all
+app.get('*', (req, res) => {
+
+  // IMPORTANT : ne jamais renvoyer index.html pour API
+  if (req.path.startsWith('/api/')) {
+    return res.status(404).json({
+      error: 'API route not found'
+    });
+  }
+
+  res.sendFile(path.join(distPath, 'index.html'));
+});
 
   // ════════════════════════════════════════════════════════════════════════
   // 💾 BACKUP AUTOMATIQUE (toutes les 24h)
