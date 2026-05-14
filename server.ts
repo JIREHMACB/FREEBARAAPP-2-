@@ -722,7 +722,7 @@ async function initDB() {
     "companyId" INTEGER,
     "createdAt" TIMESTAMP DEFAULT NOW()
   );
-`);
+`); 
 
   console.log('✅ Toutes les tables PostgreSQL sont prêtes');
 }
@@ -1341,20 +1341,20 @@ app.get("*", (req, res, next) => {
   // 📁 FICHIERS STATIQUES (Frontend React)
   // ════════════════════════════════════════════════════════════════════════
 
-  const distPath = path.join(__dirname, 'dist');
+ const distPath = path.join(__dirname, 'dist');
 
+// ✅ Servir les fichiers frontend Vite
 app.use(express.static(distPath));
 
-// React catch-all
-app.get('*', (req, res) => {
+// ✅ React/Vite fallback
+app.get('*', (req, res, next) => {
 
-  // IMPORTANT : ne jamais renvoyer index.html pour API
-  if (req.path.startsWith('/api/')) {
-    return res.status(404).json({
-      error: 'API route not found'
-    });
+  // ❌ Ne jamais intercepter les routes API
+  if (req.path.startsWith('/api')) {
+    return next();
   }
 
+  // ✅ Retourner index.html pour React Router
   res.sendFile(path.join(distPath, 'index.html'));
 });
 
