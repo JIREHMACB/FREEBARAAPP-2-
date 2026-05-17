@@ -1,4 +1,4 @@
-import useUser from '../App';
+import { useAuth } from '../hooks/useAuth';  // ✅ correct
 import React, { useState, useEffect, useRef, Suspense, lazy } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { api } from '../lib/api';

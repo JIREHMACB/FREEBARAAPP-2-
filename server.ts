@@ -16,38 +16,35 @@ import jwt               from 'jsonwebtoken';
 import { Resend } from "resend";
 import pkg               from 'pg';
 
-const app = express();
-
-// ─── CORS (IMPORTANT POUR FRONTEND) ─────────────────────────────
-app.use(cors({
-  origin: [
-    "https://www.freebara.com",
-    "https://freebara.com",
-    "http://localhost:5173"
-  ],
-  credentials: true,
-  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"]
-}));
-
-app.options("*", cors());
-
-// ─── JSON BODY PARSER ────────────────────────────────────────────
-app.use(express.json());
+const IS_DEV     = process.env.NODE_ENV !== 'production';
+// ─── JSON BODY PARSER (utilisé uniquement dans startServer) ──────
 const { Pool } = pkg;
 
 dotenv.config();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // ─── CONFIGURATION ───────────────────────────────────────────────────────────
-if (!process.env.JWT_SECRET)    console.warn('⚠️  JWT_SECRET manquant → ajouter dans Render > Environment');
+if (!process.env.JWT_SECRET) {
+  console.error('❌ JWT_SECRET manquant → le serveur ne peut pas démarrer en production');
+  if (process.env.NODE_ENV === 'production') process.exit(1);
+  console.warn('⚠️  Mode DEV uniquement — JWT_SECRET temporaire utilisé');
+}
 if (!process.env.DATABASE_URL)  { console.error('❌ DATABASE_URL manquant!'); process.exit(1); }
 if (!process.env.SMTP_USER)     console.warn('⚠️  SMTP non configuré → codes OTP affichés en console');
 if (!process.env.CLOUDINARY_URL) console.warn('⚠️  CLOUDINARY_URL manquant → placeholders utilisés');
 
-const JWT_SECRET = process.env.JWT_SECRET || 'freebara-change-this-in-render-env';
+const ALLOWED_ORIGINS = [
+  'https://www.freebara.com',
+  'https://freebara.com',
+  'https://freebaraapp-2.onrender.com',
+  ...(IS_DEV ? ['http://localhost:5173', 'http://localhost:3000'] : []),
+];
+
+const JWT_SECRET = process.env.JWT_SECRET || 'dev-only-secret-change-in-prod';
+// Note: en prod, le process.exit(1) ci-dessus empêche d'atteindre cette ligne sans JWT_SECRET
+
 const PORT       = parseInt(process.env.PORT || '3000');
-const IS_DEV     = process.env.NODE_ENV !== 'production';
+
 
 // ─── POSTGRESQL ───────────────────────────────────────────────────────────────
 const pool = new Pool({
@@ -197,11 +194,11 @@ async function initDB() {
       badge                   TEXT DEFAULT 'Invité',
       "referralCode"          TEXT UNIQUE,
       "referredBy"            INTEGER,
-      balance                 REAL DEFAULT 0,
-      role                    TEXT DEFAULT 'user',
-      status                  TEXT DEFAULT 'active',
+      balance                 NUMERIC(10,2) DEFAULT 0,
+      role                    TEXT DEFAULT 'user' CHECK (role IN ('user','moderator','admin')),
+      status                  TEXT DEFAULT 'active' CHECK (status IN ('active','banned','inactive')),
       "bannedReason"          TEXT,
-      "notificationPreferences" TEXT,
+      "notificationPreferences" JSONB DEFAULT '{}',
       visibility              TEXT DEFAULT 'public',
       country                 TEXT,
       "createdAt"             TIMESTAMP DEFAULT NOW()
@@ -254,7 +251,7 @@ async function initDB() {
       "cellId"    INTEGER,
       content     TEXT NOT NULL,
       category    TEXT DEFAULT 'Tous',
-      "mediaUrls" TEXT,
+      "mediaUrls" JSONB,
       views       INTEGER DEFAULT 0,
       "createdAt" TIMESTAMP DEFAULT NOW()
     );
@@ -275,10 +272,7 @@ async function initDB() {
     CREATE TABLE IF NOT EXISTS post_boosts (
       "postId"    INTEGER PRIMARY KEY,
       "userId"    INTEGER NOT NULL,
-      amount      REAL NOT NULL,
-      "createdAt" TIMESTAMP DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS stories (
+      amount      NUMERIC(10,2) NOT NULL,
       id          SERIAL PRIMARY KEY,
       "userId"    INTEGER NOT NULL,
       "mediaUrl"  TEXT NOT NULL,
@@ -318,7 +312,7 @@ async function initDB() {
       category        TEXT NOT NULL,
       "communityId"   INTEGER,
       "creatorId"     INTEGER NOT NULL,
-      price           REAL DEFAULT 0,
+      price           NUMERIC(10,2) DEFAULT 0,
       "visualUrl"     TEXT,
       "shares_count"  INTEGER DEFAULT 0,
       "createdAt"     TIMESTAMP DEFAULT NOW()
@@ -364,7 +358,7 @@ async function initDB() {
       linkedin     TEXT,
       "logoUrl"    TEXT,
       "coverUrl"   TEXT,
-      "isShop"     INTEGER DEFAULT 0,
+      "isShop"     BOOLEAN DEFAULT FALSE,
       specialty    TEXT,
       categories   TEXT,
       country      TEXT,
@@ -379,7 +373,7 @@ async function initDB() {
       "companyId"    INTEGER NOT NULL,
       name           TEXT NOT NULL,
       description    TEXT,
-      price          REAL,
+      price          NUMERIC(10,2),
       "imageUrl"     TEXT,
       category       TEXT,
       tag            TEXT,
@@ -391,7 +385,7 @@ async function initDB() {
       "productId"   INTEGER PRIMARY KEY,
       quantity      INTEGER DEFAULT 0,
       "minQuantity" INTEGER DEFAULT 5,
-      "costPrice"   REAL DEFAULT 0,
+      "costPrice"   NUMERIC(10,2) DEFAULT 0,
       "lastUpdated" TIMESTAMP DEFAULT NOW()
     );
     CREATE TABLE IF NOT EXISTS stock_movements (
@@ -408,7 +402,7 @@ async function initDB() {
       "customerId"       INTEGER NOT NULL,
       "productId"        INTEGER NOT NULL,
       quantity           INTEGER DEFAULT 1,
-      "totalPrice"       REAL NOT NULL,
+      "totalPrice"       NUMERIC(10,2) NOT NULL,
       status             TEXT DEFAULT 'pending',
       "customerName"     TEXT,
       "customerWhatsapp" TEXT,
@@ -428,12 +422,12 @@ async function initDB() {
     );
     CREATE TABLE IF NOT EXISTS transactions (
       id          SERIAL PRIMARY KEY,
-      "userId"    INTEGER NOT NULL,
-      date        TEXT NOT NULL,
+      "userId"    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      date        DATE NOT NULL,
       description TEXT NOT NULL,
       category    TEXT NOT NULL,
-      amount      REAL NOT NULL,
-      type        TEXT NOT NULL,
+      amount      NUMERIC(10,2) NOT NULL,
+      type        TEXT NOT NULL CHECK (type IN ('income','expense')),
       "createdAt" TIMESTAMP DEFAULT NOW()
     );
     CREATE TABLE IF NOT EXISTS funding_requests (
@@ -442,9 +436,9 @@ async function initDB() {
       "companyId"    INTEGER NOT NULL,
       "institutionId" INTEGER,
       "fundingType"  TEXT NOT NULL,
-      amount         REAL,
+      amount         NUMERIC(10,2),
       reason         TEXT,
-      "strategicData" TEXT,
+      "strategicData" JSONB,
       status         TEXT DEFAULT 'En attente',
       "createdAt"    TIMESTAMP DEFAULT NOW()
     );
@@ -472,7 +466,7 @@ async function initDB() {
       goal        TEXT NOT NULL,
       content     TEXT NOT NULL,
       targeting   TEXT NOT NULL,
-      budget      REAL NOT NULL,
+      budget      NUMERIC(10,2) NOT NULL,
       duration    INTEGER NOT NULL,
       status      TEXT DEFAULT 'pending',
       "createdAt" TIMESTAMP DEFAULT NOW()
@@ -482,7 +476,7 @@ async function initDB() {
       "userId"     INTEGER NOT NULL,
       "targetType" TEXT NOT NULL,
       "targetId"   INTEGER NOT NULL,
-      rating       INTEGER NOT NULL,
+      rating       INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
       comment      TEXT,
       "createdAt"  TIMESTAMP DEFAULT NOW()
     );
@@ -499,7 +493,7 @@ async function initDB() {
       "fileUrl"    TEXT,
       "fileType"   TEXT,
       "fileName"   TEXT,
-      read         INTEGER DEFAULT 0,
+      read         BOOLEAN DEFAULT FALSE,
       "isPinned"   BOOLEAN DEFAULT FALSE,
       "replyToId"  INTEGER,
       "createdAt"  TIMESTAMP DEFAULT NOW()
@@ -617,7 +611,7 @@ async function initDB() {
       status        TEXT DEFAULT 'non_commence',
       position      REAL DEFAULT 0,
       notes         TEXT,
-      "stickyNotes" TEXT,
+      "stickyNotes" JSONB,
       "updatedAt"   TIMESTAMP DEFAULT NOW(),
       PRIMARY KEY ("pannelId","userId","courseId")
     );
@@ -657,16 +651,16 @@ async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS tasks (
       id               SERIAL PRIMARY KEY,
-      "userId"         INTEGER NOT NULL,
+      "userId"         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       title            TEXT NOT NULL,
       description      TEXT,
-      "dueDate"        TEXT,
+      "dueDate"        DATE,
       "reminderTime"   TEXT,
-      status           TEXT DEFAULT 'todo',
-      priority         TEXT DEFAULT 'medium',
+      status           TEXT DEFAULT 'todo' CHECK (status IN ('todo','in_progress','done')),
+      priority         TEXT DEFAULT 'medium' CHECK (priority IN ('low','medium','high')),
       category         TEXT DEFAULT 'Général',
-      "assignedUserId" INTEGER,
-      "isArchived"     INTEGER DEFAULT 0,
+      "assignedUserId" INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      "isArchived"     BOOLEAN DEFAULT FALSE,
       "createdAt"      TIMESTAMP DEFAULT NOW()
     );
     CREATE TABLE IF NOT EXISTS task_subtasks (
@@ -712,17 +706,67 @@ async function initDB() {
       "createdAt" TIMESTAMP DEFAULT NOW()
     );
   `);
+  // ── Table services (complète) ──
   await pool.query(`
-  CREATE TABLE IF NOT EXISTS services (
-    id SERIAL PRIMARY KEY,
-    name TEXT NOT NULL,
-    description TEXT,
-    price REAL DEFAULT 0,
-    category TEXT,
-    "companyId" INTEGER,
-    "createdAt" TIMESTAMP DEFAULT NOW()
-  );
-`); 
+    CREATE TABLE IF NOT EXISTS services (
+      id               SERIAL PRIMARY KEY,
+      "providerId"     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      title            TEXT NOT NULL,
+      description      TEXT,
+      availability     TEXT,
+      budget           NUMERIC(10,2) DEFAULT 0,
+      type             TEXT DEFAULT 'projet',
+      "companyName"    TEXT,
+      location         TEXT,
+      "contractType"   TEXT,
+      "fileUrl"        TEXT,
+      category         TEXT,
+      "createdAt"      TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS service_applications (
+      id               SERIAL PRIMARY KEY,
+      "serviceId"      INTEGER NOT NULL REFERENCES services(id) ON DELETE CASCADE,
+      "userId"         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      message          TEXT,
+      "contactDetails" JSONB,
+      status           TEXT DEFAULT 'pending',
+      "createdAt"      TIMESTAMP DEFAULT NOW(),
+      UNIQUE("serviceId","userId")
+    );
+  `);
+
+  // ── Index de performance ──
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_posts_author        ON posts("authorId");
+    CREATE INDEX IF NOT EXISTS idx_posts_created       ON posts("createdAt" DESC);
+    CREATE INDEX IF NOT EXISTS idx_posts_category      ON posts(category);
+    CREATE INDEX IF NOT EXISTS idx_messages_sender     ON messages("senderId");
+    CREATE INDEX IF NOT EXISTS idx_messages_receiver   ON messages("receiverId");
+    CREATE INDEX IF NOT EXISTS idx_messages_room       ON messages("roomId");
+    CREATE INDEX IF NOT EXISTS idx_notifications_user  ON notifications("userId");
+    CREATE INDEX IF NOT EXISTS idx_notifications_read  ON notifications("userId", read) WHERE read = FALSE;
+    CREATE INDEX IF NOT EXISTS idx_follows_follower    ON follows("followerId");
+    CREATE INDEX IF NOT EXISTS idx_follows_following   ON follows("followingId");
+    CREATE INDEX IF NOT EXISTS idx_tasks_user          ON tasks("userId");
+    CREATE INDEX IF NOT EXISTS idx_tasks_status        ON tasks("userId", status);
+    CREATE INDEX IF NOT EXISTS idx_services_provider   ON services("providerId");
+    CREATE INDEX IF NOT EXISTS idx_services_category   ON services(category);
+    CREATE INDEX IF NOT EXISTS idx_service_apps_service ON service_applications("serviceId");
+    CREATE INDEX IF NOT EXISTS idx_service_apps_user    ON service_applications("userId");
+    CREATE INDEX IF NOT EXISTS idx_companies_owner     ON companies("ownerId");
+    CREATE INDEX IF NOT EXISTS idx_catalog_company     ON company_catalog("companyId");
+    CREATE INDEX IF NOT EXISTS idx_catalog_category    ON company_catalog(category);
+    CREATE INDEX IF NOT EXISTS idx_events_creator      ON events("creatorId");
+    CREATE INDEX IF NOT EXISTS idx_events_start        ON events("startDate");
+    CREATE INDEX IF NOT EXISTS idx_pannel_members_user ON pannel_members("userId");
+    CREATE INDEX IF NOT EXISTS idx_pannel_courses_panel ON pannel_courses("pannelId");
+    CREATE INDEX IF NOT EXISTS idx_pannel_progress_user ON pannel_progress("userId");
+    CREATE INDEX IF NOT EXISTS idx_cell_members_user   ON cell_members("userId");
+    CREATE INDEX IF NOT EXISTS idx_stories_user        ON stories("userId");
+    CREATE INDEX IF NOT EXISTS idx_stories_expires     ON stories("expiresAt");
+    CREATE INDEX IF NOT EXISTS idx_post_likes_post     ON post_likes("postId");
+    CREATE INDEX IF NOT EXISTS idx_post_comments_post  ON post_comments("postId");
+  `);
 
   console.log('✅ Toutes les tables PostgreSQL sont prêtes');
 }
@@ -737,20 +781,11 @@ async function startServer() {
   const httpServer = createServer(app);
   const io         = new Server(httpServer, {
     path: '/socket.io',
-    cors: { origin: '*', methods: ['GET', 'POST'] },
+    cors: { origin: ALLOWED_ORIGINS, methods: ['GET', 'POST'], credentials: true },
   });
 
   // ─── MIDDLEWARE ────────────────────────────────────────────────────────────
-  app.use(cors({
-    origin: [
-      'https://www.freebara.com',
-      'https://freebara.com',
-      'https://freebaraapp-2.onrender.com',
-      'http://localhost:5173',
-      'http://localhost:3000',
-    ],
-    credentials: true,
-  }));
+  app.use(cors({ origin: ALLOWED_ORIGINS, credentials: true }));
   app.use(express.json({ limit: '50mb' }));
   app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
@@ -763,20 +798,6 @@ async function startServer() {
     next();
   });
  
-// 🟢 SERVIR LE FRONTEND (Vite build)
-app.use(express.static(__dirname));
-
-// 🟢 FALLBACK REACT / VITE ROUTER
-app.use(express.static(path.join(__dirname, "dist")));
-
-app.get("*", (req, res, next) => {
-  if (req.path.startsWith("/api")) {
-    return next();
-  }
-
-  res.sendFile(path.join(__dirname, "dist", "index.html"));
-});
-
   // Rate limiting (anti-abus)
   const rlMap = new Map<string, { count: number; reset: number }>();
   const rateLimit = (max: number, ms: number) => (req: any, res: any, next: any) => {
@@ -873,12 +894,12 @@ app.get("*", (req, res, next) => {
     const ip = req.ip ?? '';
     if (!email || !isValidEmail(email)) return res.status(400).json({ error: 'Email invalide' });
     try {
-      const otp = await db.one(`SELECT * FROM otps WHERE email=$1`, [email]);
+      const otp = await db.one(`SELECT email, code, "expiresAt" FROM otps WHERE email=$1`, [email]);
       if (!otp || otp.code !== code || new Date(otp.expiresAt) < new Date()) {
         await logAction('WARN', 'otp_failed', undefined, ip, email);
         return res.status(400).json({ error: 'Code invalide ou expiré' });
       }
-      let user = await db.one(`SELECT * FROM users WHERE email=$1`, [email]);
+      let user = await db.one(`SELECT id, email, name, profession, "avatarUrl", country, role, status, badge, "referralCode", balance FROM users WHERE email=$1`, [email]);
       if (isRegister) {
         if (user) return res.status(400).json({ error: 'Compte déjà existant' });
         let refBy = null;
@@ -910,9 +931,10 @@ app.get("*", (req, res, next) => {
   // ════════════════════════════════════════════════════════════════════════
   app.get('/api/users/me', authenticate, async (req: any, res) => {
     try {
-      const u = await db.one(`SELECT * FROM users WHERE id=$1`, [req.userId]);
+      const u = await db.one(`SELECT id, email, name, profession, bio, company, "avatarUrl", "coverUrl", phone, location, website, church, groups, interests, skills, marketing, goals, badge, "referralCode", balance, role, status, visibility, country, "createdAt", "notificationPreferences" FROM users WHERE id=$1`, [req.userId]);
       if (!u) return res.status(404).json({ error: 'Introuvable' });
-      try { u.notificationPreferences = JSON.parse(u.notificationpreferences); } catch { u.notificationPreferences = {}; }
+      // JSONB: pg retourne déjà un objet JS, pas besoin de JSON.parse
+      if (!u.notificationPreferences) u.notificationPreferences = {};
       const conn = await db.one(`SELECT COUNT(*) as n FROM follows WHERE "followerId"=$1 OR "followingId"=$1`, [req.userId]);
       const badges: string[] = [];
       if (conn.n >= 100) badges.push('Super Connecteur');
@@ -927,7 +949,7 @@ app.get("*", (req, res, next) => {
     const { name,profession,bio,company,avatarUrl,coverUrl,phone,location,website,church,groups,interests,skills,marketing,goals,notificationPreferences,visibility,country } = req.body;
     await pool.query(
       `UPDATE users SET name=$1,profession=$2,bio=$3,company=$4,"avatarUrl"=$5,"coverUrl"=$6,phone=$7,location=$8,website=$9,church=$10,groups=$11,interests=$12,skills=$13,marketing=$14,goals=$15,"notificationPreferences"=$16,visibility=$17,country=$18 WHERE id=$19`,
-      [name,profession,bio,company,avatarUrl,coverUrl,phone,location,website,church,groups,interests,skills,marketing,goals,notificationPreferences?JSON.stringify(notificationPreferences):null,visibility,country,req.userId]
+      [name,profession,bio,company,avatarUrl,coverUrl,phone,location,website,church,groups,interests,skills,marketing,goals,notificationPreferences ?? null,visibility,country,req.userId]
     );
     res.json({ success: true });
   });
@@ -979,7 +1001,7 @@ app.get("*", (req, res, next) => {
       await pool.query(`INSERT INTO follows("followerId","followingId") VALUES($1,$2)`, [req.userId, req.params.id]);
       const f = await db.one(`SELECT name FROM users WHERE id=$1`, [req.userId]);
       const n = await db.one(`INSERT INTO notifications("userId",type,content,"relatedId") VALUES($1,'follow',$2,$3) RETURNING *`, [req.params.id, `${f.name} a commencé à vous suivre.`, req.userId]);
-      io.to(`user_${req.params.id}`).emit('notification', { ...n, read: 0 });
+      io.to(`user_${req.params.id}`).emit('notification', { ...n, read: false });
       res.json({ success: true });
     } catch { res.status(400).json({ error: 'Déjà suivi' }); }
   });
@@ -992,16 +1014,20 @@ app.get("*", (req, res, next) => {
   app.get('/api/users/me/following',        authenticate, async (req: any, res) => res.json(await db.all(`SELECT u.id,u.name,u.profession,u."avatarUrl",u.company,u.badge FROM users u JOIN follows f ON u.id=f."followingId" WHERE f."followerId"=$1`, [req.userId])));
   app.get('/api/users/me/connections',      authenticate, async (req: any, res) => res.json(await db.all(`SELECT u.id,u.name,u.profession,u."avatarUrl" FROM users u WHERE u.id IN(SELECT "senderId" FROM connection_requests WHERE "receiverId"=$1 AND status='accepted' UNION SELECT "receiverId" FROM connection_requests WHERE "senderId"=$1 AND status='accepted')`, [req.userId])));
   app.get('/api/users/me/network-requests', authenticate, async (req: any, res) => res.json(await db.all(`SELECT cr.*,u.name,u."avatarUrl",u.profession FROM connection_requests cr JOIN users u ON cr."senderId"=u.id WHERE cr."receiverId"=$1 AND cr.status='pending'`, [req.userId])));
-  app.get('/api/users/me/certifications',   authenticate, async (req: any, res) => res.json(await db.all(`SELECT * FROM certifications WHERE "userId"=$1 ORDER BY "dateObtained" DESC`, [req.userId])));
+  app.get('/api/users/me/certifications',   authenticate, async (req: any, res) => res.json(await db.all(`SELECT id, "userId", name, organization, "dateObtained", "createdAt" FROM certifications WHERE "userId"=$1 ORDER BY "dateObtained" DESC`, [req.userId])));
   app.post('/api/users/me/certifications',  authenticate, async (req: any, res) => { const {name,organization,dateObtained}=req.body; res.json(await db.one(`INSERT INTO certifications("userId",name,organization,"dateObtained") VALUES($1,$2,$3,$4) RETURNING *`, [req.userId,name,organization,dateObtained])); });
   app.delete('/api/users/me/certifications/:id', authenticate, async (req: any, res) => { await pool.query(`DELETE FROM certifications WHERE id=$1 AND "userId"=$2`, [req.params.id, req.userId]); res.json({ success: true }); });
-  app.get('/api/users/me/transactions',     authenticate, async (req: any, res) => res.json(await db.all(`SELECT * FROM transactions WHERE "userId"=$1 ORDER BY date DESC`, [req.userId])));
+  app.get('/api/users/me/transactions',     authenticate, async (req: any, res) => res.json(await db.all(`SELECT id, "userId", date, description, category, amount, type, "createdAt" FROM transactions WHERE "userId"=$1 ORDER BY date DESC`, [req.userId])));
   app.post('/api/users/me/transactions',    authenticate, async (req: any, res) => { const {date,description,category,amount,type}=req.body; const tx=await db.one(`INSERT INTO transactions("userId",date,description,category,amount,type) VALUES($1,$2,$3,$4,$5,$6) RETURNING *`,[req.userId,date,description,category,amount,type]); io.to(`user_${req.userId}`).emit('transaction_update',tx); res.json(tx); });
   app.get('/api/users/me/favorite-companies', authenticate, async (req: any, res) => res.json(await db.all(`SELECT c.* FROM companies c JOIN favorite_companies fc ON c.id=fc."companyId" WHERE fc."userId"=$1`, [req.userId])));
   app.get('/api/users/me/favorite-products',  authenticate, async (req: any, res) => res.json(await db.all(`SELECT p.*,c.name as "companyName" FROM company_catalog p JOIN companies c ON p."companyId"=c.id JOIN favorite_products fp ON p.id=fp."productId" WHERE fp."userId"=$1`, [req.userId])));
   app.get('/api/users/me/events',   authenticate, async (req: any, res) => res.json(await db.all(`SELECT e.* FROM events e JOIN event_participants ep ON e.id=ep."eventId" WHERE ep."userId"=$1 ORDER BY e."startDate" ASC`, [req.userId])));
   app.get('/api/users/:id/events',  authenticate, async (req: any, res) => res.json(await db.all(`SELECT e.* FROM events e JOIN event_participants ep ON e.id=ep."eventId" WHERE ep."userId"=$1`, [req.params.id])));
-  app.get('/api/users/me/services', authenticate, async (req: any, res) => { const cr=await db.all(`SELECT * FROM services WHERE "providerId"=$1 ORDER BY "createdAt" DESC`,[req.userId]); const ap=await db.all(`SELECT s.* FROM services s JOIN service_applications sa ON s.id=sa."serviceId" WHERE sa."userId"=$1`,[req.userId]); res.json({created:cr,applied:ap}); });
+  app.get('/api/users/me/services', authenticate, async (req: any, res) => {
+    const cr = await db.all(`SELECT id, "providerId", title, description, availability, budget, type, "companyName", location, "contractType", "fileUrl", category, "createdAt" FROM services WHERE "providerId"=$1 ORDER BY "createdAt" DESC`, [req.userId]);
+    const ap = await db.all(`SELECT s.id, s."providerId", s.title, s.description, s.budget, s.type, s.category, s."createdAt" FROM services s JOIN service_applications sa ON s.id=sa."serviceId" WHERE sa."userId"=$1`, [req.userId]);
+    res.json({ created: cr, applied: ap });
+  });
   app.post('/api/users/me/claim-church', authenticate, async (req: any, res) => { await pool.query(`UPDATE users SET church=$1 WHERE id=$2`, [req.body.churchName, req.userId]); res.json({ success: true }); });
 
   // ════════════════════════════════════════════════════════════════════════
@@ -1026,7 +1052,7 @@ app.get("*", (req, res, next) => {
   app.post('/api/posts', authenticate, async (req: any, res) => {
     const { content, category, mediaUrls, cellId } = req.body;
     if (!content && (!mediaUrls || !mediaUrls.length)) return res.status(400).json({ error: 'Contenu requis' });
-    const post = await db.one(`INSERT INTO posts("authorId",content,category,"mediaUrls","cellId") VALUES($1,$2,$3,$4,$5) RETURNING *`, [req.userId,content||'',category||'Tous',mediaUrls?JSON.stringify(mediaUrls):null,cellId||null]);
+    const post = await db.one(`INSERT INTO posts("authorId",content,category,"mediaUrls","cellId") VALUES($1,$2,$3,$4,$5) RETURNING *`, [req.userId,content||'',category||'Tous',mediaUrls ?? null,cellId||null]);
     res.json(post);
   });
 
@@ -1046,7 +1072,7 @@ app.get("*", (req, res, next) => {
 
   app.post('/api/posts/:id/like', authenticate, async (req: any, res) => {
     const { type = 'like' } = req.body;
-    const ex = await db.one(`SELECT * FROM post_likes WHERE "postId"=$1 AND "userId"=$2`, [req.params.id, req.userId]);
+    const ex = await db.one(`SELECT "postId", "userId", type FROM post_likes WHERE "postId"=$1 AND "userId"=$2`, [req.params.id, req.userId]);
     if (ex) {
       if (ex.type === type) { await pool.query(`DELETE FROM post_likes WHERE "postId"=$1 AND "userId"=$2`, [req.params.id, req.userId]); return res.json({ liked: false }); }
       await pool.query(`UPDATE post_likes SET type=$1 WHERE "postId"=$2 AND "userId"=$3`, [type, req.params.id, req.userId]);
@@ -1067,7 +1093,7 @@ app.get("*", (req, res, next) => {
   // ════════════════════════════════════════════════════════════════════════
   // 🔔 NOTIFICATIONS
   // ════════════════════════════════════════════════════════════════════════
-  app.get('/api/notifications',       authenticate, async (req: any, res) => res.json(await db.all(`SELECT * FROM notifications WHERE "userId"=$1 ORDER BY "createdAt" DESC LIMIT 50`, [req.userId])));
+  app.get('/api/notifications',       authenticate, async (req: any, res) => res.json(await db.all(`SELECT id, "userId", type, content, "relatedId", read, "createdAt" FROM notifications WHERE "userId"=$1 ORDER BY "createdAt" DESC LIMIT 50`, [req.userId])));
   app.put('/api/notifications/:id/read', authenticate, async (req: any, res) => { await pool.query(`UPDATE notifications SET read=TRUE WHERE id=$1 AND "userId"=$2`,[req.params.id,req.userId]); res.json({success:true}); });
 
   // ════════════════════════════════════════════════════════════════════════
@@ -1085,31 +1111,47 @@ app.get("*", (req, res, next) => {
   app.post('/api/events/:id/comments',     authenticate, async (req: any, res) => { if(!req.body.content) return res.status(400).json({error:'Contenu requis'}); res.json(await db.one(`INSERT INTO event_comments("eventId","userId",content) VALUES($1,$2,$3) RETURNING *`,[req.params.id,req.userId,req.body.content])); });
   app.post('/api/events/:id/favorite',     authenticate, async (req: any, res) => { try { await pool.query(`INSERT INTO favorite_events("userId","eventId") VALUES($1,$2) ON CONFLICT DO NOTHING`,[req.userId,req.params.id]); } catch {} res.json({success:true}); });
   app.post('/api/events/:id/share',        authenticate, async (req: any, res) => { await pool.query(`UPDATE events SET "shares_count"="shares_count"+1 WHERE id=$1`,[req.params.id]); res.json({success:true}); });
-  app.post('/api/events/:id/invite',       authenticate, async (req: any, res) => { const {userIds}=req.body; if(!Array.isArray(userIds)) return res.status(400).json({error:'userIds requis'}); const ev=await db.one(`SELECT title FROM events WHERE id=$1`,[req.params.id]); const s=await db.one(`SELECT name FROM users WHERE id=$1`,[req.userId]); for(const uid of userIds){const n=await db.one(`INSERT INTO notifications("userId",type,content,"relatedId") VALUES($1,'event_invite',$2,$3) RETURNING *`,[uid,`${s.name} vous invite: ${ev.title}`,req.params.id]);io.to(`user_${uid}`).emit('notification',{...n,read:0});} res.json({success:true}); });
+  app.post('/api/events/:id/invite', authenticate, async (req: any, res) => {
+    const {userIds}=req.body;
+    if(!Array.isArray(userIds)) return res.status(400).json({error:'userIds requis'});
+    const ev=await db.one(`SELECT title FROM events WHERE id=$1`,[req.params.id]);
+    const s=await db.one(`SELECT name FROM users WHERE id=$1`,[req.userId]);
+    for(const uid of userIds){
+      const n=await db.one(`INSERT INTO notifications("userId",type,content,"relatedId") VALUES($1,'event_invite',$2,$3) RETURNING *`,[uid,`${s.name} vous invite: ${ev.title}`,req.params.id]);
+      io.to(`user_${uid}`).emit('notification',{...n, read: false});
+    }
+    res.json({success:true});
+  });
 
   // ════════════════════════════════════════════════════════════════════════
   // 💼 SERVICES
   // ════════════════════════════════════════════════════════════════════════
   app.get('/api/services',     authenticate, async (_, res) => res.json(await db.all(`SELECT s.*,u.name as "providerName",u."avatarUrl" as "providerAvatar" FROM services s JOIN users u ON s."providerId"=u.id ORDER BY s."createdAt" DESC`, [])));
-  app.post('/api/services',    authenticate, async (req: any, res) => { const {title,description,availability,budget,type,companyName,location,contractType,fileUrl,category}=req.body; res.json(await db.one(`INSERT INTO services("providerId",title,description,availability,budget,type,"companyName",location,"contractType","fileUrl",category) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,[req.userId,title,description,availability,budget,type||'projet',companyName,location,contractType,fileUrl,category])); });
+  app.post('/api/services',    authenticate, async (req: any, res) => {
+    const {title,description,availability,budget,type,companyName,location,contractType,fileUrl,category}=req.body;
+    if (!title) return res.status(400).json({ error: 'Titre requis' });
+    try {
+      res.json(await db.one(`INSERT INTO services("providerId",title,description,availability,budget,type,"companyName",location,"contractType","fileUrl",category) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,[req.userId,title,description,availability,budget||0,type||'projet',companyName,location,contractType,fileUrl,category]));
+    } catch (e: any) { res.status(500).json({ error: 'Erreur création service: ' + e.message }); }
+  });
   app.put('/api/services/:id', authenticate, async (req: any, res) => { const s=await db.one(`SELECT "providerId" FROM services WHERE id=$1`,[req.params.id]); if(!s||s.providerid!==req.userId) return res.status(403).json({error:'Non autorisé'}); const {title,description,budget,availability,type,companyName,location,contractType,fileUrl,category}=req.body; await pool.query(`UPDATE services SET title=$1,description=$2,budget=$3,availability=$4,type=$5,"companyName"=$6,location=$7,"contractType"=$8,"fileUrl"=$9,category=$10 WHERE id=$11`,[title,description,budget,availability,type,companyName,location,contractType,fileUrl,category,req.params.id]); res.json({success:true}); });
   app.delete('/api/services/:id',          authenticate, async (req: any, res) => { await pool.query(`DELETE FROM services WHERE id=$1 AND "providerId"=$2`,[req.params.id,req.userId]); res.json({success:true}); });
   app.post('/api/services/:id/apply',      authenticate, async (req: any, res) => { const {message,contactDetails}=req.body; try { await pool.query(`INSERT INTO service_applications("serviceId","userId",message,"contactDetails") VALUES($1,$2,$3,$4)`,[req.params.id,req.userId,message,contactDetails]); res.json({success:true}); } catch { res.status(400).json({error:'Déjà postulé'}); } });
   app.get('/api/services/:id/applications',authenticate, async (req: any, res) => res.json(await db.all(`SELECT sa.*,u.name,u."avatarUrl",u.email FROM service_applications sa JOIN users u ON sa."userId"=u.id WHERE sa."serviceId"=$1`,[req.params.id])));
-  app.put('/api/services/:serviceId/applications/:applicationId', authenticate, async (req: any, res) => { await pool.query(`UPDATE service_applications SET status=$1 WHERE "serviceId"=$2`,[req.body.status,req.params.serviceId]); res.json({success:true}); });
+  app.put('/api/services/:serviceId/applications/:applicationId', authenticate, async (req: any, res) => { await pool.query(`UPDATE service_applications SET status=$1 WHERE id=$2 AND "serviceId"=$3`,[req.body.status,req.params.applicationId,req.params.serviceId]); res.json({success:true}); });
 
   // ════════════════════════════════════════════════════════════════════════
   // 🏢 ENTREPRISES & BOUTIQUES
   // ════════════════════════════════════════════════════════════════════════
   app.get('/api/companies',          authenticate, async (_, res) => res.json(await db.all(`SELECT c.*,u.name as "ownerName" FROM companies c JOIN users u ON c."ownerId"=u.id ORDER BY c."createdAt" DESC`, [])));
-  app.get('/api/companies/new',      authenticate, async (_, res) => res.json(await db.all(`SELECT * FROM companies ORDER BY "createdAt" DESC LIMIT 10`, [])));
+  app.get('/api/companies/new',      authenticate, async (_, res) => res.json(await db.all(`SELECT id, "ownerId", name, sector, description, "logoUrl", "coverUrl", country, city, "isShop", "createdAt" FROM companies ORDER BY "createdAt" DESC LIMIT 10`, [])));
   app.get('/api/companies/trending', authenticate, async (_, res) => res.json(await db.all(`SELECT c.*,(SELECT COUNT(*) FROM favorite_companies WHERE "companyId"=c.id) as fav FROM companies c ORDER BY fav DESC LIMIT 10`, [])));
   app.post('/api/companies',   authenticate, async (req: any, res) => { const {name,sector,description,address,whatsapp,facebook,twitter,linkedin,logoUrl,coverUrl,isShop,specialty,categories,country,city}=req.body; res.json(await db.one(`INSERT INTO companies("ownerId",name,sector,description,address,whatsapp,facebook,twitter,linkedin,"logoUrl","coverUrl","isShop",specialty,categories,country,city) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`,[req.userId,name,sector,description,address,whatsapp,facebook,twitter,linkedin,logoUrl,coverUrl,isShop||0,specialty,categories,country,city])); });
   app.put('/api/companies/:id', authenticate, async (req: any, res) => { const {name,sector,description,address,whatsapp,logoUrl,coverUrl,isShop,specialty,categories,country,city}=req.body; await pool.query(`UPDATE companies SET name=$1,sector=$2,description=$3,address=$4,whatsapp=$5,"logoUrl"=$6,"coverUrl"=$7,"isShop"=$8,specialty=$9,categories=$10,country=$11,city=$12 WHERE id=$13 AND "ownerId"=$14`,[name,sector,description,address,whatsapp,logoUrl,coverUrl,isShop,specialty,categories,country,city,req.params.id,req.userId]); res.json({success:true}); });
   app.delete('/api/companies/:id', authenticate, async (req: any, res) => { await pool.query(`DELETE FROM companies WHERE id=$1 AND "ownerId"=$2`,[req.params.id,req.userId]); res.json({success:true}); });
   app.post('/api/companies/:id/favorite',   authenticate, async (req: any, res) => { try { await pool.query(`INSERT INTO favorite_companies("userId","companyId") VALUES($1,$2) ON CONFLICT DO NOTHING`,[req.userId,req.params.id]); } catch {} res.json({success:true}); });
   app.delete('/api/companies/:id/favorite', authenticate, async (req: any, res) => { await pool.query(`DELETE FROM favorite_companies WHERE "userId"=$1 AND "companyId"=$2`,[req.userId,req.params.id]); res.json({success:true}); });
-  app.get('/api/companies/:id/catalog',     authenticate, async (req: any, res) => res.json(await db.all(`SELECT * FROM company_catalog WHERE "companyId"=$1`,[req.params.id])));
+  app.get('/api/companies/:id/catalog',     authenticate, async (req: any, res) => res.json(await db.all(`SELECT id, "companyId", name, description, price, "imageUrl", category, tag, "tagValue", "shares_count", "createdAt" FROM company_catalog WHERE "companyId"=$1`,[req.params.id])));
   app.post('/api/companies/:id/catalog',    authenticate, async (req: any, res) => { const {name,description,price,imageUrl,category,tag,tagValue}=req.body; res.json(await db.one(`INSERT INTO company_catalog("companyId",name,description,price,"imageUrl",category,tag,"tagValue") VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,[req.params.id,name,description,price,imageUrl,category,tag,tagValue])); });
   app.put('/api/companies/:companyId/catalog/:productId',    authenticate, async (req: any, res) => { const {name,description,price,imageUrl,category}=req.body; await pool.query(`UPDATE company_catalog SET name=$1,description=$2,price=$3,"imageUrl"=$4,category=$5 WHERE id=$6 AND "companyId"=$7`,[name,description,price,imageUrl,category,req.params.productId,req.params.companyId]); res.json({success:true}); });
   app.delete('/api/companies/:companyId/catalog/:productId', authenticate, async (req: any, res) => { await pool.query(`DELETE FROM company_catalog WHERE id=$1 AND "companyId"=$2`,[req.params.productId,req.params.companyId]); res.json({success:true}); });
@@ -1124,7 +1166,7 @@ app.get("*", (req, res, next) => {
   app.post('/api/companies/:id/orders',   authenticate, async (req: any, res) => { const {productId,quantity,totalPrice,customerName,customerWhatsapp}=req.body; res.json(await db.one(`INSERT INTO shop_orders("companyId","customerId","productId",quantity,"totalPrice","customerName","customerWhatsapp") VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *`,[req.params.id,req.userId,productId,quantity||1,totalPrice,customerName,customerWhatsapp])); });
   app.put('/api/orders/:orderId/status',  authenticate, async (req: any, res) => { await pool.query(`UPDATE shop_orders SET status=$1 WHERE id=$2`,[req.body.status,req.params.orderId]); res.json({success:true}); });
   app.get('/api/companies/:id/insights',  authenticate, async (req: any, res) => { const o=await db.one(`SELECT COUNT(*) as c,SUM("totalPrice") as rev FROM shop_orders WHERE "companyId"=$1`,[req.params.id]); const p=await db.one(`SELECT COUNT(*) as c FROM company_catalog WHERE "companyId"=$1`,[req.params.id]); res.json({totalOrders:o.c,totalRevenue:o.rev||0,totalProducts:p.c}); });
-  app.post('/api/companies/:id/funding-request', authenticate, async (req: any, res) => { const {fundingType,amount,reason,institutionId,strategicData}=req.body; res.json(await db.one(`INSERT INTO funding_requests("userId","companyId","institutionId","fundingType",amount,reason,"strategicData") VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *`,[req.userId,req.params.id,institutionId||null,fundingType,amount,reason,strategicData?JSON.stringify(strategicData):null])); });
+  app.post('/api/companies/:id/funding-request', authenticate, async (req: any, res) => { const {fundingType,amount,reason,institutionId,strategicData}=req.body; res.json(await db.one(`INSERT INTO funding_requests("userId","companyId","institutionId","fundingType",amount,reason,"strategicData") VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *`,[req.userId,req.params.id,institutionId||null,fundingType,amount,reason,strategicData ?? null])); });
   app.get('/api/funding-requests/my', authenticate, async (req: any, res) => res.json(await db.all(`SELECT fr.*,c.name as "companyName" FROM funding_requests fr JOIN companies c ON fr."companyId"=c.id WHERE fr."userId"=$1 ORDER BY fr."createdAt" DESC`,[req.userId])));
   app.put('/api/companies/:id/manager',      authenticate, async (req: any, res) => { await pool.query(`UPDATE companies SET "managerId"=$1 WHERE id=$2 AND "ownerId"=$3`,[req.body.managerId||null,req.params.id,req.userId]); res.json({success:true}); });
   app.post('/api/companies/:id/resign-manager', authenticate, async (req: any, res) => { await pool.query(`UPDATE companies SET "managerId"=NULL WHERE id=$1 AND "managerId"=$2`,[req.params.id,req.userId]); res.json({success:true}); });
@@ -1181,13 +1223,13 @@ app.get("*", (req, res, next) => {
   app.post('/api/pannels/:id/courses',  authenticate, async (req: any, res) => { const {title,description,duration,fileUrl,fileType,url,type}=req.body; const fu=fileUrl||url; const ft=fileType||type; if(!title||!fu||!ft) return res.status(400).json({error:'Titre, fichier et type requis'}); await pool.query(`INSERT INTO pannel_courses("pannelId",title,description,duration,"fileUrl","fileType") VALUES($1,$2,$3,$4,$5,$6)`,[req.params.id,title,description,duration,fu,ft]); res.json({success:true}); });
   app.delete('/api/pannels/:id/courses/:courseId',              authenticate, async (req: any, res) => { await pool.query(`DELETE FROM pannel_courses WHERE id=$1 AND "pannelId"=$2`,[req.params.courseId,req.params.id]); res.json({success:true}); });
   app.post('/api/pannels/:id/courses/:courseId/learn',          authenticate, async (req: any, res) => { const {status,position,notes,stickyNotes}=req.body; await pool.query(`INSERT INTO pannel_progress("pannelId","userId","courseId",status,position,notes,"stickyNotes","updatedAt") VALUES($1,$2,$3,$4,$5,$6,$7,NOW()) ON CONFLICT("pannelId","userId","courseId") DO UPDATE SET status=$4,position=$5,notes=$6,"stickyNotes"=$7,"updatedAt"=NOW()`,[req.params.id,req.userId,req.params.courseId,status||'en_cours',position||0,notes,stickyNotes]); res.json({success:true}); });
-  app.get('/api/pannels/:id/courses/:courseId/progress',        authenticate, async (req: any, res) => res.json(await db.one(`SELECT * FROM pannel_progress WHERE "pannelId"=$1 AND "userId"=$2 AND "courseId"=$3`,[req.params.id,req.userId,req.params.courseId]) || {}));
+  app.get('/api/pannels/:id/courses/:courseId/progress', authenticate, async (req: any, res) => res.json(await db.one(`SELECT "pannelId", "userId", "courseId", status, position, notes, "stickyNotes", "updatedAt" FROM pannel_progress WHERE "pannelId"=$1 AND "userId"=$2 AND "courseId"=$3`,[req.params.id,req.userId,req.params.courseId]) || {}));
   app.get('/api/pannels/:id/courses/:courseId/comments',        authenticate, async (req: any, res) => res.json(await db.all(`SELECT c.*,u.name as "userName",u."avatarUrl" as "userAvatar" FROM pannel_course_comments c JOIN users u ON c."userId"=u.id WHERE c."courseId"=$1 ORDER BY c."createdAt" ASC`,[req.params.courseId])));
   app.post('/api/pannels/:id/courses/:courseId/comments',       authenticate, async (req: any, res) => { await pool.query(`INSERT INTO pannel_course_comments("courseId","userId",content) VALUES($1,$2,$3)`,[req.params.courseId,req.userId,req.body.content]); res.json({success:true}); });
   app.post('/api/pannels/:id/courses/:courseId/favorite',       authenticate, async (_, res) => res.json({ success: true }));
-  app.get('/api/pannels/:id/evaluations',  authenticate, async (req: any, res) => res.json(await db.all(`SELECT * FROM pannel_evaluations WHERE "pannelId"=$1`,[req.params.id])));
+  app.get('/api/pannels/:id/evaluations',  authenticate, async (req: any, res) => res.json(await db.all(`SELECT id, "pannelId", "userId", "courseTitle", grade, feedback, "createdAt" FROM pannel_evaluations WHERE "pannelId"=$1`,[req.params.id])));
   app.post('/api/pannels/:id/evaluations', authenticate, async (req: any, res) => { const {courseTitle,grade,feedback,userId}=req.body; await pool.query(`INSERT INTO pannel_evaluations("pannelId","userId","courseTitle",grade,feedback) VALUES($1,$2,$3,$4,$5)`,[req.params.id,userId||req.userId,courseTitle,grade,feedback]); res.json({success:true}); });
-  app.get('/api/pannels/:id/badges',  authenticate, async (req: any, res) => res.json(await db.all(`SELECT * FROM pannel_badges WHERE "pannelId"=$1 AND "userId"=$2`,[req.params.id,req.userId])));
+  app.get('/api/pannels/:id/badges',  authenticate, async (req: any, res) => res.json(await db.all(`SELECT id, "pannelId", "userId", "badgeType", "unlockedAt" FROM pannel_badges WHERE "pannelId"=$1 AND "userId"=$2`,[req.params.id,req.userId])));
   app.post('/api/pannels/:id/badges', authenticate, async (req: any, res) => { await pool.query(`INSERT INTO pannel_badges("pannelId","userId","badgeType") VALUES($1,$2,$3)`,[req.params.id,req.userId,req.body.badgeType]); res.json({success:true}); });
   app.get('/api/pannels/:id/stats',   authenticate, async (req: any, res) => { const m=await db.one(`SELECT COUNT(*) as c FROM pannel_members WHERE "pannelId"=$1`,[req.params.id]); const co=await db.one(`SELECT COUNT(*) as c FROM pannel_courses WHERE "pannelId"=$1`,[req.params.id]); res.json({membersCount:m.c,coursesCount:co.c}); });
   app.get('/api/pannels/:id/forum',   authenticate, async (req: any, res) => res.json(await db.all(`SELECT f.*,u.name as "userName",u."avatarUrl" as "userAvatar" FROM pannel_forum f JOIN users u ON f."userId"=u.id WHERE f."pannelId"=$1 ORDER BY f."createdAt" ASC`,[req.params.id])));
@@ -1208,7 +1250,7 @@ app.get("*", (req, res, next) => {
   // ════════════════════════════════════════════════════════════════════════
   // ⛪ CHURCHES
   // ════════════════════════════════════════════════════════════════════════
-  app.get('/api/churches',    authenticate, async (_, res) => res.json(await db.all(`SELECT * FROM churches ORDER BY "createdAt" DESC`,[])));
+  app.get('/api/churches',    authenticate, async (_, res) => res.json(await db.all(`SELECT id, name, pastor, hq, description, programs, "coverUrl", latitude, longitude, city, country, "creatorId", "createdAt" FROM churches ORDER BY "createdAt" DESC`,[])));
   app.post('/api/churches',   authenticate, async (req: any, res) => { const {name,pastor,hq,description,coverUrl,latitude,longitude,city,country}=req.body; res.json(await db.one(`INSERT INTO churches(name,pastor,hq,description,"coverUrl",latitude,longitude,city,country,"creatorId") VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,[name,pastor,hq,description,coverUrl,latitude,longitude,city,country,req.userId])); });
   app.put('/api/churches/:id',authenticate, async (req: any, res) => { const {name,pastor,hq,description,coverUrl}=req.body; await pool.query(`UPDATE churches SET name=$1,pastor=$2,hq=$3,description=$4,"coverUrl"=$5 WHERE id=$6 AND "creatorId"=$7`,[name,pastor,hq,description,coverUrl,req.params.id,req.userId]); res.json({success:true}); });
   app.delete('/api/churches/:id',authenticate, async (req: any, res) => { await pool.query(`DELETE FROM churches WHERE id=$1 AND "creatorId"=$2`,[req.params.id,req.userId]); res.json({success:true}); });
@@ -1217,7 +1259,7 @@ app.get("*", (req, res, next) => {
   // 🏦 INSTITUTIONS DE CRÉDIT
   // ════════════════════════════════════════════════════════════════════════
   app.get('/api/credit-institutions',     authenticate, async (_, res) => res.json(await db.all(`SELECT ci.*,u.name as "creatorName" FROM credit_institutions ci JOIN users u ON ci."creatorId"=u.id ORDER BY ci."createdAt" DESC`,[])));
-  app.get('/api/credit-institutions/my',  authenticate, async (req: any, res) => res.json(await db.all(`SELECT * FROM credit_institutions WHERE "creatorId"=$1`,[req.userId])));
+  app.get('/api/credit-institutions/my',  authenticate, async (req: any, res) => res.json(await db.all(`SELECT id, "creatorId", name, type, description, eligibility, terms, city, country, "logoUrl", "createdAt" FROM credit_institutions WHERE "creatorId"=$1`,[req.userId])));
   app.post('/api/credit-institutions',    authenticate, async (req: any, res) => { const {name,type,description,eligibilityConditions,offers,city,country,logoUrl}=req.body; if(!name||!type) return res.status(400).json({error:'Nom et type obligatoires'}); res.json(await db.one(`INSERT INTO credit_institutions("creatorId",name,type,description,eligibility,terms,city,country,"logoUrl") VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,[req.userId,name,type,description,eligibilityConditions,offers,city,country,logoUrl])); });
   app.put('/api/credit-institutions/:id', authenticate, async (req: any, res) => { const {name,type,description,eligibility,terms,city,country,logoUrl}=req.body; await pool.query(`UPDATE credit_institutions SET name=$1,type=$2,description=$3,eligibility=$4,terms=$5,city=$6,country=$7,"logoUrl"=$8 WHERE id=$9 AND "creatorId"=$10`,[name,type,description,eligibility,terms,city,country,logoUrl,req.params.id,req.userId]); res.json({success:true}); });
   app.get('/api/credit-institutions/:id/requests', authenticate, async (req: any, res) => res.json(await db.all(`SELECT fr.*,u.name as "userName",c.name as "companyName" FROM funding_requests fr JOIN users u ON fr."userId"=u.id JOIN companies c ON fr."companyId"=c.id WHERE fr."institutionId"=$1`,[req.params.id])));
@@ -1225,12 +1267,12 @@ app.get("*", (req, res, next) => {
   // ════════════════════════════════════════════════════════════════════════
   // ✅ TÂCHES
   // ════════════════════════════════════════════════════════════════════════
-  app.get('/api/tasks',    authenticate, async (req: any, res) => res.json(await db.all(`SELECT * FROM tasks WHERE "userId"=$1 ORDER BY "createdAt" DESC`,[req.userId])));
+  app.get('/api/tasks',    authenticate, async (req: any, res) => res.json(await db.all(`SELECT id, "userId", title, description, "dueDate", "reminderTime", status, priority, category, "assignedUserId", "isArchived", "createdAt" FROM tasks WHERE "userId"=$1 ORDER BY "createdAt" DESC`,[req.userId])));
   app.post('/api/tasks',   authenticate, async (req: any, res) => { const {title,description,dueDate,reminderTime,status,priority,category,assignedUserId}=req.body; res.json(await db.one(`INSERT INTO tasks("userId",title,description,"dueDate","reminderTime",status,priority,category,"assignedUserId") VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,[req.userId,title,description,dueDate,reminderTime,status||'todo',priority||'medium',category||'Général',assignedUserId||null])); });
   app.put('/api/tasks/:id',authenticate, async (req: any, res) => { const {status,title,description,dueDate,reminderTime,priority,category}=req.body; await pool.query(`UPDATE tasks SET status=$1,title=$2,description=$3,"dueDate"=$4,"reminderTime"=$5,priority=$6,category=$7 WHERE id=$8 AND "userId"=$9`,[status,title,description,dueDate,reminderTime,priority,category,req.params.id,req.userId]); res.json({success:true}); });
   app.delete('/api/tasks/:id',authenticate, async (req: any, res) => { await pool.query(`DELETE FROM tasks WHERE id=$1 AND "userId"=$2`,[req.params.id,req.userId]); res.json({success:true}); });
   app.post('/api/tasks/:taskId/subtasks', authenticate, async (req: any, res) => res.json(await db.one(`INSERT INTO task_subtasks("taskId",title) VALUES($1,$2) RETURNING *`,[req.params.taskId,req.body.title])));
-  app.get('/api/tasks/:taskId/subtasks',  authenticate, async (req: any, res) => res.json(await db.all(`SELECT * FROM task_subtasks WHERE "taskId"=$1`,[req.params.taskId])));
+  app.get('/api/tasks/:taskId/subtasks',  authenticate, async (req: any, res) => res.json(await db.all(`SELECT id, "taskId", title, status, "createdAt" FROM task_subtasks WHERE "taskId"=$1`,[req.params.taskId])));
   app.put('/api/subtasks/:id',            authenticate, async (req: any, res) => { await pool.query(`UPDATE task_subtasks SET status=$1 WHERE id=$2`,[req.body.status,req.params.id]); res.json({success:true}); });
 
   // ════════════════════════════════════════════════════════════════════════
@@ -1240,7 +1282,7 @@ app.get("*", (req, res, next) => {
   app.get('/api/reviews/:targetType/:targetId',   authenticate, async (req: any, res) => res.json(await db.all(`SELECT r.*,u.name,u."avatarUrl" FROM reviews r JOIN users u ON r."userId"=u.id WHERE r."targetType"=$1 AND r."targetId"=$2 ORDER BY r."createdAt" DESC`,[req.params.targetType,req.params.targetId])));
   app.post('/api/reviews',                        authenticate, async (req: any, res) => { const {targetType,targetId,rating,comment}=req.body; res.json(await db.one(`INSERT INTO reviews("userId","targetType","targetId",rating,comment) VALUES($1,$2,$3,$4,$5) RETURNING *`,[req.userId,targetType,targetId,rating,comment])); });
   app.post('/api/ads',                            authenticate, async (req: any, res) => { const {companyId,goal,content,targeting,budget,duration}=req.body; res.json(await db.one(`INSERT INTO ads("companyId",goal,content,targeting,budget,duration) VALUES($1,$2,$3,$4,$5,$6) RETURNING *`,[companyId,goal,content,targeting,budget,duration])); });
-  app.get('/api/ads/:companyId',                  authenticate, async (req: any, res) => res.json(await db.all(`SELECT * FROM ads WHERE "companyId"=$1`,[req.params.companyId])));
+  app.get('/api/ads/:companyId',                  authenticate, async (req: any, res) => res.json(await db.all(`SELECT id, "companyId", goal, content, targeting, budget, duration, status, "createdAt" FROM ads WHERE "companyId"=$1`,[req.params.companyId])));
   app.post('/api/reports',                        authenticate, async (req: any, res) => { const {targetType,targetId,reason}=req.body; if(!targetType||!targetId||!reason) return res.status(400).json({error:'Données manquantes'}); await pool.query(`INSERT INTO reports("reporterId","targetType","targetId",reason) VALUES($1,$2,$3,$4)`,[req.userId,targetType,targetId,reason]); res.json({success:true}); });
 
   // ════════════════════════════════════════════════════════════════════════
@@ -1283,14 +1325,14 @@ app.get("*", (req, res, next) => {
   app.put('/api/admin/reports/:id',     authenticate, requireAdmin,      async (req: any, res) => { await pool.query(`UPDATE reports SET status=$1 WHERE id=$2`,[req.body.status,req.params.id]); res.json({success:true}); });
   app.delete('/api/admin/posts/:id',    authenticate, requireAdmin,      async (req: any, res) => { await pool.query(`DELETE FROM posts WHERE id=$1`,[req.params.id]); await pool.query(`INSERT INTO admin_logs("adminId",action,"targetId") VALUES($1,'delete_post',$2)`,[req.userId,req.params.id]); res.json({success:true}); });
   app.get('/api/admin/logs',            authenticate, requireAdmin,      async (_, res) => res.json(await db.all(`SELECT al.*,u.name as "adminName" FROM admin_logs al JOIN users u ON al."adminId"=u.id ORDER BY al."createdAt" DESC LIMIT 200`,[])));
-  app.get('/api/admin/db-logs',         authenticate, requireSuperAdmin, async (_, res) => res.json(await db.all(`SELECT * FROM db_logs ORDER BY "createdAt" DESC LIMIT 500`,[])));
+  app.get('/api/admin/db-logs',         authenticate, requireSuperAdmin, async (_, res) => res.json(await db.all(`SELECT id, level, action, "userId", ip, details, "createdAt" FROM db_logs ORDER BY "createdAt" DESC LIMIT 500`,[])));
   app.get('/api/admin/errors',          authenticate, requireSuperAdmin, (_, res) => res.json(errorTracker.errors));
   app.post('/api/admin/backup',         authenticate, requireSuperAdmin, async (req: any, res) => {
     try {
       const [users, posts, companies] = await Promise.all([
         db.all(`SELECT id,email,name,country,role,status,"createdAt" FROM users`, []),
         db.all(`SELECT id,"authorId",content,"createdAt" FROM posts ORDER BY "createdAt" DESC LIMIT 5000`, []),
-        db.all(`SELECT * FROM companies`, []),
+        db.all(`SELECT id, "ownerId", name, sector, country, city, "createdAt" FROM companies`, []),
       ]);
       await logAction('ADMIN', 'backup_triggered', req.userId, req.ip, `${users.length} users`);
       res.json({ success: true, timestamp: new Date(), counts: { users: users.length, posts: posts.length, companies: companies.length }, data: { users, posts, companies } });
@@ -1343,20 +1385,15 @@ app.get("*", (req, res, next) => {
 
  const distPath = path.join(__dirname, 'dist');
 
-// ✅ Servir les fichiers frontend Vite
-app.use(express.static(distPath));
+  // ════════════════════════════════════════════════════════════════════════
+  // 📁 FICHIERS STATIQUES (Frontend React) — TOUJOURS EN DERNIER
+  // ════════════════════════════════════════════════════════════════════════
+  app.use(express.static(distPath));
 
-// ✅ React/Vite fallback
-app.get('*', (req, res, next) => {
-
-  // ❌ Ne jamais intercepter les routes API
-  if (req.path.startsWith('/api')) {
-    return next();
-  }
-
-  // ✅ Retourner index.html pour React Router
-  res.sendFile(path.join(distPath, 'index.html'));
-});
+  // ✅ React Router fallback — ne jamais intercepter /api
+  app.get('*', (req, res) => {
+    res.sendFile(path.join(distPath, 'index.html'));
+  });
 
   // ════════════════════════════════════════════════════════════════════════
   // 💾 BACKUP AUTOMATIQUE (toutes les 24h)
