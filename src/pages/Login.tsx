@@ -6,7 +6,6 @@ import { toast } from 'react-hot-toast';
 
 export default function Login() {
   const navigate = useNavigate();
- const otpStore: Record<string, string> = {};
   const [mode, setMode] = useState<'login' | 'register'>('login');
   const [email, setEmail] = useState('');
   const [country, setCountry] = useState('');
@@ -15,7 +14,7 @@ export default function Login() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [devCode, setDevCode] = useState('');
-const API_URL = import.meta.env.VITE_API_URL || "";
+  const API_URL = import.meta.env.VITE_API_URL || "";
 
 // ✅ REQUEST OTP
 const handleRequestOtp = async (e: React.FormEvent) => {
@@ -36,6 +35,7 @@ const handleRequestOtp = async (e: React.FormEvent) => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ 
         email: email.trim(),
+        country: mode === 'register' ? country : undefined,
         isRegister: mode === 'register'
       })
     });
@@ -53,8 +53,7 @@ const handleRequestOtp = async (e: React.FormEvent) => {
       setDevCode(data.devCode);
     }
 
-    // ⚠️ petit fix anti bug React
-    setTimeout(() => setStep('code'), 0);
+    setStep('code');
 
   } catch (err: any) {
     console.error("REQUEST OTP ERROR:", err);
@@ -133,7 +132,7 @@ const handleVerifyOtp = async (e: React.FormEvent) => {
         {step === 'email' && (
           <div className="flex bg-slate-100 p-1 rounded-xl mb-6">
             <button
-              onClick={() => { setMode('login'); setError(''); }}
+              onClick={() => { setMode('login'); setError(''); setCode(''); }}
               className={`flex-1 py-2 text-sm font-medium rounded-lg transition-all ${
                 mode === 'login' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-700'
               }`}
@@ -141,7 +140,7 @@ const handleVerifyOtp = async (e: React.FormEvent) => {
               Se connecter
             </button>
             <button
-              onClick={() => { setMode('register'); setError(''); }}
+              onClick={() => { setMode('register'); setError(''); setCode(''); }}
               className={`flex-1 py-2 text-sm font-medium rounded-lg transition-all ${
                 mode === 'register' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-700'
               }`}
@@ -250,7 +249,7 @@ const handleVerifyOtp = async (e: React.FormEvent) => {
             </button>
             <button
               type="button"
-              onClick={() => setStep('email')}
+              onClick={() => { setStep('email'); setCode(''); setError(''); setDevCode(''); }}
               className="w-full text-sm text-slate-500 hover:text-slate-700 text-center"
             >
               Modifier l'adresse email
