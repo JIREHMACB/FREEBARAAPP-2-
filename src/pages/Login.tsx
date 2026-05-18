@@ -15,7 +15,7 @@ export default function Login() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [devCode, setDevCode] = useState('');
-const API_URL = "https://freebaraapp-2.onrender.com";
+const API_URL = import.meta.env.VITE_API_URL || "";
 
 // ✅ REQUEST OTP
 const handleRequestOtp = async (e: React.FormEvent) => {
@@ -260,4 +260,4 @@ const handleVerifyOtp = async (e: React.FormEvent) => {
       </div>
     </div>
   );
-} 
+}
