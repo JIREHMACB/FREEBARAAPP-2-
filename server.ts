@@ -137,7 +137,7 @@ export const sendOTPEmail = async (email: string, code: string) => {
 
   try {
     const result = await resend.emails.send({
-     from: "onboarding@resend.dev",
+      from: "FreeBara <noreply@freebara.com>",
       to: email,
       subject: "Votre code de connexion FreeBara",
       html: `
@@ -163,6 +163,7 @@ export const sendOTPEmail = async (email: string, code: string) => {
 
     console.log("📧 Email OTP envoyé avec succès à", email);
     console.log("📨 Resend response:", result);
+
   } catch (error) {
     console.error("❌ Erreur Resend:", error);
   }
@@ -1387,7 +1388,7 @@ async function startServer() {
   // ════════════════════════════════════════════════════════════════════════
   // 📁 FICHIERS STATIQUES (Frontend React)
   // ════════════════════════════════════════════════════════════════════════
-const distPath = __dirname;
+     const distPath = __dirname;
 
   // ════════════════════════════════════════════════════════════════════════
   // 📁 FICHIERS STATIQUES (Frontend React) — TOUJOURS EN DERNIER
