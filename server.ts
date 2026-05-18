@@ -1387,8 +1387,7 @@ async function startServer() {
   // ════════════════════════════════════════════════════════════════════════
   // 📁 FICHIERS STATIQUES (Frontend React)
   // ════════════════════════════════════════════════════════════════════════
-
- const distPath = path.join(__dirname, 'dist');
+const distPath = __dirname;
 
   // ════════════════════════════════════════════════════════════════════════
   // 📁 FICHIERS STATIQUES (Frontend React) — TOUJOURS EN DERNIER
