@@ -1393,12 +1393,16 @@ async function startServer() {
   // ════════════════════════════════════════════════════════════════════════
   // 📁 FICHIERS STATIQUES (Frontend React) — TOUJOURS EN DERNIER
   // ════════════════════════════════════════════════════════════════════════
-  app.use(express.static(distPath));
+app.use(express.static(distPath));
 
-  // ✅ React Router fallback — ne jamais intercepter /api
-  app.get('*', (req, res) => {
-    res.sendFile(path.join(distPath, 'index.html'));
-  });
+// React Router fallback
+app.get('*', (req, res) => {
+  if (req.path.startsWith('/api')) {
+    return res.status(404).json({ error: 'API route not found' });
+  }
+
+  res.sendFile(path.join(distPath, 'index.html'));
+});
 
   // ════════════════════════════════════════════════════════════════════════
   // 💾 BACKUP AUTOMATIQUE (toutes les 24h)
