@@ -17,6 +17,7 @@ import { Resend } from "resend";
 import pkg               from 'pg';
 
 const IS_DEV     = process.env.NODE_ENV !== 'production';
+
 // ─── JSON BODY PARSER (utilisé uniquement dans startServer) ──────
 const { Pool } = pkg;
 
@@ -44,7 +45,6 @@ const JWT_SECRET = process.env.JWT_SECRET || 'dev-only-secret-change-in-prod';
 // Note: en prod, le process.exit(1) ci-dessus empêche d'atteindre cette ligne sans JWT_SECRET
 
 const PORT       = parseInt(process.env.PORT || '3000');
-
 
 // ─── POSTGRESQL ───────────────────────────────────────────────────────────────
 const pool = new Pool({
@@ -736,37 +736,42 @@ async function initDB() {
   `);
 
   // ── Index de performance ──
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_posts_author        ON posts("authorId");
-    CREATE INDEX IF NOT EXISTS idx_posts_created       ON posts("createdAt" DESC);
-    CREATE INDEX IF NOT EXISTS idx_posts_category      ON posts(category);
-    CREATE INDEX IF NOT EXISTS idx_messages_sender     ON messages("senderId");
-    CREATE INDEX IF NOT EXISTS idx_messages_receiver   ON messages("receiverId");
-    CREATE INDEX IF NOT EXISTS idx_messages_room       ON messages("roomId");
-    CREATE INDEX IF NOT EXISTS idx_notifications_user  ON notifications("userId");
-    CREATE INDEX IF NOT EXISTS idx_notifications_read  ON notifications("userId", read) WHERE read = FALSE;
-    CREATE INDEX IF NOT EXISTS idx_follows_follower    ON follows("followerId");
-    CREATE INDEX IF NOT EXISTS idx_follows_following   ON follows("followingId");
-    CREATE INDEX IF NOT EXISTS idx_tasks_user          ON tasks("userId");
-    CREATE INDEX IF NOT EXISTS idx_tasks_status        ON tasks("userId", status);
-    CREATE INDEX IF NOT EXISTS idx_services_provider   ON services("providerId");
-    CREATE INDEX IF NOT EXISTS idx_services_category   ON services(category);
-    CREATE INDEX IF NOT EXISTS idx_service_apps_service ON service_applications("serviceId");
-    CREATE INDEX IF NOT EXISTS idx_service_apps_user    ON service_applications("userId");
-    CREATE INDEX IF NOT EXISTS idx_companies_owner     ON companies("ownerId");
-    CREATE INDEX IF NOT EXISTS idx_catalog_company     ON company_catalog("companyId");
-    CREATE INDEX IF NOT EXISTS idx_catalog_category    ON company_catalog(category);
-    CREATE INDEX IF NOT EXISTS idx_events_creator      ON events("creatorId");
-    CREATE INDEX IF NOT EXISTS idx_events_start        ON events("startDate");
-    CREATE INDEX IF NOT EXISTS idx_pannel_members_user ON pannel_members("userId");
-    CREATE INDEX IF NOT EXISTS idx_pannel_courses_panel ON pannel_courses("pannelId");
-    CREATE INDEX IF NOT EXISTS idx_pannel_progress_user ON pannel_progress("userId");
-    CREATE INDEX IF NOT EXISTS idx_cell_members_user   ON cell_members("userId");
-    CREATE INDEX IF NOT EXISTS idx_stories_user        ON stories("userId");
-    CREATE INDEX IF NOT EXISTS idx_stories_expires     ON stories("expiresAt");
-    CREATE INDEX IF NOT EXISTS idx_post_likes_post     ON post_likes("postId");
-    CREATE INDEX IF NOT EXISTS idx_post_comments_post  ON post_comments("postId");
-  `);
+  try {
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_posts_author        ON posts("authorId");
+      CREATE INDEX IF NOT EXISTS idx_posts_created       ON posts("createdAt" DESC);
+      CREATE INDEX IF NOT EXISTS idx_posts_category      ON posts(category);
+      CREATE INDEX IF NOT EXISTS idx_messages_sender     ON messages("senderId");
+      CREATE INDEX IF NOT EXISTS idx_messages_receiver   ON messages("receiverId");
+      CREATE INDEX IF NOT EXISTS idx_messages_room       ON messages("roomId");
+      CREATE INDEX IF NOT EXISTS idx_notifications_user  ON notifications("userId");
+      CREATE INDEX IF NOT EXISTS idx_notifications_read  ON notifications("userId", read) WHERE read = FALSE;
+      CREATE INDEX IF NOT EXISTS idx_follows_follower    ON follows("followerId");
+      CREATE INDEX IF NOT EXISTS idx_follows_following   ON follows("followingId");
+      CREATE INDEX IF NOT EXISTS idx_tasks_user          ON tasks("userId");
+      CREATE INDEX IF NOT EXISTS idx_tasks_status        ON tasks("userId", status);
+      CREATE INDEX IF NOT EXISTS idx_services_provider   ON services("providerId");
+      CREATE INDEX IF NOT EXISTS idx_services_category   ON services(category);
+      CREATE INDEX IF NOT EXISTS idx_service_apps_service ON service_applications("serviceId");
+      CREATE INDEX IF NOT EXISTS idx_service_apps_user    ON service_applications("userId");
+      CREATE INDEX IF NOT EXISTS idx_companies_owner     ON companies("ownerId");
+      CREATE INDEX IF NOT EXISTS idx_catalog_company     ON company_catalog("companyId");
+      CREATE INDEX IF NOT EXISTS idx_catalog_category    ON company_catalog(category);
+      CREATE INDEX IF NOT EXISTS idx_events_creator      ON events("creatorId");
+      CREATE INDEX IF NOT EXISTS idx_events_start        ON events("startDate");
+      CREATE INDEX IF NOT EXISTS idx_pannel_members_user ON pannel_members("userId");
+      CREATE INDEX IF NOT EXISTS idx_pannel_courses_panel ON pannel_courses("pannelId");
+      CREATE INDEX IF NOT EXISTS idx_pannel_progress_user ON pannel_progress("userId");
+      CREATE INDEX IF NOT EXISTS idx_cell_members_user   ON cell_members("userId");
+      CREATE INDEX IF NOT EXISTS idx_stories_user        ON stories("userId");
+      CREATE INDEX IF NOT EXISTS idx_stories_expires     ON stories("expiresAt");
+      CREATE INDEX IF NOT EXISTS idx_post_likes_post     ON post_likes("postId");
+      CREATE INDEX IF NOT EXISTS idx_post_comments_post  ON post_comments("postId");
+    `);
+    console.log('✅ Index créés');
+  } catch (e: any) {
+    console.warn('⚠️  Certains index non créés (migration requise?):', e.message);
+  }
 
   console.log('✅ Toutes les tables PostgreSQL sont prêtes');
 }
