@@ -292,10 +292,13 @@ export default function Profile() {
 
   const handleNextStep = () => {
     if (editStep === 1) {
-      if (!formData.name || !formData.age || !formData.maritalStatus || !formData.profession || !formData.country) {
-        toast.error('Veuillez remplir tous les champs obligatoires (Nom, Âge, Statut, Profession, Pays) pour continuer.');
+      // Étape 1 : seul le nom est obligatoire
+    if (editStep === 1) {
+      if (!formData.name || formData.name.trim().length < 2) {
+        toast.error('Le nom est obligatoire pour continuer.');
         return;
       }
+    }
     }
     setEditStep(prev => prev + 1);
   };
@@ -411,6 +414,18 @@ export default function Profile() {
           visibility: userData.visibility || 'public',
           externalPortfolioUrl: userData.externalPortfolioUrl || ''
         });
+
+        // 🆕 Ouvrir automatiquement le modal pour les nouveaux comptes
+        const isNewAccount = !userData.name && !userData.profession;
+        if (isNewAccount && !userId) {
+          setEditStep(1);
+          setIsEditModalOpen(true);
+          toast('👋 Bienvenue ! Complétez votre profil pour commencer.', {
+            icon: '✨',
+            duration: 4000,
+            style: { borderRadius: '12px', background: '#1e293b', color: '#fff' },
+          });
+        }
         
         // Fetch data for the profile
         const [eventsData, servicesData, networkData, certsData, favCompaniesData, allCompaniesData, postsData] = await Promise.all([
@@ -498,25 +513,19 @@ export default function Profile() {
 
   const handleUpdate = async (e: React.FormEvent) => {
     e.preventDefault();
-    
-    // Validation
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    const phoneRegex = /^\+?[1-9]\d{1,14}$/;
 
-    if (!formData.name || formData.name.trim().length < 3) {
-      toast.error('Le nom d\'utilisateur doit contenir au moins 3 caractères.');
+    // Validation minimale — seul le nom est obligatoire
+    if (!formData.name || formData.name.trim().length < 2) {
+      toast.error('Le nom doit contenir au moins 2 caractères.');
       return;
     }
-    if (!emailRegex.test(formData.email)) {
-      toast.error('Veuillez entrer une adresse email valide.');
+    if (formData.age && (parseInt(formData.age) < 13 || parseInt(formData.age) > 120)) {
+      toast.error('Veuillez entrer un âge valide (entre 13 et 120 ans).');
       return;
     }
-    if (formData.age && (formData.age < 18 || formData.age > 120)) {
-      toast.error('Veuillez entrer un âge valide (entre 18 et 120 ans).');
-      return;
-    }
+    const phoneRegex = /^\+?[1-9]\d{6,14}$/;
     if (formData.whatsapp && !phoneRegex.test(formData.whatsapp.replace(/\s/g, ''))) {
-      toast.error('Veuillez entrer un numéro WhatsApp valide (ex: +2250102030405).');
+      toast.error('Numéro WhatsApp invalide (ex: +2250102030405).');
       return;
     }
 
@@ -595,6 +604,14 @@ export default function Profile() {
   const handleLogout = () => {
     localStorage.removeItem('token');
     navigate('/login');
+  };
+
+  // 🆕 Calcul complétion profil
+  const profileCompletion = () => {
+    if (!user) return 0;
+    const fields = ['name','profession','country','bio','avatarUrl','skills','goals','company','phone'];
+    const filled = fields.filter(f => user[f] && String(user[f]).trim().length > 0).length;
+    return Math.round((filled / fields.length) * 100);
   };
 
   const generateAvatar = async () => {

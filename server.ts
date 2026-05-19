@@ -50,9 +50,11 @@ const PORT       = parseInt(process.env.PORT || '3000');
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_URL!.includes('localhost') ? false : { rejectUnauthorized: false },
-  max: 20,
+  max: 10,                    // Render Starter: max 10 connexions simultanées
+  min: 2,                     // garder 2 connexions chaudes
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 10000,
+  statement_timeout: 15000,   // tuer les requêtes > 15s (prévient les freezes)
 });
 
 // Helper raccourci
@@ -62,12 +64,184 @@ const db = {
   run: (sql: string, p?: any[]) => pool.query(sql, p),
 };
 
-// ─── LOGS ─────────────────────────────────────────────────────────────────────
+// ─── MIGRATIONS POSTGRESQL PROPRES ───────────────────────────────────────────
+async function runMigrations() {
+  // Table de suivi des migrations
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS migrations (
+      id         SERIAL PRIMARY KEY,
+      name       TEXT UNIQUE NOT NULL,
+      "appliedAt" TIMESTAMP DEFAULT NOW()
+    )
+  `);
+
+  const applied = new Set((await pool.query(`SELECT name FROM migrations`)).rows.map((r: any) => r.name));
+
+  const migrations: { name: string; sql: string }[] = [
+    {
+      name: '001_add_last_seen_users',
+      sql: `ALTER TABLE users ADD COLUMN IF NOT EXISTS "lastSeen" TIMESTAMP;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS "loginCount" INTEGER DEFAULT 0;`
+    },
+    {
+      name: '002_add_permissions_table',
+      sql: `CREATE TABLE IF NOT EXISTS permissions (
+              id          SERIAL PRIMARY KEY,
+              "userId"    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+              resource    TEXT NOT NULL,
+              action      TEXT NOT NULL,
+              granted     BOOLEAN DEFAULT TRUE,
+              "grantedBy" INTEGER,
+              "createdAt" TIMESTAMP DEFAULT NOW(),
+              UNIQUE("userId", resource, action)
+            );`
+    },
+    {
+      name: '003_add_user_sessions',
+      sql: `CREATE TABLE IF NOT EXISTS user_sessions (
+              id         TEXT PRIMARY KEY,
+              "userId"   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+              ip         TEXT,
+              "userAgent" TEXT,
+              "createdAt" TIMESTAMP DEFAULT NOW(),
+              "lastActiveAt" TIMESTAMP DEFAULT NOW(),
+              active     BOOLEAN DEFAULT TRUE
+            );
+            CREATE INDEX IF NOT EXISTS idx_sessions_user ON user_sessions("userId");`
+    },
+    {
+      name: '004_add_audit_trail',
+      sql: `CREATE TABLE IF NOT EXISTS audit_trail (
+              id         SERIAL PRIMARY KEY,
+              "userId"   INTEGER,
+              action     TEXT NOT NULL,
+              resource   TEXT,
+              "resourceId" INTEGER,
+              ip         TEXT,
+              "userAgent" TEXT,
+              before     JSONB,
+              after      JSONB,
+              "createdAt" TIMESTAMP DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_trail("userId");
+            CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_trail("createdAt" DESC);`
+    },
+    {
+      name: '005_add_metrics_table',
+      sql: `CREATE TABLE IF NOT EXISTS metrics (
+              id        SERIAL PRIMARY KEY,
+              name      TEXT NOT NULL,
+              value     NUMERIC(10,2) NOT NULL,
+              tags      JSONB,
+              "createdAt" TIMESTAMP DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_metrics_name ON metrics(name, "createdAt" DESC);`
+    },
+    {
+      name: '007_add_profile_fields',
+      sql: `ALTER TABLE users ADD COLUMN IF NOT EXISTS age INTEGER;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS "maritalStatus" TEXT;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS whatsapp TEXT;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS "externalPortfolioUrl" TEXT;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS "companyId" INTEGER REFERENCES companies(id) ON DELETE SET NULL;`
+    },
+  ];
+
+  for (const m of migrations) {
+    if (applied.has(m.name)) continue;
+    try {
+      await pool.query(m.sql);
+      await pool.query(`INSERT INTO migrations(name) VALUES($1)`, [m.name]);
+      console.log(`✅ Migration appliquée: ${m.name}`);
+    } catch (e: any) {
+      console.warn(`⚠️ Migration échouée (${m.name}): ${e.message}`);
+    }
+  }
+}
+
+// ─── SYSTÈME DE PERMISSIONS GRANULAIRES ──────────────────────────────────────
+const ROLE_PERMISSIONS: Record<string, string[]> = {
+  user:      ['posts:read','posts:write','messages:read','messages:write','profile:read','profile:write','companies:read','events:read'],
+  moderator: ['posts:read','posts:write','posts:delete','messages:read','users:read','reports:read','reports:write','companies:read','events:read','events:delete'],
+  admin:     ['*'], // tout
+};
+
+const hasPermission = async (userId: number, role: string, resource: string, action: string): Promise<boolean> => {
+  const key = `${resource}:${action}`;
+  const rolePerms = ROLE_PERMISSIONS[role] ?? [];
+  if (rolePerms.includes('*') || rolePerms.includes(key)) return true;
+  // Vérifier permissions individuelles en base
+  try {
+    const p = await db.one(`SELECT granted FROM permissions WHERE "userId"=$1 AND resource=$2 AND action=$3`, [userId, resource, action]);
+    return p?.granted === true;
+  } catch { return false; }
+};
+
+const requirePermission = (resource: string, action: string) =>
+  async (req: any, res: any, next: any) => {
+    const ok = await hasPermission(req.userId, req.userRole, resource, action);
+    if (!ok) return res.status(403).json({ error: `Permission refusée: ${resource}:${action}` });
+    next();
+  };
+
+// ─── MONITORING & MÉTRIQUES ───────────────────────────────────────────────────
+const metrics = {
+  requests: 0,
+  errors:   0,
+  dbQueries: 0,
+  activeConnections: 0,
+  responseTimesMs: [] as number[],
+  recordResponseTime(ms: number) {
+    this.responseTimesMs.push(ms);
+    if (this.responseTimesMs.length > 1000) this.responseTimesMs.shift();
+  },
+  avgResponseTime() {
+    if (!this.responseTimesMs.length) return 0;
+    return Math.round(this.responseTimesMs.reduce((a, b) => a + b, 0) / this.responseTimesMs.length);
+  },
+  p95ResponseTime() {
+    if (!this.responseTimesMs.length) return 0;
+    const sorted = [...this.responseTimesMs].sort((a, b) => a - b);
+    return sorted[Math.floor(sorted.length * 0.95)];
+  },
+};
+
+// Enregistrer métriques en base toutes les 5 minutes
+setInterval(async () => {
+  try {
+    const poolStats = pool as any;
+    await pool.query(
+      `INSERT INTO metrics(name, value, tags) VALUES ($1,$2,$3),($4,$5,$6),($7,$8,$9),($10,$11,$12)`,
+      [
+        'requests_total',    metrics.requests,    JSON.stringify({ period: '5m' }),
+        'errors_total',      metrics.errors,      JSON.stringify({ period: '5m' }),
+        'avg_response_ms',   metrics.avgResponseTime(), JSON.stringify({}),
+        'p95_response_ms',   metrics.p95ResponseTime(), JSON.stringify({}),
+      ]
+    );
+    metrics.requests = 0;
+    metrics.errors   = 0;
+  } catch {}
+}, 5 * 60000);
+
+
 const logAction = async (level: string, action: string, userId?: number, ip?: string, details?: string) => {
   try {
     await pool.query(
       `INSERT INTO db_logs (level, action, "userId", ip, details) VALUES ($1,$2,$3,$4,$5)`,
       [level, action, userId ?? null, ip ?? null, details ?? null]
+    );
+  } catch {}
+};
+
+// ─── AUDIT TRAIL ─────────────────────────────────────────────────────────────
+const audit = async (req: any, action: string, resource: string, resourceId?: number, before?: any, after?: any) => {
+  try {
+    await pool.query(
+      `INSERT INTO audit_trail("userId",action,resource,"resourceId",ip,"userAgent",before,after) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [req.userId ?? null, action, resource, resourceId ?? null, req.ip ?? null, req.headers?.['user-agent'] ?? null,
+       before ? JSON.stringify(before) : null, after ? JSON.stringify(after) : null]
     );
   } catch {}
 };
@@ -85,6 +259,43 @@ const errorTracker = {
 };
 process.on('uncaughtException',  (e) => errorTracker.capture(e, 'uncaughtException'));
 process.on('unhandledRejection', (e) => errorTracker.capture(e, 'unhandledRejection'));
+
+// ─── CACHE IN-MEMORY (sans Redis, 100% Render) ────────────────────────────────
+const cache = new Map<string, { data: any; exp: number }>();
+const cacheGet = (key: string) => {
+  const e = cache.get(key);
+  if (!e || Date.now() > e.exp) { cache.delete(key); return null; }
+  return e.data;
+};
+const cacheSet = (key: string, data: any, ttlMs = 30000) =>
+  cache.set(key, { data, exp: Date.now() + ttlMs });
+const cacheDel = (...patterns: string[]) => {
+  for (const k of cache.keys())
+    if (patterns.some(p => k.startsWith(p))) cache.delete(k);
+};
+setInterval(() => { const n = Date.now(); for (const [k, v] of cache) if (n > v.exp) cache.delete(k); }, 2 * 60000);
+
+// ─── WORKER QUEUE (jobs async sans Redis) ────────────────────────────────────
+type Job = { type: string; payload: any; retries: number };
+const jobQueue: Job[] = [];
+let jobRunning = false;
+const enqueueJob = (type: string, payload: any) => jobQueue.push({ type, payload, retries: 0 });
+const processJobs = async () => {
+  if (jobRunning || jobQueue.length === 0) return;
+  jobRunning = true;
+  const job = jobQueue.shift()!;
+  try {
+    if (job.type === 'send_email') await sendOTPEmail(job.payload.email, job.payload.code);
+    else if (job.type === 'log')   await logAction(job.payload.level, job.payload.action, job.payload.userId, job.payload.ip, job.payload.details);
+    else if (job.type === 'notif') {
+      await pool.query(`INSERT INTO notifications("userId",type,content,"relatedId") VALUES($1,$2,$3,$4)`, [job.payload.userId, job.payload.type, job.payload.content, job.payload.relatedId]);
+    }
+  } catch (e: any) {
+    if (job.retries < 3) { job.retries++; jobQueue.unshift(job); }
+    else console.error(`[QUEUE] Job ${job.type} échoué après 3 tentatives: ${e.message}`);
+  } finally { jobRunning = false; }
+};
+setInterval(processJobs, 300);
 
 // ─── CLOUDINARY (upload images) ───────────────────────────────────────────────
 const uploadToCloudinary = async (base64Data: string, folder = 'freebara'): Promise<string> => {
@@ -274,6 +485,9 @@ async function initDB() {
       "postId"    INTEGER PRIMARY KEY,
       "userId"    INTEGER NOT NULL,
       amount      NUMERIC(10,2) NOT NULL,
+      "createdAt" TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS stories (
       id          SERIAL PRIMARY KEY,
       "userId"    INTEGER NOT NULL,
       "mediaUrl"  TEXT NOT NULL,
@@ -782,6 +996,7 @@ async function initDB() {
 // ════════════════════════════════════════════════════════════════════════════
 async function startServer() {
   await initDB();
+  await runMigrations();
 
   const app        = express();
   const httpServer = createServer(app);
@@ -795,51 +1010,88 @@ async function startServer() {
   app.use(express.json({ limit: '50mb' }));
   app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-  // Headers sécurité
-  app.use((req, res, next) => {
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('X-Frame-Options', 'DENY');
-    res.setHeader('X-XSS-Protection', '1; mode=block');
-    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
-    next();
-  });
- 
-  // Rate limiting (anti-abus)
-  const rlMap = new Map<string, { count: number; reset: number }>();
-  const rateLimit = (max: number, ms: number) => (req: any, res: any, next: any) => {
-    const ip = req.ip ?? 'x';
-    const now = Date.now();
-    const e = rlMap.get(ip);
-    if (!e || now > e.reset) { rlMap.set(ip, { count: 1, reset: now + ms }); return next(); }
-    e.count++;
-    if (e.count > max) {
-      logAction('WARN', 'rate_limit', undefined, ip, req.path);
-      return res.status(429).json({ error: 'Trop de requêtes. Réessayez dans un instant.' });
-    }
-    next();
-  };
-  setInterval(() => { const n = Date.now(); for (const [k, v] of rlMap) if (n > v.reset) rlMap.delete(k); }, 60000);
-  app.use('/api/auth', rateLimit(10, 60000));   // 10 tentatives auth/minute
-  app.use('/api',      rateLimit(300, 60000));  // 300 requêtes API/minute
-
-  // Logger
-  app.use((req, res, next) => {
-    console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
+  // ─── SÉCURITÉ HEADERS RENFORCÉS ──────────────────────────────────────────
+  app.use((req: any, res: any, next: any) => {
+    res.setHeader('X-Content-Type-Options',            'nosniff');
+    res.setHeader('X-Frame-Options',                   'DENY');
+    res.setHeader('X-XSS-Protection',                  '1; mode=block');
+    res.setHeader('Referrer-Policy',                   'strict-origin-when-cross-origin');
+    res.setHeader('Permissions-Policy',                'camera=(), microphone=(), geolocation=()');
+    res.setHeader('Strict-Transport-Security',         'max-age=31536000; includeSubDomains');
+    res.setHeader('Content-Security-Policy',           "default-src 'self'; connect-src 'self' https://api.cloudinary.com wss://www.freebara.com");
     next();
   });
 
-  // ─── MIDDLEWARE AUTHENTIFICATION ──────────────────────────────────────────
+  // ─── MONITORING MIDDLEWARE (métriques + logs structurés) ─────────────────
+  app.use((req: any, res: any, next: any) => {
+    const start = Date.now();
+    metrics.requests++;
+    res.on('finish', () => {
+      const ms = Date.now() - start;
+      metrics.recordResponseTime(ms);
+      if (res.statusCode >= 400) metrics.errors++;
+      const log = `${req.method} ${req.path} ${res.statusCode} ${ms}ms ip=${req.ip}`;
+      if      (res.statusCode >= 500) { console.error('🔴 ' + log); }
+      else if (res.statusCode >= 400) { console.warn ('🟡 ' + log); }
+      else if (ms > 3000)             { console.warn ('🐢 SLOW ' + log); }
+      if (res.statusCode >= 500) enqueueJob('log', { level: 'ERROR', action: 'http_500', ip: req.ip, details: log });
+    });
+    next();
+  });
+  // ─── RATE LIMITING AVANCÉ ─────────────────────────────────────────────────
+  type RLEntry = { count: number; reset: number; blocked?: number };
+  const rlMap = new Map<string, RLEntry>();
+  const rateLimit = (max: number, ms: number, blockMs = 0) =>
+    (req: any, res: any, next: any) => {
+      const key = `${req.ip ?? 'x'}:${req.path}`;
+      const now = Date.now();
+      let e = rlMap.get(key);
+      if (e?.blocked && now < e.blocked) {
+        res.setHeader('Retry-After', Math.ceil((e.blocked - now) / 1000));
+        return res.status(429).json({ error: 'Trop de tentatives. Réessayez plus tard.' });
+      }
+      if (!e || now > e.reset) { rlMap.set(key, { count: 1, reset: now + ms }); return next(); }
+      e.count++;
+      if (e.count > max) {
+        if (blockMs) e.blocked = now + blockMs;
+        res.setHeader('Retry-After', Math.ceil((e.reset - now) / 1000));
+        enqueueJob('log', { level: 'WARN', action: 'rate_limit', ip: req.ip, details: req.path });
+        return res.status(429).json({ error: 'Trop de requêtes. Réessayez dans un instant.' });
+      }
+      next();
+    };
+  setInterval(() => { const n = Date.now(); for (const [k, v] of rlMap) if (n > v.reset && (!v.blocked || n > v.blocked)) rlMap.delete(k); }, 5 * 60000);
+  // 5 tentatives OTP/10min puis blocage 1h
+  app.use('/api/auth/request-otp', rateLimit(5,  10 * 60000, 60 * 60000));
+  app.use('/api/auth/verify-otp',  rateLimit(10, 10 * 60000, 30 * 60000));
+  app.use('/api/auth',             rateLimit(20, 60000));
+  app.use('/api',                  rateLimit(300, 60000));
+
+  // Monitoring middleware déjà déclaré ci-dessus
+
+  // ─── MIDDLEWARE AUTHENTIFICATION (cache + session + lastSeen) ────────────
   const authenticate = async (req: any, res: any, next: any) => {
     const token = req.headers.authorization?.split(' ')[1];
     if (!token) return res.status(401).json({ error: 'Non autorisé' });
     try {
       const decoded = jwt.verify(token, JWT_SECRET) as { userId: number };
-      const user    = await db.one(`SELECT id, status, role FROM users WHERE id=$1`, [decoded.userId]);
+      const cacheKey = `auth:${decoded.userId}`;
+      let user = cacheGet(cacheKey);
+      if (!user) {
+        user = await db.one(`SELECT id, status, role FROM users WHERE id=$1`, [decoded.userId]);
+        if (user) cacheSet(cacheKey, user, 30000);
+      }
       if (!user)             return res.status(401).json({ error: 'Utilisateur introuvable' });
       if (user.status === 'banned')
         return res.status(403).json({ error: 'Compte suspendu. Contactez le support FreeBara.' });
       req.userId   = decoded.userId;
       req.userRole = user.role;
+      // Mettre à jour lastSeen toutes les 5 minutes (via cache pour éviter spam DB)
+      const lsKey = `lastseen:${decoded.userId}`;
+      if (!cacheGet(lsKey)) {
+        pool.query(`UPDATE users SET "lastSeen"=NOW() WHERE id=$1`, [decoded.userId]).catch(() => {});
+        cacheSet(lsKey, true, 5 * 60000);
+      }
       next();
     } catch {
       res.status(401).json({ error: 'Session expirée. Veuillez vous reconnecter.' });
@@ -862,8 +1114,18 @@ async function startServer() {
   // ════════════════════════════════════════════════════════════════════════
   app.get('/api/health', async (_, res) => {
     try {
+      const start = Date.now();
       await pool.query('SELECT 1');
-      res.json({ status: 'ok', db: 'postgresql', time: new Date() });
+      res.json({
+        status: 'ok',
+        db: 'postgresql',
+        dbLatency: `${Date.now() - start}ms`,
+        uptime: `${Math.floor(process.uptime())}s`,
+        memory: `${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB`,
+        cacheSize: cache.size,
+        queueSize: jobQueue.length,
+        time: new Date()
+      });
     } catch {
       res.status(500).json({ status: 'error', db: 'disconnected' });
     }
@@ -900,8 +1162,11 @@ async function startServer() {
     const ip = req.ip ?? '';
     if (!email || !isValidEmail(email)) return res.status(400).json({ error: 'Email invalide' });
     try {
-      const otp = await db.one(`SELECT email, code, "expiresAt" FROM otps WHERE email=$1`, [email]);
-      if (!otp || otp.code !== code || new Date(otp.expiresAt) < new Date()) {
+      const otp = await db.one(
+        `SELECT email, code FROM otps WHERE email=$1 AND "expiresAt" > NOW()`,
+        [email]
+      );
+      if (!otp || otp.code !== code) {
         await logAction('WARN', 'otp_failed', undefined, ip, email);
         return res.status(400).json({ error: 'Code invalide ou expiré' });
       }
@@ -924,6 +1189,7 @@ async function startServer() {
         await logAction('INFO', 'user_login', user.id, ip, email);
       }
       await pool.query(`DELETE FROM otps WHERE email=$1`, [email]);
+      await pool.query(`UPDATE users SET "loginCount"=COALESCE("loginCount",0)+1,"lastSeen"=NOW() WHERE id=$1`, [user.id]);
       const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '30d' });
       res.json({ token, user });
     } catch (e: any) {
@@ -937,26 +1203,48 @@ async function startServer() {
   // ════════════════════════════════════════════════════════════════════════
   app.get('/api/users/me', authenticate, async (req: any, res) => {
     try {
-      const u = await db.one(`SELECT id, email, name, profession, bio, company, "avatarUrl", "coverUrl", phone, location, website, church, groups, interests, skills, marketing, goals, badge, "referralCode", balance, role, status, visibility, country, "createdAt", "notificationPreferences" FROM users WHERE id=$1`, [req.userId]);
-      if (!u) return res.status(404).json({ error: 'Introuvable' });
-      // JSONB: pg retourne déjà un objet JS, pas besoin de JSON.parse
-      if (!u.notificationPreferences) u.notificationPreferences = {};
-      const conn = await db.one(`SELECT COUNT(*) as n FROM follows WHERE "followerId"=$1 OR "followingId"=$1`, [req.userId]);
-      const badges: string[] = [];
-      if (conn.n >= 100) badges.push('Super Connecteur');
-      if (conn.n >= 50)  badges.push('Réseauteur Actif');
-      if (conn.n >= 10)  badges.push('Sociable');
-      u.badges = badges;
+      const cacheKey = `profile:${req.userId}`;
+      let u = cacheGet(cacheKey);
+      if (!u) {
+        u = await db.one(`SELECT id, email, name, profession, bio, company, "companyId", "avatarUrl", "coverUrl", phone, location, website, church, groups, interests, skills, marketing, goals, badge, "referralCode", balance, role, status, visibility, country, age, "maritalStatus", whatsapp, "externalPortfolioUrl", "createdAt", "notificationPreferences", "lastSeen", "loginCount" FROM users WHERE id=$1`, [req.userId]);
+        if (!u) return res.status(404).json({ error: 'Introuvable' });
+        if (!u.notificationPreferences) u.notificationPreferences = {};
+        // Calcul badges (mis en cache aussi)
+        const conn = await db.one(`SELECT COUNT(*) as n FROM follows WHERE "followerId"=$1 OR "followingId"=$1`, [req.userId]);
+        const badges: string[] = [];
+        if (conn.n >= 100) badges.push('Super Connecteur');
+        if (conn.n >= 50)  badges.push('Réseauteur Actif');
+        if (conn.n >= 10)  badges.push('Sociable');
+        u.badges = badges;
+        cacheSet(cacheKey, u, 60000); // cache 60s
+      }
       res.json(u);
     } catch (e: any) { errorTracker.capture(e, 'get-me'); res.status(500).json({ error: 'Erreur' }); }
   });
 
   app.put('/api/users/me', authenticate, async (req: any, res) => {
-    const { name,profession,bio,company,avatarUrl,coverUrl,phone,location,website,church,groups,interests,skills,marketing,goals,notificationPreferences,visibility,country } = req.body;
+    const {
+      name, profession, bio, company, companyId, avatarUrl, coverUrl,
+      phone, location, website, church, groups, interests, skills,
+      marketing, goals, notificationPreferences, visibility, country,
+      age, maritalStatus, whatsapp, externalPortfolioUrl
+    } = req.body;
     await pool.query(
-      `UPDATE users SET name=$1,profession=$2,bio=$3,company=$4,"avatarUrl"=$5,"coverUrl"=$6,phone=$7,location=$8,website=$9,church=$10,groups=$11,interests=$12,skills=$13,marketing=$14,goals=$15,"notificationPreferences"=$16,visibility=$17,country=$18 WHERE id=$19`,
-      [name,profession,bio,company,avatarUrl,coverUrl,phone,location,website,church,groups,interests,skills,marketing,goals,notificationPreferences ?? null,visibility,country,req.userId]
+      `UPDATE users SET
+        name=$1, profession=$2, bio=$3, company=$4, "companyId"=$5,
+        "avatarUrl"=$6, "coverUrl"=$7, phone=$8, location=$9, website=$10,
+        church=$11, groups=$12, interests=$13, skills=$14, marketing=$15,
+        goals=$16, "notificationPreferences"=$17, visibility=$18, country=$19,
+        age=$20, "maritalStatus"=$21, whatsapp=$22, "externalPortfolioUrl"=$23
+       WHERE id=$24`,
+      [name, profession, bio, company, companyId ?? null,
+       avatarUrl, coverUrl, phone, location, website,
+       church, groups, interests, skills, marketing,
+       goals, notificationPreferences ?? null, visibility, country,
+       age ?? null, maritalStatus ?? null, whatsapp ?? null, externalPortfolioUrl ?? null,
+       req.userId]
     );
+    cacheDel(`profile:${req.userId}`, `auth:${req.userId}`);
     res.json({ success: true });
   });
 
@@ -1006,8 +1294,10 @@ async function startServer() {
     try {
       await pool.query(`INSERT INTO follows("followerId","followingId") VALUES($1,$2)`, [req.userId, req.params.id]);
       const f = await db.one(`SELECT name FROM users WHERE id=$1`, [req.userId]);
-      const n = await db.one(`INSERT INTO notifications("userId",type,content,"relatedId") VALUES($1,'follow',$2,$3) RETURNING *`, [req.params.id, `${f.name} a commencé à vous suivre.`, req.userId]);
-      io.to(`user_${req.params.id}`).emit('notification', { ...n, read: false });
+      // Notification via queue (non-bloquant)
+      enqueueJob('notif', { userId: req.params.id, type: 'follow', content: `${f.name} a commencé à vous suivre.`, relatedId: req.userId });
+      const n = { type: 'follow', content: `${f.name} a commencé à vous suivre.`, read: false, createdAt: new Date() };
+      io.to(`user_${req.params.id}`).emit('notification', n);
       res.json({ success: true });
     } catch { res.status(400).json({ error: 'Déjà suivi' }); }
   });
@@ -1041,9 +1331,21 @@ async function startServer() {
   // ════════════════════════════════════════════════════════════════════════
   app.get('/api/posts', authenticate, async (req: any, res) => {
     try {
-      const page=parseInt(req.query.page)||1; const limit=parseInt(req.query.limit)||10; const offset=(page-1)*limit;
-      const {category,country,feedType,search}=req.query as any; const authorId=req.query.authorId?parseInt(req.query.authorId):null;
-      let q=`SELECT p.*,u.name as "authorName",u."avatarUrl" as "authorAvatar",u.profession as "authorProfession",u.country as "authorCountry",(SELECT COUNT(*) FROM post_likes WHERE "postId"=p.id) as "likesCount",(SELECT COUNT(*) FROM post_comments WHERE "postId"=p.id) as "commentsCount",(SELECT type FROM post_likes WHERE "postId"=p.id AND "userId"=$1) as "myReactionType",EXISTS(SELECT 1 FROM post_boosts WHERE "postId"=p.id) as "isBoosted" FROM posts p JOIN users u ON p."authorId"=u.id WHERE 1=1`;
+      const page=parseInt(req.query.page as string)||1;
+      const limit=Math.min(parseInt(req.query.limit as string)||10, 50); // max 50
+      const offset=(page-1)*limit;
+      const {category,country,feedType,search}=req.query as any;
+      const authorId=req.query.authorId?parseInt(req.query.authorId as string):null;
+
+      // Cache uniquement le feed public page 1 sans filtres (le plus chargé)
+      const isPublicFeed = !authorId && !feedType && !category && !country && !search && page === 1;
+      const cacheKey = `posts:public:${req.userId}`;
+      if (isPublicFeed) {
+        const cached = cacheGet(cacheKey);
+        if (cached) return res.json(cached);
+      }
+
+      let q=`SELECT p.id,p."authorId",p.content,p.category,p."mediaUrls",p.views,p."createdAt",p."cellId",u.name as "authorName",u."avatarUrl" as "authorAvatar",u.profession as "authorProfession",u.country as "authorCountry",(SELECT COUNT(*) FROM post_likes WHERE "postId"=p.id) as "likesCount",(SELECT COUNT(*) FROM post_comments WHERE "postId"=p.id) as "commentsCount",(SELECT type FROM post_likes WHERE "postId"=p.id AND "userId"=$1) as "myReactionType",EXISTS(SELECT 1 FROM post_boosts WHERE "postId"=p.id) as "isBoosted" FROM posts p JOIN users u ON p."authorId"=u.id WHERE 1=1`;
       const p:any[]=[req.userId]; let i=2;
       if(authorId){q+=` AND p."authorId"=$${i++}`;p.push(authorId);}
       if(feedType==='network'){q+=` AND p."authorId" IN(SELECT "followingId" FROM follows WHERE "followerId"=$${i++})`;p.push(req.userId);}
@@ -1051,7 +1353,10 @@ async function startServer() {
       if(country&&country!=='Tous'){q+=` AND u.country=$${i++}`;p.push(country);}
       if(search){q+=` AND(p.content ILIKE $${i} OR u.name ILIKE $${i})`;p.push(`%${search}%`);i++;}
       q+=` ORDER BY "isBoosted" DESC,p."createdAt" DESC LIMIT $${i++} OFFSET $${i++}`;p.push(limit,offset);
-      res.json(await db.all(q,p));
+
+      const result = await db.all(q, p);
+      if (isPublicFeed) cacheSet(cacheKey, result, 15000); // cache 15s
+      res.json(result);
     } catch(e:any){errorTracker.capture(e,'get-posts');res.status(500).json({error:'Erreur'});}
   });
 
@@ -1059,6 +1364,7 @@ async function startServer() {
     const { content, category, mediaUrls, cellId } = req.body;
     if (!content && (!mediaUrls || !mediaUrls.length)) return res.status(400).json({ error: 'Contenu requis' });
     const post = await db.one(`INSERT INTO posts("authorId",content,category,"mediaUrls","cellId") VALUES($1,$2,$3,$4,$5) RETURNING *`, [req.userId,content||'',category||'Tous',mediaUrls ?? null,cellId||null]);
+    cacheDel('posts:public:'); // invalider cache feed
     res.json(post);
   });
 
@@ -1149,10 +1455,28 @@ async function startServer() {
   // ════════════════════════════════════════════════════════════════════════
   // 🏢 ENTREPRISES & BOUTIQUES
   // ════════════════════════════════════════════════════════════════════════
-  app.get('/api/companies',          authenticate, async (_, res) => res.json(await db.all(`SELECT c.*,u.name as "ownerName" FROM companies c JOIN users u ON c."ownerId"=u.id ORDER BY c."createdAt" DESC`, [])));
-  app.get('/api/companies/new',      authenticate, async (_, res) => res.json(await db.all(`SELECT id, "ownerId", name, sector, description, "logoUrl", "coverUrl", country, city, "isShop", "createdAt" FROM companies ORDER BY "createdAt" DESC LIMIT 10`, [])));
-  app.get('/api/companies/trending', authenticate, async (_, res) => res.json(await db.all(`SELECT c.*,(SELECT COUNT(*) FROM favorite_companies WHERE "companyId"=c.id) as fav FROM companies c ORDER BY fav DESC LIMIT 10`, [])));
-  app.post('/api/companies',   authenticate, async (req: any, res) => { const {name,sector,description,address,whatsapp,facebook,twitter,linkedin,logoUrl,coverUrl,isShop,specialty,categories,country,city}=req.body; res.json(await db.one(`INSERT INTO companies("ownerId",name,sector,description,address,whatsapp,facebook,twitter,linkedin,"logoUrl","coverUrl","isShop",specialty,categories,country,city) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`,[req.userId,name,sector,description,address,whatsapp,facebook,twitter,linkedin,logoUrl,coverUrl,isShop||0,specialty,categories,country,city])); });
+  app.get('/api/companies',          authenticate, async (_, res) => {
+    const cached = cacheGet('companies:all');
+    if (cached) return res.json(cached);
+    const data = await db.all(`SELECT c.*,u.name as "ownerName" FROM companies c JOIN users u ON c."ownerId"=u.id ORDER BY c."createdAt" DESC`, []);
+    cacheSet('companies:all', data, 60000);
+    res.json(data);
+  });
+  app.get('/api/companies/new',      authenticate, async (_, res) => {
+    const cached = cacheGet('companies:new');
+    if (cached) return res.json(cached);
+    const data = await db.all(`SELECT id, "ownerId", name, sector, description, "logoUrl", "coverUrl", country, city, "isShop", "createdAt" FROM companies ORDER BY "createdAt" DESC LIMIT 10`, []);
+    cacheSet('companies:new', data, 60000);
+    res.json(data);
+  });
+  app.get('/api/companies/trending', authenticate, async (_, res) => {
+    const cached = cacheGet('companies:trending');
+    if (cached) return res.json(cached);
+    const data = await db.all(`SELECT c.*,(SELECT COUNT(*) FROM favorite_companies WHERE "companyId"=c.id) as fav FROM companies c ORDER BY fav DESC LIMIT 10`, []);
+    cacheSet('companies:trending', data, 120000); // 2min
+    res.json(data);
+  });
+  app.post('/api/companies',   authenticate, async (req: any, res) => { const {name,sector,description,address,whatsapp,facebook,twitter,linkedin,logoUrl,coverUrl,isShop,specialty,categories,country,city}=req.body; const r=await db.one(`INSERT INTO companies("ownerId",name,sector,description,address,whatsapp,facebook,twitter,linkedin,"logoUrl","coverUrl","isShop",specialty,categories,country,city) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`,[req.userId,name,sector,description,address,whatsapp,facebook,twitter,linkedin,logoUrl,coverUrl,isShop||false,specialty,categories,country,city]); cacheDel('companies:'); res.json(r); });
   app.put('/api/companies/:id', authenticate, async (req: any, res) => { const {name,sector,description,address,whatsapp,logoUrl,coverUrl,isShop,specialty,categories,country,city}=req.body; await pool.query(`UPDATE companies SET name=$1,sector=$2,description=$3,address=$4,whatsapp=$5,"logoUrl"=$6,"coverUrl"=$7,"isShop"=$8,specialty=$9,categories=$10,country=$11,city=$12 WHERE id=$13 AND "ownerId"=$14`,[name,sector,description,address,whatsapp,logoUrl,coverUrl,isShop,specialty,categories,country,city,req.params.id,req.userId]); res.json({success:true}); });
   app.delete('/api/companies/:id', authenticate, async (req: any, res) => { await pool.query(`DELETE FROM companies WHERE id=$1 AND "ownerId"=$2`,[req.params.id,req.userId]); res.json({success:true}); });
   app.post('/api/companies/:id/favorite',   authenticate, async (req: any, res) => { try { await pool.query(`INSERT INTO favorite_companies("userId","companyId") VALUES($1,$2) ON CONFLICT DO NOTHING`,[req.userId,req.params.id]); } catch {} res.json({success:true}); });
@@ -1181,13 +1505,38 @@ async function startServer() {
   // 💬 MESSAGERIE
   // ════════════════════════════════════════════════════════════════════════
   app.get('/api/conversations', authenticate, async (req: any, res) => {
-    const direct = await db.all(`SELECT u.id,u.name,u."avatarUrl",MAX(m."createdAt") as "lastMessageAt",(SELECT content FROM messages WHERE(("senderId"=u.id AND "receiverId"=$1) OR("senderId"=$1 AND "receiverId"=u.id)) AND "roomId" IS NULL ORDER BY "createdAt" DESC LIMIT 1) as "lastMessage",(SELECT COUNT(*) FROM messages WHERE "senderId"=u.id AND "receiverId"=$1 AND read=0 AND "roomId" IS NULL) as "unreadCount",'direct' as type FROM users u JOIN messages m ON u.id=m."senderId" OR u.id=m."receiverId" WHERE(m."senderId"=$1 OR m."receiverId"=$1) AND u.id!=$1 AND m."roomId" IS NULL GROUP BY u.id,u.name,u."avatarUrl"`, [req.userId]);
-    const rooms  = await db.all(`SELECT cr.id,cr.name,cr."avatarUrl",MAX(m."createdAt") as "lastMessageAt",(SELECT content FROM messages WHERE "roomId"=cr.id ORDER BY "createdAt" DESC LIMIT 1) as "lastMessage",(SELECT COUNT(*) FROM messages WHERE "roomId"=cr.id AND read=0 AND "senderId"!=$1) as "unreadCount",cr.type FROM chat_rooms cr JOIN chat_room_members crm ON cr.id=crm."roomId" LEFT JOIN messages m ON cr.id=m."roomId" WHERE crm."userId"=$1 GROUP BY cr.id`, [req.userId]);
-    res.json([...direct, ...rooms].sort((a: any, b: any) => new Date(b.lastMessageAt || 0).getTime() - new Date(a.lastMessageAt || 0).getTime()));
+    try {
+      const direct = await db.all(`
+        SELECT u.id,u.name,u."avatarUrl",
+          MAX(m."createdAt") as "lastMessageAt",
+          (SELECT content FROM messages WHERE(("senderId"=u.id AND "receiverId"=$1) OR("senderId"=$1 AND "receiverId"=u.id)) AND "roomId" IS NULL ORDER BY "createdAt" DESC LIMIT 1) as "lastMessage",
+          (SELECT COUNT(*) FROM messages WHERE "senderId"=u.id AND "receiverId"=$1 AND read=FALSE AND "roomId" IS NULL) as "unreadCount",
+          'direct' as type
+        FROM users u
+        JOIN messages m ON (u.id=m."senderId" OR u.id=m."receiverId")
+        WHERE (m."senderId"=$1 OR m."receiverId"=$1) AND u.id!=$1 AND m."roomId" IS NULL
+        GROUP BY u.id,u.name,u."avatarUrl"`, [req.userId]);
+
+      const rooms = await db.all(`
+        SELECT cr.id,cr.name,cr."avatarUrl",
+          MAX(m."createdAt") as "lastMessageAt",
+          (SELECT content FROM messages WHERE "roomId"=cr.id ORDER BY "createdAt" DESC LIMIT 1) as "lastMessage",
+          (SELECT COUNT(*) FROM messages WHERE "roomId"=cr.id AND read=FALSE AND "senderId"!=$1) as "unreadCount",
+          cr.type
+        FROM chat_rooms cr
+        JOIN chat_room_members crm ON cr.id=crm."roomId"
+        LEFT JOIN messages m ON cr.id=m."roomId"
+        WHERE crm."userId"=$1
+        GROUP BY cr.id`, [req.userId]);
+
+      res.json([...direct, ...rooms].sort((a: any, b: any) =>
+        new Date(b.lastMessageAt || 0).getTime() - new Date(a.lastMessageAt || 0).getTime()
+      ));
+    } catch (e: any) { errorTracker.capture(e, 'conversations'); res.status(500).json({ error: 'Erreur' }); }
   });
   app.get('/api/messages/:userId',    authenticate, async (req: any, res) => res.json(await db.all(`SELECT m.*,u.name as "senderName",u."avatarUrl" as "senderAvatar" FROM messages m JOIN users u ON m."senderId"=u.id WHERE(m."senderId"=$1 AND m."receiverId"=$2) OR(m."senderId"=$2 AND m."receiverId"=$1) ORDER BY m."createdAt" ASC`,[req.userId,req.params.userId])));
   app.post('/api/messages/:userId',   authenticate, async (req: any, res) => { const {content,fileUrl,fileType,fileName}=req.body; const msg=await db.one(`INSERT INTO messages("senderId","receiverId",content,"fileUrl","fileType","fileName") VALUES($1,$2,$3,$4,$5,$6) RETURNING *`,[req.userId,req.params.userId,content||'',fileUrl,fileType,fileName]); const s=await db.one(`SELECT name,"avatarUrl" FROM users WHERE id=$1`,[req.userId]); const full={...msg,senderName:s.name,senderAvatar:s.avatarurl}; io.to(`user_${req.params.userId}`).emit('new_message',full); res.json(full); });
-  app.put('/api/messages/:userId/read',  authenticate, async (req: any, res) => { await pool.query(`UPDATE messages SET read=1 WHERE "senderId"=$1 AND "receiverId"=$2`,[req.params.userId,req.userId]); res.json({success:true}); });
+  app.put('/api/messages/:userId/read',  authenticate, async (req: any, res) => { await pool.query(`UPDATE messages SET read=TRUE WHERE "senderId"=$1 AND "receiverId"=$2`,[req.params.userId,req.userId]); res.json({success:true}); });
   app.delete('/api/messages/:userId/history', authenticate, async (req: any, res) => { await pool.query(`DELETE FROM messages WHERE("senderId"=$1 AND "receiverId"=$2) OR("senderId"=$2 AND "receiverId"=$1)`,[req.userId,req.params.userId]); res.json({success:true}); });
   app.delete('/api/messages/:userId',    authenticate, async (req: any, res) => { await pool.query(`DELETE FROM messages WHERE("senderId"=$1 AND "receiverId"=$2) OR("senderId"=$2 AND "receiverId"=$1)`,[req.userId,req.params.userId]); res.json({success:true}); });
   app.delete('/api/messages/item/:id',   authenticate, async (req: any, res) => { await pool.query(`DELETE FROM messages WHERE id=$1 AND "senderId"=$2`,[req.params.id,req.userId]); res.json({success:true}); });
@@ -1310,8 +1659,8 @@ async function startServer() {
   // ════════════════════════════════════════════════════════════════════════
   // 🛡️  PANEL ADMIN (Sécurisé)
   // ════════════════════════════════════════════════════════════════════════
-  app.get('/api/admin/stats',     authenticate, requireAdmin,      async (_, res) => {
-    const [u,a,b,p,r,t,w] = await Promise.all([
+  app.get('/api/admin/stats',     authenticate, requireAdmin, async (_, res) => {
+    const [u,a,b,p,r,t,w,msg,comp] = await Promise.all([
       db.one(`SELECT COUNT(*) as c FROM users`),
       db.one(`SELECT COUNT(*) as c FROM users WHERE status='active'`),
       db.one(`SELECT COUNT(*) as c FROM users WHERE status='banned'`),
@@ -1319,12 +1668,24 @@ async function startServer() {
       db.one(`SELECT COUNT(*) as c FROM reports WHERE status='pending'`),
       db.one(`SELECT COUNT(*) as c FROM users WHERE "createdAt"::date=CURRENT_DATE`),
       db.one(`SELECT COUNT(*) as c FROM users WHERE "createdAt">=NOW()-INTERVAL '7 days'`),
+      db.one(`SELECT COUNT(*) as c FROM messages WHERE "createdAt">=NOW()-INTERVAL '24 hours'`),
+      db.one(`SELECT COUNT(*) as c FROM companies`),
     ]);
-    res.json({ totalUsers:u.c, activeUsers:a.c, bannedUsers:b.c, totalPosts:p.c, pendingReports:r.c, newUsersToday:t.c, newUsersWeek:w.c });
+    res.json({ totalUsers:u.c, activeUsers:a.c, bannedUsers:b.c, totalPosts:p.c, pendingReports:r.c, newUsersToday:t.c, newUsersWeek:w.c, messagesLast24h:msg.c, totalCompanies:comp.c });
   });
   app.get('/api/admin/users',     authenticate, requireAdmin,      async (req: any, res) => { const {search,status,role}=req.query as any; let q=`SELECT id,email,name,country,role,status,badge,"bannedReason","createdAt" FROM users WHERE 1=1`; const p:any[]=[]; let i=1; if(search){q+=` AND(name ILIKE $${i} OR email ILIKE $${i})`;p.push(`%${search}%`);i++;} if(status){q+=` AND status=$${i++}`;p.push(status);} if(role){q+=` AND role=$${i++}`;p.push(role);} q+=` ORDER BY "createdAt" DESC`; res.json(await db.all(q,p)); });
   app.put('/api/admin/users/:id/role',  authenticate, requireSuperAdmin, async (req: any, res) => { const {role}=req.body; if(!['user','moderator','admin'].includes(role)) return res.status(400).json({error:'Rôle invalide'}); await pool.query(`UPDATE users SET role=$1 WHERE id=$2`,[role,req.params.id]); await pool.query(`INSERT INTO admin_logs("adminId",action,"targetId",details) VALUES($1,'change_role',$2,$3)`,[req.userId,req.params.id,`→${role}`]); await logAction('ADMIN','change_role',req.userId,req.ip,`User ${req.params.id}→${role}`); res.json({success:true}); });
-  app.put('/api/admin/users/:id/ban',   authenticate, requireAdmin,      async (req: any, res) => { if(Number(req.params.id)===req.userId) return res.status(400).json({error:'Impossible de se bannir'}); const {reason}=req.body; await pool.query(`UPDATE users SET status='banned',"bannedReason"=$1 WHERE id=$2`,[reason||'Violation des règles',req.params.id]); await pool.query(`INSERT INTO admin_logs("adminId",action,"targetId",details) VALUES($1,'ban_user',$2,$3)`,[req.userId,req.params.id,reason]); await logAction('ADMIN','ban_user',req.userId,req.ip,`User ${req.params.id}: ${reason}`); res.json({success:true}); });
+  app.put('/api/admin/users/:id/ban',   authenticate, requireAdmin, async (req: any, res) => {
+    if(Number(req.params.id)===req.userId) return res.status(400).json({error:'Impossible de se bannir'});
+    const {reason}=req.body;
+    const before = await db.one(`SELECT status FROM users WHERE id=$1`,[req.params.id]);
+    await pool.query(`UPDATE users SET status='banned',"bannedReason"=$1 WHERE id=$2`,[reason||'Violation des règles',req.params.id]);
+    await pool.query(`INSERT INTO admin_logs("adminId",action,"targetId",details) VALUES($1,'ban_user',$2,$3)`,[req.userId,req.params.id,reason]);
+    await audit(req,'ban','users',Number(req.params.id),before,{status:'banned',reason});
+    cacheDel(`auth:${req.params.id}`,`profile:${req.params.id}`);
+    await logAction('ADMIN','ban_user',req.userId,req.ip,`User ${req.params.id}: ${reason}`);
+    res.json({success:true});
+  });
   app.put('/api/admin/users/:id/unban', authenticate, requireAdmin,      async (req: any, res) => { await pool.query(`UPDATE users SET status='active',"bannedReason"=NULL WHERE id=$1`,[req.params.id]); await pool.query(`INSERT INTO admin_logs("adminId",action,"targetId") VALUES($1,'unban_user',$2)`,[req.userId,req.params.id]); res.json({success:true}); });
   app.delete('/api/admin/users/:id',    authenticate, requireSuperAdmin, async (req: any, res) => { if(Number(req.params.id)===req.userId) return res.status(400).json({error:'Impossible'}); await pool.query(`DELETE FROM users WHERE id=$1`,[req.params.id]); await pool.query(`INSERT INTO admin_logs("adminId",action,"targetId") VALUES($1,'delete_user',$2)`,[req.userId,req.params.id]); await logAction('ADMIN','delete_user',req.userId,req.ip,`User ${req.params.id}`); res.json({success:true}); });
   app.get('/api/admin/reports',         authenticate, requireAdmin,      async (_, res) => res.json(await db.all(`SELECT r.*,u.name as "reporterName",u.email as "reporterEmail" FROM reports r JOIN users u ON r."reporterId"=u.id ORDER BY r."createdAt" DESC`,[])));
@@ -1333,34 +1694,102 @@ async function startServer() {
   app.get('/api/admin/logs',            authenticate, requireAdmin,      async (_, res) => res.json(await db.all(`SELECT al.*,u.name as "adminName" FROM admin_logs al JOIN users u ON al."adminId"=u.id ORDER BY al."createdAt" DESC LIMIT 200`,[])));
   app.get('/api/admin/db-logs',         authenticate, requireSuperAdmin, async (_, res) => res.json(await db.all(`SELECT id, level, action, "userId", ip, details, "createdAt" FROM db_logs ORDER BY "createdAt" DESC LIMIT 500`,[])));
   app.get('/api/admin/errors',          authenticate, requireSuperAdmin, (_, res) => res.json(errorTracker.errors));
-  app.post('/api/admin/backup',         authenticate, requireSuperAdmin, async (req: any, res) => {
-    try {
-      const [users, posts, companies] = await Promise.all([
-        db.all(`SELECT id,email,name,country,role,status,"createdAt" FROM users`, []),
-        db.all(`SELECT id,"authorId",content,"createdAt" FROM posts ORDER BY "createdAt" DESC LIMIT 5000`, []),
-        db.all(`SELECT id, "ownerId", name, sector, country, city, "createdAt" FROM companies`, []),
-      ]);
-      await logAction('ADMIN', 'backup_triggered', req.userId, req.ip, `${users.length} users`);
-      res.json({ success: true, timestamp: new Date(), counts: { users: users.length, posts: posts.length, companies: companies.length }, data: { users, posts, companies } });
-    } catch { res.status(500).json({ error: 'Backup échoué' }); }
-  });
-  app.get('/api/admin/health-full', authenticate, requireSuperAdmin, async (_, res) => {
-    const dbOk = await pool.query('SELECT 1').then(() => true).catch(() => false);
-    const users = await db.one(`SELECT COUNT(*) as c FROM users`);
-    res.json({
-      status: dbOk ? 'healthy' : 'degraded',
-      db: dbOk ? 'connected' : 'error',
-      uptime: Math.floor(process.uptime()) + 's',
-      memory: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + 'MB',
-      users: users.c,
-      recentErrors: errorTracker.errors.slice(0, 5),
-      env: { cloudinary: !!process.env.CLOUDINARY_URL, smtp: !!process.env.SMTP_USER, jwt: !!process.env.JWT_SECRET },
-    });
+
+  // ── Surveillance utilisateurs ──────────────────────────────────────────────
+  app.get('/api/admin/users/online',    authenticate, requireAdmin, async (_, res) => {
+    const onlineUsers = await db.all(
+      `SELECT id,name,email,profession,country,"avatarUrl","lastSeen","loginCount","createdAt"
+       FROM users WHERE "lastSeen" >= NOW()-INTERVAL '15 minutes' ORDER BY "lastSeen" DESC`, []
+    );
+    res.json({ count: onlineUsers.length, users: onlineUsers });
   });
 
+  app.get('/api/admin/users/activity',  authenticate, requireAdmin, async (req: any, res) => {
+    const days = parseInt(req.query.days as string) || 7;
+    const activity = await db.all(
+      `SELECT DATE("createdAt") as date, COUNT(*) as new_users FROM users
+       WHERE "createdAt" >= NOW()-INTERVAL '${days} days' GROUP BY DATE("createdAt") ORDER BY date ASC`, []
+    );
+    const logins = await db.all(
+      `SELECT DATE("createdAt") as date, COUNT(*) as logins FROM db_logs
+       WHERE action IN('user_login','register') AND "createdAt">=NOW()-INTERVAL '${days} days'
+       GROUP BY DATE("createdAt") ORDER BY date ASC`, []
+    );
+    res.json({ activity, logins });
+  });
+
+  app.get('/api/admin/users/:id/profile', authenticate, requireAdmin, async (req: any, res) => {
+    const u = await db.one(
+      `SELECT id,email,name,profession,country,role,status,badge,"bannedReason","loginCount","lastSeen","createdAt"
+       FROM users WHERE id=$1`, [req.params.id]
+    );
+    if (!u) return res.status(404).json({ error: 'Introuvable' });
+    const [posts, companies, reports] = await Promise.all([
+      db.one(`SELECT COUNT(*) as c FROM posts WHERE "authorId"=$1`, [req.params.id]),
+      db.one(`SELECT COUNT(*) as c FROM companies WHERE "ownerId"=$1`, [req.params.id]),
+      db.one(`SELECT COUNT(*) as c FROM reports WHERE "reporterId"=$1`, [req.params.id]),
+    ]);
+    res.json({ ...u, stats: { posts: posts.c, companies: companies.c, reports: reports.c } });
+  });
+
+  // ── Métriques & monitoring ────s──────────────────────────────────────────────
+  app.get('/api/admin/metrics',         authenticate, requireSuperAdmin, async (req: any, res) => {
+    const hours = parseInt(req.query.hours as string) || 24;
+    const m = await db.all(
+      `SELECT name, AVG(value) as avg, MAX(value) as max, MIN(value) as min,
+              DATE_TRUNC('hour',"createdAt") as hour
+       FROM metrics WHERE "createdAt">=NOW()-INTERVAL '${hours} hours'
+       GROUP BY name, hour ORDER BY hour ASC`, []
+    );
+    res.json({ metrics: m, live: {
+      requests: metrics.requests,
+      errors: metrics.errors,
+      avgResponseMs: metrics.avgResponseTime(),
+      p95ResponseMs: metrics.p95ResponseTime(),
+      cacheSize: cache.size,
+      queueSize: jobQueue.length,
+      uptime: Math.floor(process.uptime()),
+      memoryMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+    }});
+  });
+
+  // ── Audit trail ─────────────────────────────────────────────────────────────
+  app.get('/api/admin/audit',           authenticate, requireSuperAdmin, async (req: any, res) => {
+    const {userId, resource, limit=100} = req.query as any;
+    let q = `SELECT at.*,u.name as "userName",u.email as "userEmail" FROM audit_trail at LEFT JOIN users u ON at."userId"=u.id WHERE 1=1`;
+    const p: any[] = []; let i = 1;
+    if (userId) { q += ` AND at."userId"=$${i++}`; p.push(userId); }
+    if (resource) { q += ` AND at.resource=$${i++}`; p.push(resource); }
+    q += ` ORDER BY at."createdAt" DESC LIMIT $${i}`; p.push(Math.min(parseInt(limit), 500));
+    res.json(await db.all(q, p));
+  });
+
+  // ── Gestion permissions ──────────────────────────────────────────────────────
+  app.get('/api/admin/users/:id/permissions',    authenticate, requireSuperAdmin, async (req: any, res) => {
+    res.json(await db.all(`SELECT * FROM permissions WHERE "userId"=$1`, [req.params.id]));
+  });
+  app.post('/api/admin/users/:id/permissions',   authenticate, requireSuperAdmin, async (req: any, res) => {
+    const {resource, action, granted=true} = req.body;
+    await pool.query(
+      `INSERT INTO permissions("userId",resource,action,granted,"grantedBy") VALUES($1,$2,$3,$4,$5)
+       ON CONFLICT("userId",resource,action) DO UPDATE SET granted=$4,"grantedBy"=$5`,
+      [req.params.id, resource, action, granted, req.userId]
+    );
+    cacheDel(`auth:${req.params.id}`);
+    res.json({ success: true });
+  });
+  app.delete('/api/admin/users/:id/permissions/:permId', authenticate, requireSuperAdmin, async (req: any, res) => {
+    await pool.query(`DELETE FROM permissions WHERE id=$1 AND "userId"=$2`, [req.params.permId, req.params.id]);
+    cacheDel(`auth:${req.params.id}`);
+    res.json({ success: true });
+  });
+
+  // ── Health-full enrichi ──────────────────────────────────────────────────────
   // ════════════════════════════════════════════════════════════════════════
   // 🔌 SOCKET.IO (Temps réel)
   // ════════════════════════════════════════════════════════════════════════
+  const onlineUsers = new Map<number, string>(); // userId → socketId
+
   io.use((socket, next) => {
     try {
       const token = socket.handshake.auth.token;
@@ -1374,15 +1803,28 @@ async function startServer() {
   });
 
   io.on('connection', (socket: any) => {
-    console.log(`🔌 User ${socket.userId} connecté`);
+    onlineUsers.set(socket.userId, socket.id);
     socket.join(`user_${socket.userId}`);
-    socket.on('disconnect',       () => console.log(`❌ User ${socket.userId} déconnecté`));
+    // Mettre à jour lastSeen
+    pool.query(`UPDATE users SET "lastSeen"=NOW() WHERE id=$1`, [socket.userId]).catch(() => {});
+    io.emit('online_count', onlineUsers.size);
+
+    socket.on('disconnect', () => {
+      onlineUsers.delete(socket.userId);
+      io.emit('online_count', onlineUsers.size);
+    });
     socket.on('join_room',        (roomId: any) => socket.join(`room_${roomId}`));
     socket.on('pin_message',      (d: any) => io.emit('message_pinned', d));
     socket.on('unpin_message',    (d: any) => io.emit('message_unpinned', d));
     socket.on('message_reaction', (d: any) => io.emit('message_reaction_updated', d));
     socket.on('message_edit',     (d: any) => io.emit('message_updated', d));
     socket.on('message_delete',   (d: any) => io.emit('message_deleted', d));
+    socket.on('typing',           (d: any) => socket.to(`user_${d.to}`).emit('typing', { from: socket.userId }));
+  });
+
+  // Route live online count
+  app.get('/api/admin/online-count', authenticate, requireAdmin, (_, res) => {
+    res.json({ count: onlineUsers.size, userIds: [...onlineUsers.keys()] });
   });
 
   // ════════════════════════════════════════════════════════════════════════
@@ -1404,16 +1846,30 @@ app.get('*', (req, res) => {
   res.sendFile(path.join(distPath, 'index.html'));
 });
 
-  // ════════════════════════════════════════════════════════════════════════
-  // 💾 BACKUP AUTOMATIQUE (toutes les 24h)
-  // ════════════════════════════════════════════════════════════════════════
+  // ─── KEEP-ALIVE (prévient les cold starts sur Render Starter) ────────────
+  const SELF_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+  setInterval(async () => {
+    try {
+      await fetch(`${SELF_URL}/api/health`);
+      console.log('💓 Keep-alive ping OK');
+    } catch { console.warn('⚠️ Keep-alive ping échoué'); }
+  }, 10 * 60 * 1000); // toutes les 10 minutes
+
+  // ─── BACKUP AUTOMATIQUE (stats toutes les 24h) ────────────────────────────
   const autoBackup = async () => {
     try {
-      const u = await db.one(`SELECT COUNT(*) as c FROM users`);
-      await logAction('INFO', 'auto_backup_check', undefined, undefined, `${u.c} users en base`);
-      console.log(`💾 Auto-backup: ${u.c} utilisateurs en base`);
+      const [u, c, p, m] = await Promise.all([
+        db.one(`SELECT COUNT(*) as c FROM users`),
+        db.one(`SELECT COUNT(*) as c FROM companies`),
+        db.one(`SELECT COUNT(*) as c FROM posts`),
+        db.one(`SELECT COUNT(*) as c FROM messages`),
+      ]);
+      const stats = `users:${u.c} companies:${c.c} posts:${p.c} messages:${m.c}`;
+      await logAction('INFO', 'auto_backup_check', undefined, undefined, stats);
+      console.log(`💾 Stats: ${stats}`);
     } catch (e: any) { errorTracker.capture(e, 'auto_backup'); }
   };
+  autoBackup(); // run au démarrage
   setInterval(autoBackup, 24 * 60 * 60 * 1000);
 
   // ════════════════════════════════════════════════════════════════════════
