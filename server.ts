@@ -15,6 +15,7 @@ import * as path         from 'path';
 import jwt               from 'jsonwebtoken';
 import { Resend } from "resend";
 import pkg               from 'pg';
+import { createHash }    from 'crypto';
 
 const IS_DEV     = process.env.NODE_ENV !== 'production';
 
@@ -63,6 +64,11 @@ const db = {
   all: async (sql: string, p?: any[]) => { const r = await pool.query(sql, p); return r.rows; },
   run: (sql: string, p?: any[]) => pool.query(sql, p),
 };
+
+// ─── HASHAGE OTP (sécurité : jamais stocker en clair) ────────────────────────
+const OTP_SALT = process.env.OTP_SALT || process.env.JWT_SECRET || 'freebara-otp-salt';
+const hashOtp = (code: string): string =>
+  createHash('sha256').update(code + OTP_SALT).digest('hex');
 
 // ─── MIGRATIONS POSTGRESQL PROPRES ───────────────────────────────────────────
 async function runMigrations() {
@@ -138,6 +144,11 @@ async function runMigrations() {
             CREATE INDEX IF NOT EXISTS idx_metrics_name ON metrics(name, "createdAt" DESC);`
     },
     {
+      name: '008_otp_security_index',
+      sql: `CREATE INDEX IF NOT EXISTS idx_otps_expires ON otps("expiresAt");
+            DELETE FROM otps WHERE "expiresAt" < NOW();`
+    },
+    {
       name: '007_add_profile_fields',
       sql: `ALTER TABLE users ADD COLUMN IF NOT EXISTS age INTEGER;
             ALTER TABLE users ADD COLUMN IF NOT EXISTS "maritalStatus" TEXT;
@@ -145,6 +156,86 @@ async function runMigrations() {
             ALTER TABLE users ADD COLUMN IF NOT EXISTS "externalPortfolioUrl" TEXT;
             ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT;
             ALTER TABLE users ADD COLUMN IF NOT EXISTS "companyId" INTEGER REFERENCES companies(id) ON DELETE SET NULL;`
+    },
+    {
+      name: '009_moderation_system',
+      sql: `
+        -- Enrichir la table reports existante
+        ALTER TABLE reports ADD COLUMN IF NOT EXISTS severity    TEXT DEFAULT 'medium' CHECK (severity IN ('low','medium','high','critical'));
+        ALTER TABLE reports ADD COLUMN IF NOT EXISTS "autoFlag"  BOOLEAN DEFAULT FALSE;
+        ALTER TABLE reports ADD COLUMN IF NOT EXISTS "aiScore"   NUMERIC(4,2);
+        ALTER TABLE reports ADD COLUMN IF NOT EXISTS "aiReason"  TEXT;
+        ALTER TABLE reports ADD COLUMN IF NOT EXISTS "reviewedBy" INTEGER;
+        ALTER TABLE reports ADD COLUMN IF NOT EXISTS "reviewedAt" TIMESTAMP;
+        ALTER TABLE reports ADD COLUMN IF NOT EXISTS "moderatorNote" TEXT;
+
+        -- Table de mots/phrases interdits (anti-spam / contenu dangereux)
+        CREATE TABLE IF NOT EXISTS moderation_rules (
+          id          SERIAL PRIMARY KEY,
+          pattern     TEXT NOT NULL UNIQUE,
+          type        TEXT NOT NULL CHECK (type IN ('spam','hate','violence','adult','scam','danger')),
+          severity    TEXT DEFAULT 'medium' CHECK (severity IN ('low','medium','high','critical')),
+          action      TEXT DEFAULT 'flag' CHECK (action IN ('flag','block','ban')),
+          "isActive"  BOOLEAN DEFAULT TRUE,
+          "createdBy" INTEGER,
+          "createdAt" TIMESTAMP DEFAULT NOW()
+        );
+
+        -- Historique des actions de modération
+        CREATE TABLE IF NOT EXISTS moderation_actions (
+          id              SERIAL PRIMARY KEY,
+          "moderatorId"   INTEGER,
+          "targetType"    TEXT NOT NULL,
+          "targetId"      INTEGER NOT NULL,
+          action          TEXT NOT NULL,
+          reason          TEXT,
+          "automated"     BOOLEAN DEFAULT FALSE,
+          "reportId"      INTEGER,
+          "createdAt"     TIMESTAMP DEFAULT NOW()
+        );
+
+        -- Compteur anti-spam par utilisateur
+        CREATE TABLE IF NOT EXISTS spam_counters (
+          "userId"        INTEGER PRIMARY KEY,
+          "postCount"     INTEGER DEFAULT 0,
+          "messageCount"  INTEGER DEFAULT 0,
+          "reportCount"   INTEGER DEFAULT 0,
+          "flagCount"     INTEGER DEFAULT 0,
+          "lastReset"     TIMESTAMP DEFAULT NOW(),
+          "isMuted"       BOOLEAN DEFAULT FALSE,
+          "mutedUntil"    TIMESTAMP
+        );
+
+        -- Index
+        CREATE INDEX IF NOT EXISTS idx_reports_status   ON reports(status, "createdAt" DESC);
+        CREATE INDEX IF NOT EXISTS idx_reports_target   ON reports("targetType","targetId");
+        CREATE INDEX IF NOT EXISTS idx_reports_autoflag ON reports("autoFlag") WHERE "autoFlag"=TRUE;
+        CREATE INDEX IF NOT EXISTS idx_mod_actions_mod  ON moderation_actions("moderatorId");
+        CREATE INDEX IF NOT EXISTS idx_mod_actions_target ON moderation_actions("targetType","targetId");
+
+        -- Règles de modération par défaut
+        INSERT INTO moderation_rules(pattern, type, severity, action) VALUES
+          ('whatsapp.com',     'spam',     'medium', 'flag'),
+          ('bit.ly',           'spam',     'medium', 'flag'),
+          ('tinyurl',          'spam',     'medium', 'flag'),
+          ('buy followers',    'spam',     'high',   'block'),
+          ('achetez maintenant','spam',    'low',    'flag'),
+          ('viagra',           'spam',     'high',   'block'),
+          ('nudes',            'adult',    'critical','block'),
+          ('attaque',          'violence', 'medium', 'flag'),
+          ('terroriste',       'danger',   'critical','block'),
+          ('explosif',         'danger',   'critical','block'),
+          ('arnaque',          'scam',     'high',   'flag'),
+          ('envoie argent',    'scam',     'high',   'block'),
+          ('wire transfer',    'scam',     'high',   'flag')
+        ON CONFLICT(pattern) DO NOTHING;
+      `
+    },
+    {
+      name: '010_privacy_policy',
+      sql: `ALTER TABLE users ADD COLUMN IF NOT EXISTS "privacyAccepted"   BOOLEAN DEFAULT FALSE;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS "privacyAcceptedAt" TIMESTAMP;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS "privacyVersion"    TEXT DEFAULT '1.0';`
     },
   ];
 
@@ -260,7 +351,172 @@ const errorTracker = {
 process.on('uncaughtException',  (e) => errorTracker.capture(e, 'uncaughtException'));
 process.on('unhandledRejection', (e) => errorTracker.capture(e, 'unhandledRejection'));
 
-// ─── CACHE IN-MEMORY (sans Redis, 100% Render) ────────────────────────────────
+// ─── MOTEUR DE MODÉRATION AUTOMATIQUE ────────────────────────────────────────
+// Analyse le contenu texte et retourne un score de risque 0-1 + catégorie
+const moderationCache = new Map<string, { score: number; reasons: string[]; action: string }>();
+
+const analyzeContent = async (text: string, userId: number): Promise<{
+  score: number; reasons: string[]; action: 'allow' | 'flag' | 'block'; severity: string;
+}> => {
+  if (!text || text.trim().length === 0) return { score: 0, reasons: [], action: 'allow', severity: 'low' };
+
+  const normalized = text.toLowerCase();
+  const cacheKey   = `modcache:${Buffer.from(normalized.substring(0, 100)).toString('base64')}`;
+  const cached     = cacheGet(cacheKey);
+  if (cached) return cached;
+
+  const reasons: string[] = [];
+  let score = 0;
+  let worstAction = 'allow';
+  let worstSeverity = 'low';
+
+  try {
+    // ── 1. Règles de la base de données ──────────────────────────────────
+    const rules = await db.all(
+      `SELECT pattern, type, severity, action FROM moderation_rules WHERE "isActive"=TRUE`,
+      []
+    );
+    for (const rule of rules) {
+      if (normalized.includes(rule.pattern.toLowerCase())) {
+        reasons.push(`${rule.type}: "${rule.pattern}"`);
+        const severityScore: Record<string, number> = { low: 0.2, medium: 0.4, high: 0.7, critical: 1.0 };
+        score = Math.max(score, severityScore[rule.severity] ?? 0.3);
+        if (rule.action === 'block' || worstAction === 'allow') worstAction = rule.action;
+        if (rule.action === 'block') worstAction = 'block';
+        else if (rule.action === 'flag' && worstAction !== 'block') worstAction = 'flag';
+        worstSeverity = rule.severity;
+      }
+    }
+
+    // ── 2. Heuristiques locales (sans API externe) ────────────────────────
+    // Répétition excessive (spam)
+    const words  = normalized.split(/\s+/);
+    const unique = new Set(words);
+    if (words.length > 10 && unique.size / words.length < 0.3) {
+      score = Math.max(score, 0.5);
+      reasons.push('spam: répétition excessive de mots');
+      if (worstAction === 'allow') worstAction = 'flag';
+    }
+
+    // Caps lock excessif (agressivité)
+    const capsRatio = (text.match(/[A-Z]/g)?.length ?? 0) / Math.max(text.length, 1);
+    if (text.length > 20 && capsRatio > 0.6) {
+      score = Math.max(score, 0.3);
+      reasons.push('comportement: texte en majuscules excessives');
+      if (worstAction === 'allow') worstAction = 'flag';
+    }
+
+    // Trop de liens (spam)
+    const linkCount = (text.match(/https?:\/\//g)?.length ?? 0);
+    if (linkCount > 3) {
+      score = Math.max(score, 0.5);
+      reasons.push(`spam: ${linkCount} liens détectés`);
+      if (worstAction === 'allow') worstAction = 'flag';
+    }
+
+    // Numéros de téléphone (phishing / spam)
+    const phonePattern = /(\+?\d[\s\-.]?){8,13}/g;
+    const phones = text.match(phonePattern);
+    if (phones && phones.length > 2) {
+      score = Math.max(score, 0.35);
+      reasons.push('spam: multiples numéros de téléphone');
+      if (worstAction === 'allow') worstAction = 'flag';
+    }
+
+    // ── 3. Anti-spam comportemental (fréquence) ───────────────────────────
+    const counter = await db.one(
+      `SELECT "postCount","messageCount","flagCount","isMuted","mutedUntil" FROM spam_counters WHERE "userId"=$1`,
+      [userId]
+    );
+    if (counter?.isMuted && counter.mutedUntil && new Date(counter.mutedUntil) > new Date()) {
+      return { score: 1, reasons: ['utilisateur muté'], action: 'block', severity: 'high' };
+    }
+    if ((counter?.postCount ?? 0) > 20) {
+      score = Math.max(score, 0.6);
+      reasons.push('spam: volume de publications élevé (>20 en 1h)');
+      worstAction = 'block';
+    }
+
+  } catch (e: any) {
+    console.warn('[MODERATION] Erreur analyse:', e.message);
+  }
+
+  const result = {
+    score: Math.min(1, score),
+    reasons,
+    action: worstAction as 'allow' | 'flag' | 'block',
+    severity: worstSeverity,
+  };
+
+  cacheSet(cacheKey, result, 60000); // cache 1 min
+  return result;
+};
+
+// Incrémenter le compteur spam d'un utilisateur
+const incrementSpamCounter = async (userId: number, type: 'post' | 'message' | 'flag') => {
+  const col = type === 'post' ? '"postCount"' : type === 'message' ? '"messageCount"' : '"flagCount"';
+  await pool.query(
+    `INSERT INTO spam_counters("userId", ${col})
+     VALUES($1, 1)
+     ON CONFLICT("userId") DO UPDATE SET ${col}=spam_counters.${col}+1`,
+    [userId]
+  ).catch(() => {});
+};
+
+// Remettre à zéro les compteurs toutes les heures
+setInterval(async () => {
+  await pool.query(
+    `UPDATE spam_counters SET "postCount"=0,"messageCount"=0,"lastReset"=NOW()
+     WHERE "lastReset" < NOW()-INTERVAL '1 hour'`
+  ).catch(() => {});
+}, 60 * 60 * 1000);
+
+// Créer automatiquement un signalement + action si critique
+const autoModerate = async (
+  content: string, userId: number,
+  targetType: string, targetId: number, ip: string
+) => {
+  const result = await analyzeContent(content, userId);
+  if (result.action === 'allow') return result;
+
+  // Enregistrer le signalement automatique
+  await pool.query(
+    `INSERT INTO reports("reporterId","targetType","targetId",reason,severity,"autoFlag","aiScore","aiReason",status)
+     VALUES($1,$2,$3,$4,$5,TRUE,$6,$7,$8)`,
+    [
+      userId, targetType, targetId,
+      `[AUTO] ${result.reasons.join(', ')}`,
+      result.severity,
+      result.score,
+      result.reasons.join(' | '),
+      result.action === 'block' ? 'action_taken' : 'pending',
+    ]
+  ).catch(() => {});
+
+  // Log action automatique
+  await pool.query(
+    `INSERT INTO moderation_actions("targetType","targetId",action,reason,"automated")
+     VALUES($1,$2,$3,$4,TRUE)`,
+    [targetType, targetId, result.action, result.reasons.join(', ')]
+  ).catch(() => {});
+
+  if (result.action === 'block' || result.score >= 0.7) {
+    await incrementSpamCounter(userId, 'flag');
+    // Muter automatiquement si flagCount > 5
+    const counter = await db.one(`SELECT "flagCount" FROM spam_counters WHERE "userId"=$1`, [userId]);
+    if ((counter?.flagCount ?? 0) >= 5) {
+      await pool.query(
+        `UPDATE spam_counters SET "isMuted"=TRUE,"mutedUntil"=NOW()+INTERVAL '24 hours' WHERE "userId"=$1`,
+        [userId]
+      ).catch(() => {});
+      await logAction('WARN', 'auto_muted', userId, ip, `flagCount atteint`);
+    }
+  }
+
+  return result;
+};
+
+
 const cache = new Map<string, { data: any; exp: number }>();
 const cacheGet = (key: string) => {
   const e = cache.get(key);
@@ -1146,7 +1402,7 @@ async function startServer() {
       const exp  = new Date(Date.now() + 10 * 60000);
       await pool.query(
         `INSERT INTO otps(email, code, "expiresAt") VALUES($1,$2,$3) ON CONFLICT(email) DO UPDATE SET code=$2,"expiresAt"=$3`,
-        [email, code, exp]
+        [email, hashOtp(code), exp]
       );
       await sendOTPEmail(email, code);
       await logAction('INFO', 'otp_requested', undefined, ip, email);
@@ -1166,7 +1422,7 @@ async function startServer() {
         `SELECT email, code FROM otps WHERE email=$1 AND "expiresAt" > NOW()`,
         [email]
       );
-      if (!otp || otp.code !== code) {
+      if (!otp || otp.code !== hashOtp(code)) {
         await logAction('WARN', 'otp_failed', undefined, ip, email);
         return res.status(400).json({ error: 'Code invalide ou expiré' });
       }
@@ -1276,11 +1532,15 @@ async function startServer() {
 
   app.get('/api/users', authenticate, async (req: any, res) => {
     const { country, profession } = req.query as any;
+    const page  = Math.max(1, parseInt(req.query.page as string) || 1);
+    const limit = Math.min(50, parseInt(req.query.limit as string) || 20);
+    const offset = (page - 1) * limit;
     let q = `SELECT id,name,profession,"avatarUrl",country,badge,company,role FROM users WHERE status='active'`;
     const p: any[] = []; let i = 1;
     if (country && country !== 'Tous') { q += ` AND country=$${i++}`; p.push(country); }
     if (profession) { q += ` AND profession ILIKE $${i++}`; p.push(`%${profession}%`); }
-    q += ' ORDER BY "createdAt" DESC LIMIT 100';
+    q += ` ORDER BY "createdAt" DESC LIMIT $${i++} OFFSET $${i++}`;
+    p.push(limit, offset);
     res.json(await db.all(q, p));
   });
 
@@ -1363,8 +1623,31 @@ async function startServer() {
   app.post('/api/posts', authenticate, async (req: any, res) => {
     const { content, category, mediaUrls, cellId } = req.body;
     if (!content && (!mediaUrls || !mediaUrls.length)) return res.status(400).json({ error: 'Contenu requis' });
-    const post = await db.one(`INSERT INTO posts("authorId",content,category,"mediaUrls","cellId") VALUES($1,$2,$3,$4,$5) RETURNING *`, [req.userId,content||'',category||'Tous',mediaUrls ?? null,cellId||null]);
-    cacheDel('posts:public:'); // invalider cache feed
+
+    // ── Modération automatique ─────────────────────────────────────────
+    if (content) {
+      const mod = await analyzeContent(content, req.userId);
+      if (mod.action === 'block') {
+        await incrementSpamCounter(req.userId, 'post');
+        return res.status(400).json({
+          error: 'Publication refusée : contenu inapproprié détecté.',
+          reasons: mod.reasons,
+        });
+      }
+    }
+
+    const post = await db.one(
+      `INSERT INTO posts("authorId",content,category,"mediaUrls","cellId") VALUES($1,$2,$3,$4,$5) RETURNING *`,
+      [req.userId, content || '', category || 'Tous', mediaUrls ?? null, cellId || null]
+    );
+
+    // Si flagué (mais pas bloqué), enregistrer en arrière-plan
+    if (content) {
+      autoModerate(content, req.userId, 'post', post.id, req.ip).catch(() => {});
+      incrementSpamCounter(req.userId, 'post').catch(() => {});
+    }
+
+    cacheDel('posts:public:');
     res.json(post);
   });
 
@@ -1535,7 +1818,29 @@ async function startServer() {
     } catch (e: any) { errorTracker.capture(e, 'conversations'); res.status(500).json({ error: 'Erreur' }); }
   });
   app.get('/api/messages/:userId',    authenticate, async (req: any, res) => res.json(await db.all(`SELECT m.*,u.name as "senderName",u."avatarUrl" as "senderAvatar" FROM messages m JOIN users u ON m."senderId"=u.id WHERE(m."senderId"=$1 AND m."receiverId"=$2) OR(m."senderId"=$2 AND m."receiverId"=$1) ORDER BY m."createdAt" ASC`,[req.userId,req.params.userId])));
-  app.post('/api/messages/:userId',   authenticate, async (req: any, res) => { const {content,fileUrl,fileType,fileName}=req.body; const msg=await db.one(`INSERT INTO messages("senderId","receiverId",content,"fileUrl","fileType","fileName") VALUES($1,$2,$3,$4,$5,$6) RETURNING *`,[req.userId,req.params.userId,content||'',fileUrl,fileType,fileName]); const s=await db.one(`SELECT name,"avatarUrl" FROM users WHERE id=$1`,[req.userId]); const full={...msg,senderName:s.name,senderAvatar:s.avatarurl}; io.to(`user_${req.params.userId}`).emit('new_message',full); res.json(full); });
+  app.post('/api/messages/:userId', authenticate, async (req: any, res) => {
+    const { content, fileUrl, fileType, fileName } = req.body;
+
+    // ── Modération automatique ─────────────────────────────────────────
+    if (content) {
+      const mod = await analyzeContent(content, req.userId);
+      if (mod.action === 'block') {
+        await incrementSpamCounter(req.userId, 'message');
+        return res.status(400).json({ error: 'Message refusé : contenu inapproprié.', reasons: mod.reasons });
+      }
+    }
+
+    const msg = await db.one(
+      `INSERT INTO messages("senderId","receiverId",content,"fileUrl","fileType","fileName") VALUES($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [req.userId, req.params.userId, content || '', fileUrl, fileType, fileName]
+    );
+    const s = await db.one(`SELECT name,"avatarUrl" FROM users WHERE id=$1`, [req.userId]);
+    const full = { ...msg, senderName: s.name, senderAvatar: s.avatarurl };
+    io.to(`user_${req.params.userId}`).emit('new_message', full);
+
+    if (content) incrementSpamCounter(req.userId, 'message').catch(() => {});
+    res.json(full);
+  });
   app.put('/api/messages/:userId/read',  authenticate, async (req: any, res) => { await pool.query(`UPDATE messages SET read=TRUE WHERE "senderId"=$1 AND "receiverId"=$2`,[req.params.userId,req.userId]); res.json({success:true}); });
   app.delete('/api/messages/:userId/history', authenticate, async (req: any, res) => { await pool.query(`DELETE FROM messages WHERE("senderId"=$1 AND "receiverId"=$2) OR("senderId"=$2 AND "receiverId"=$1)`,[req.userId,req.params.userId]); res.json({success:true}); });
   app.delete('/api/messages/:userId',    authenticate, async (req: any, res) => { await pool.query(`DELETE FROM messages WHERE("senderId"=$1 AND "receiverId"=$2) OR("senderId"=$2 AND "receiverId"=$1)`,[req.userId,req.params.userId]); res.json({success:true}); });
@@ -1638,7 +1943,40 @@ async function startServer() {
   app.post('/api/reviews',                        authenticate, async (req: any, res) => { const {targetType,targetId,rating,comment}=req.body; res.json(await db.one(`INSERT INTO reviews("userId","targetType","targetId",rating,comment) VALUES($1,$2,$3,$4,$5) RETURNING *`,[req.userId,targetType,targetId,rating,comment])); });
   app.post('/api/ads',                            authenticate, async (req: any, res) => { const {companyId,goal,content,targeting,budget,duration}=req.body; res.json(await db.one(`INSERT INTO ads("companyId",goal,content,targeting,budget,duration) VALUES($1,$2,$3,$4,$5,$6) RETURNING *`,[companyId,goal,content,targeting,budget,duration])); });
   app.get('/api/ads/:companyId',                  authenticate, async (req: any, res) => res.json(await db.all(`SELECT id, "companyId", goal, content, targeting, budget, duration, status, "createdAt" FROM ads WHERE "companyId"=$1`,[req.params.companyId])));
-  app.post('/api/reports',                        authenticate, async (req: any, res) => { const {targetType,targetId,reason}=req.body; if(!targetType||!targetId||!reason) return res.status(400).json({error:'Données manquantes'}); await pool.query(`INSERT INTO reports("reporterId","targetType","targetId",reason) VALUES($1,$2,$3,$4)`,[req.userId,targetType,targetId,reason]); res.json({success:true}); });
+  app.post('/api/reports', authenticate, async (req: any, res) => {
+    const { targetType, targetId, reason, details } = req.body;
+    if (!targetType || !targetId || !reason) return res.status(400).json({ error: 'Données manquantes' });
+
+    // Anti-abus : max 10 signalements par heure par utilisateur
+    const recentReports = await db.one(
+      `SELECT COUNT(*) as c FROM reports WHERE "reporterId"=$1 AND "createdAt">NOW()-INTERVAL '1 hour'`,
+      [req.userId]
+    );
+    if (parseInt(recentReports?.c ?? 0) >= 10) {
+      return res.status(429).json({ error: 'Trop de signalements. Réessayez plus tard.' });
+    }
+
+    await pool.query(
+      `INSERT INTO reports("reporterId","targetType","targetId",reason) VALUES($1,$2,$3,$4)`,
+      [req.userId, targetType, targetId, details ? `${reason} — ${details}` : reason]
+    );
+    await incrementSpamCounter(req.userId, 'flag');
+
+    // Vérifier si ce contenu a été signalé +3 fois → auto-escalade
+    const reportCount = await db.one(
+      `SELECT COUNT(*) as c FROM reports WHERE "targetType"=$1 AND "targetId"=$2 AND status='pending'`,
+      [targetType, targetId]
+    );
+    if (parseInt(reportCount?.c ?? 0) >= 3) {
+      await pool.query(
+        `UPDATE reports SET severity='high' WHERE "targetType"=$1 AND "targetId"=$2 AND status='pending'`,
+        [targetType, targetId]
+      );
+      await logAction('WARN', 'multi_report_escalated', req.userId, req.ip, `${targetType}:${targetId}`);
+    }
+
+    res.json({ success: true });
+  });
 
   // ════════════════════════════════════════════════════════════════════════
   // 📤 UPLOAD IMAGES (Cloudinary)
@@ -1688,9 +2026,169 @@ async function startServer() {
   });
   app.put('/api/admin/users/:id/unban', authenticate, requireAdmin,      async (req: any, res) => { await pool.query(`UPDATE users SET status='active',"bannedReason"=NULL WHERE id=$1`,[req.params.id]); await pool.query(`INSERT INTO admin_logs("adminId",action,"targetId") VALUES($1,'unban_user',$2)`,[req.userId,req.params.id]); res.json({success:true}); });
   app.delete('/api/admin/users/:id',    authenticate, requireSuperAdmin, async (req: any, res) => { if(Number(req.params.id)===req.userId) return res.status(400).json({error:'Impossible'}); await pool.query(`DELETE FROM users WHERE id=$1`,[req.params.id]); await pool.query(`INSERT INTO admin_logs("adminId",action,"targetId") VALUES($1,'delete_user',$2)`,[req.userId,req.params.id]); await logAction('ADMIN','delete_user',req.userId,req.ip,`User ${req.params.id}`); res.json({success:true}); });
-  app.get('/api/admin/reports',         authenticate, requireAdmin,      async (_, res) => res.json(await db.all(`SELECT r.*,u.name as "reporterName",u.email as "reporterEmail" FROM reports r JOIN users u ON r."reporterId"=u.id ORDER BY r."createdAt" DESC`,[])));
-  app.put('/api/admin/reports/:id',     authenticate, requireAdmin,      async (req: any, res) => { await pool.query(`UPDATE reports SET status=$1 WHERE id=$2`,[req.body.status,req.params.id]); res.json({success:true}); });
-  app.delete('/api/admin/posts/:id',    authenticate, requireAdmin,      async (req: any, res) => { await pool.query(`DELETE FROM posts WHERE id=$1`,[req.params.id]); await pool.query(`INSERT INTO admin_logs("adminId",action,"targetId") VALUES($1,'delete_post',$2)`,[req.userId,req.params.id]); res.json({success:true}); });
+  // ════════════════════════════════════════════════════════════════════════
+  // 🛡️  MODÉRATION — Panel admin complet
+  // ════════════════════════════════════════════════════════════════════════
+
+  // ── Liste des signalements (filtrable) ───────────────────────────────────
+  app.get('/api/admin/reports', authenticate, requireAdmin, async (req: any, res) => {
+    const { status = 'pending', severity, autoFlag, targetType, limit = 50 } = req.query as any;
+    let q = `SELECT r.*,
+               u.name as "reporterName", u.email as "reporterEmail",
+               m.name as "reviewerName"
+             FROM reports r
+             JOIN users u ON r."reporterId"=u.id
+             LEFT JOIN users m ON r."reviewedBy"=m.id
+             WHERE 1=1`;
+    const p: any[] = []; let i = 1;
+    if (status)     { q += ` AND r.status=$${i++}`;      p.push(status); }
+    if (severity)   { q += ` AND r.severity=$${i++}`;    p.push(severity); }
+    if (autoFlag)   { q += ` AND r."autoFlag"=$${i++}`;  p.push(autoFlag === 'true'); }
+    if (targetType) { q += ` AND r."targetType"=$${i++}`; p.push(targetType); }
+    q += ` ORDER BY r."createdAt" DESC LIMIT $${i}`; p.push(Math.min(parseInt(limit), 200));
+    res.json(await db.all(q, p));
+  });
+
+  // ── Résoudre un signalement ──────────────────────────────────────────────
+  app.put('/api/admin/reports/:id', authenticate, requireAdmin, async (req: any, res) => {
+    const { status, moderatorNote } = req.body;
+    if (!['pending','reviewed','action_taken','dismissed'].includes(status))
+      return res.status(400).json({ error: 'Statut invalide' });
+    await pool.query(
+      `UPDATE reports SET status=$1,"reviewedBy"=$2,"reviewedAt"=NOW(),"moderatorNote"=$3 WHERE id=$4`,
+      [status, req.userId, moderatorNote ?? null, req.params.id]
+    );
+    await pool.query(
+      `INSERT INTO moderation_actions("moderatorId","targetType","targetId",action,reason,"reportId")
+       SELECT $1,"targetType","targetId",$2,$3,id FROM reports WHERE id=$4`,
+      [req.userId, status, moderatorNote ?? '', req.params.id]
+    );
+    res.json({ success: true });
+  });
+
+  // ── Supprimer un post (admin) ────────────────────────────────────────────
+  app.delete('/api/admin/posts/:id', authenticate, requireAdmin, async (req: any, res) => {
+    const post = await db.one(`SELECT "authorId", content FROM posts WHERE id=$1`, [req.params.id]);
+    if (!post) return res.status(404).json({ error: 'Post introuvable' });
+    await pool.query(`DELETE FROM posts WHERE id=$1`, [req.params.id]);
+    await pool.query(
+      `INSERT INTO admin_logs("adminId",action,"targetId",details) VALUES($1,'delete_post',$2,$3)`,
+      [req.userId, req.params.id, `authorId:${post.authorid}`]
+    );
+    await audit(req, 'delete_post', 'posts', Number(req.params.id), post, null);
+    cacheDel('posts:public:');
+    res.json({ success: true });
+  });
+
+  // ── Supprimer un message (admin) ─────────────────────────────────────────
+  app.delete('/api/admin/messages/:id', authenticate, requireAdmin, async (req: any, res) => {
+    const msg = await db.one(`SELECT "senderId", content FROM messages WHERE id=$1`, [req.params.id]);
+    if (!msg) return res.status(404).json({ error: 'Message introuvable' });
+    await pool.query(`DELETE FROM messages WHERE id=$1`, [req.params.id]);
+    await pool.query(
+      `INSERT INTO admin_logs("adminId",action,"targetId",details) VALUES($1,'delete_message',$2,$3)`,
+      [req.userId, req.params.id, `senderId:${msg.senderid}`]
+    );
+    res.json({ success: true });
+  });
+
+  // ── Muter un utilisateur ─────────────────────────────────────────────────
+  app.put('/api/admin/users/:id/mute', authenticate, requireAdmin, async (req: any, res) => {
+    const { hours = 24, reason } = req.body;
+    const mutedUntil = new Date(Date.now() + Math.min(hours, 720) * 60 * 60 * 1000);
+    await pool.query(
+      `INSERT INTO spam_counters("userId","isMuted","mutedUntil")
+       VALUES($1,TRUE,$2)
+       ON CONFLICT("userId") DO UPDATE SET "isMuted"=TRUE,"mutedUntil"=$2`,
+      [req.params.id, mutedUntil]
+    );
+    await pool.query(
+      `INSERT INTO moderation_actions("moderatorId","targetType","targetId",action,reason)
+       VALUES($1,'user',$2,'mute',$3)`,
+      [req.userId, req.params.id, reason ?? '']
+    );
+    await logAction('ADMIN', 'mute_user', req.userId, req.ip, `User ${req.params.id} muté ${hours}h`);
+    res.json({ success: true, mutedUntil });
+  });
+
+  // ── Démuter un utilisateur ───────────────────────────────────────────────
+  app.put('/api/admin/users/:id/unmute', authenticate, requireAdmin, async (req: any, res) => {
+    await pool.query(
+      `UPDATE spam_counters SET "isMuted"=FALSE,"mutedUntil"=NULL WHERE "userId"=$1`,
+      [req.params.id]
+    );
+    res.json({ success: true });
+  });
+
+  // ── Stats modération ─────────────────────────────────────────────────────
+  app.get('/api/admin/moderation/stats', authenticate, requireAdmin, async (_, res) => {
+    const [pending, critical, autoFlagged, actionsToday, mutedUsers, topOffenders] = await Promise.all([
+      db.one(`SELECT COUNT(*) as c FROM reports WHERE status='pending'`),
+      db.one(`SELECT COUNT(*) as c FROM reports WHERE severity='critical' AND status='pending'`),
+      db.one(`SELECT COUNT(*) as c FROM reports WHERE "autoFlag"=TRUE AND status='pending'`),
+      db.one(`SELECT COUNT(*) as c FROM moderation_actions WHERE "createdAt">=NOW()-INTERVAL '24 hours'`),
+      db.one(`SELECT COUNT(*) as c FROM spam_counters WHERE "isMuted"=TRUE AND "mutedUntil">NOW()`),
+      db.all(`SELECT u.id,u.name,u.email,sc."flagCount",sc."isMuted"
+              FROM spam_counters sc JOIN users u ON sc."userId"=u.id
+              ORDER BY sc."flagCount" DESC LIMIT 10`),
+    ]);
+    res.json({
+      pendingReports:   parseInt(pending?.c   ?? 0),
+      criticalReports:  parseInt(critical?.c  ?? 0),
+      autoFlaggedToday: parseInt(autoFlagged?.c ?? 0),
+      actionsToday:     parseInt(actionsToday?.c ?? 0),
+      mutedUsers:       parseInt(mutedUsers?.c  ?? 0),
+      topOffenders,
+    });
+  });
+
+  // ── Historique actions de modération ────────────────────────────────────
+  app.get('/api/admin/moderation/actions', authenticate, requireAdmin, async (req: any, res) => {
+    const limit = Math.min(parseInt(req.query.limit as string) || 100, 500);
+    res.json(await db.all(
+      `SELECT ma.*,u.name as "moderatorName" FROM moderation_actions ma
+       LEFT JOIN users u ON ma."moderatorId"=u.id
+       ORDER BY ma."createdAt" DESC LIMIT $1`, [limit]
+    ));
+  });
+
+  // ── Gérer les règles de modération ──────────────────────────────────────
+  app.get('/api/admin/moderation/rules', authenticate, requireAdmin, async (_, res) => {
+    res.json(await db.all(`SELECT * FROM moderation_rules ORDER BY severity DESC, type ASC`, []));
+  });
+  app.post('/api/admin/moderation/rules', authenticate, requireSuperAdmin, async (req: any, res) => {
+    const { pattern, type, severity, action } = req.body;
+    if (!pattern || !type) return res.status(400).json({ error: 'Pattern et type requis' });
+    const r = await db.one(
+      `INSERT INTO moderation_rules(pattern,type,severity,action,"createdBy")
+       VALUES($1,$2,$3,$4,$5) RETURNING *`,
+      [pattern.toLowerCase(), type, severity ?? 'medium', action ?? 'flag', req.userId]
+    );
+    moderationCache.clear(); // invalider le cache d'analyse
+    res.json(r);
+  });
+  app.put('/api/admin/moderation/rules/:id', authenticate, requireSuperAdmin, async (req: any, res) => {
+    const { severity, action, isActive } = req.body;
+    await pool.query(
+      `UPDATE moderation_rules SET severity=$1,action=$2,"isActive"=$3 WHERE id=$4`,
+      [severity, action, isActive ?? true, req.params.id]
+    );
+    moderationCache.clear();
+    res.json({ success: true });
+  });
+  app.delete('/api/admin/moderation/rules/:id', authenticate, requireSuperAdmin, async (req: any, res) => {
+    await pool.query(`DELETE FROM moderation_rules WHERE id=$1`, [req.params.id]);
+    moderationCache.clear();
+    res.json({ success: true });
+  });
+
+  // ── Tester l'analyse sur un texte (outil admin) ──────────────────────────
+  app.post('/api/admin/moderation/test', authenticate, requireSuperAdmin, async (req: any, res) => {
+    const { text } = req.body;
+    if (!text) return res.status(400).json({ error: 'Texte requis' });
+    const result = await analyzeContent(text, req.userId);
+    res.json(result);
+  });
   app.get('/api/admin/logs',            authenticate, requireAdmin,      async (_, res) => res.json(await db.all(`SELECT al.*,u.name as "adminName" FROM admin_logs al JOIN users u ON al."adminId"=u.id ORDER BY al."createdAt" DESC LIMIT 200`,[])));
   app.get('/api/admin/db-logs',         authenticate, requireSuperAdmin, async (_, res) => res.json(await db.all(`SELECT id, level, action, "userId", ip, details, "createdAt" FROM db_logs ORDER BY "createdAt" DESC LIMIT 500`,[])));
   app.get('/api/admin/errors',          authenticate, requireSuperAdmin, (_, res) => res.json(errorTracker.errors));
@@ -1705,15 +2203,15 @@ async function startServer() {
   });
 
   app.get('/api/admin/users/activity',  authenticate, requireAdmin, async (req: any, res) => {
-    const days = parseInt(req.query.days as string) || 7;
+    const days = Math.max(1, Math.min(90, parseInt(req.query.days as string) || 7));
     const activity = await db.all(
       `SELECT DATE("createdAt") as date, COUNT(*) as new_users FROM users
-       WHERE "createdAt" >= NOW()-INTERVAL '${days} days' GROUP BY DATE("createdAt") ORDER BY date ASC`, []
+       WHERE "createdAt" >= NOW()-INTERVAL '1 day' * $1 GROUP BY DATE("createdAt") ORDER BY date ASC`, [days]
     );
     const logins = await db.all(
       `SELECT DATE("createdAt") as date, COUNT(*) as logins FROM db_logs
-       WHERE action IN('user_login','register') AND "createdAt">=NOW()-INTERVAL '${days} days'
-       GROUP BY DATE("createdAt") ORDER BY date ASC`, []
+       WHERE action IN('user_login','register') AND "createdAt">=NOW()-INTERVAL '1 day' * $1
+       GROUP BY DATE("createdAt") ORDER BY date ASC`, [days]
     );
     res.json({ activity, logins });
   });
@@ -1734,12 +2232,12 @@ async function startServer() {
 
   // ── Métriques & monitoring ────s──────────────────────────────────────────────
   app.get('/api/admin/metrics',         authenticate, requireSuperAdmin, async (req: any, res) => {
-    const hours = parseInt(req.query.hours as string) || 24;
+    const hours = Math.max(1, Math.min(168, parseInt(req.query.hours as string) || 24));
     const m = await db.all(
       `SELECT name, AVG(value) as avg, MAX(value) as max, MIN(value) as min,
               DATE_TRUNC('hour',"createdAt") as hour
-       FROM metrics WHERE "createdAt">=NOW()-INTERVAL '${hours} hours'
-       GROUP BY name, hour ORDER BY hour ASC`, []
+       FROM metrics WHERE "createdAt">=NOW()-INTERVAL '1 hour' * $1
+       GROUP BY name, hour ORDER BY hour ASC`, [hours]
     );
     res.json({ metrics: m, live: {
       requests: metrics.requests,
@@ -1830,7 +2328,7 @@ async function startServer() {
   // ════════════════════════════════════════════════════════════════════════
   // 📁 FICHIERS STATIQUES (Frontend React)
   // ════════════════════════════════════════════════════════════════════════
-     const distPath = __dirname;
+  const distPath = IS_DEV ? path.join(__dirname, 'dist') : __dirname;
 
   // ════════════════════════════════════════════════════════════════════════
   // 📁 FICHIERS STATIQUES (Frontend React) — TOUJOURS EN DERNIER
