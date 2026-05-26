@@ -1,4 +1,4 @@
-import { enqueueJob } from '../services/queue';
+import { enqueueJob } from '../services/queue.js';
 
 type RLEntry = { count: number; reset: number; blocked?: number };
 const rlMap = new Map<string, RLEntry>();

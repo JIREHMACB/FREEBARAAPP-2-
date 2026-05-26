@@ -37,8 +37,8 @@ export const ALLOWED_ORIGINS = [
 
 // ─── Imports modules ─────────────────────────────────────────────────────────
 import { pool, db }          from './config/db.js';
-import { initDB } from './database/init';
-import { runMigrations } from './database/migrations';
+import { initDB } from './database/init.js';
+import { runMigrations } from './database/migrations.js';
 import { cacheGet, cacheSet, cacheDel, cacheSize } from './services/cache.js';
 import { metrics, errorTracker } from './services/metrics.js';
 import { enqueueJob, jobQueue }  from './services/queue.js';
@@ -49,7 +49,7 @@ import {
   autoModerate,
   incrementSpamCounter,
   moderationCache
-} from './middleware/moderation';
+} from './middleware/moderation.js';
 import { authenticate, requireAdmin, requireSuperAdmin } from './middleware/auth.js';
 import { rateLimit } from './middleware/rateLimit.js';
 import { validate, schemas } from './middleware/validate.js';
