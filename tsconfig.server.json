@@ -3,11 +3,24 @@
     "target": "ES2022",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "outDir": "dist-server",
+
+    "rootDir": "./src",
+    "outDir": "./dist",
+
     "strict": false,
     "esModuleInterop": true,
-    "skipLibCheck": true
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+
+    "allowSyntheticDefaultImports": true
   },
-  "include": ["server.ts"],
-  "exclude": ["src", "node_modules"]
+
+  "include": [
+    "src/server/**/*.ts"
+  ],
+
+  "exclude": [
+    "node_modules",
+    "dist"
+  ]
 }
