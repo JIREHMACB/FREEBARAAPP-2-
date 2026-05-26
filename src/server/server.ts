@@ -1,10 +1,8 @@
 // ════════════════════════════════════════════════════════════════════════════
-// 🚀 FREEBARA SERVER — PostgreSQL | Production Ready
+// 🚀 FREEBARA SERVER v2 — Architecture modulaire | PostgreSQL | Production
 // ════════════════════════════════════════════════════════════════════════════
-
 console.log('🚀 FreeBara Server démarrage...');
 
-// ─── IMPORTS ─────────────────────────────────────────────────────────────────
 import express        from 'express';
 import { createServer }  from 'http';
 import { Server }        from 'socket.io';
@@ -13,1252 +11,83 @@ import { fileURLToPath } from 'url';
 import dotenv            from 'dotenv';
 import * as path         from 'path';
 import jwt               from 'jsonwebtoken';
-import { Resend } from "resend";
-import pkg               from 'pg';
-import { createHash }    from 'crypto';
-
-const IS_DEV     = process.env.NODE_ENV !== 'production';
-
-// ─── JSON BODY PARSER (utilisé uniquement dans startServer) ──────
-const { Pool } = pkg;
 
 dotenv.config();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const IS_DEV    = process.env.NODE_ENV !== 'production';
+const PORT      = parseInt(process.env.PORT || '3000');
+const JWT_SECRET = process.env.JWT_SECRET || 'dev-only-secret';
 
-// ─── CONFIGURATION ───────────────────────────────────────────────────────────
+// ─── Validation config ───────────────────────────────────────────────────────
 if (!process.env.JWT_SECRET) {
-  console.error('❌ JWT_SECRET manquant → le serveur ne peut pas démarrer en production');
-  if (process.env.NODE_ENV === 'production') process.exit(1);
-  console.warn('⚠️  Mode DEV uniquement — JWT_SECRET temporaire utilisé');
+  if (process.env.NODE_ENV === 'production') { console.error('❌ JWT_SECRET manquant'); process.exit(1); }
+  console.warn('⚠️  Mode DEV — JWT_SECRET temporaire');
 }
-if (!process.env.DATABASE_URL)  { console.error('❌ DATABASE_URL manquant!'); process.exit(1); }
-if (!process.env.SMTP_USER)     console.warn('⚠️  SMTP non configuré → codes OTP affichés en console');
-if (!process.env.CLOUDINARY_URL) console.warn('⚠️  CLOUDINARY_URL manquant → placeholders utilisés');
+if (!process.env.DATABASE_URL) { console.error('❌ DATABASE_URL manquant'); process.exit(1); }
+if (!process.env.SMTP_USER)     console.warn('⚠️  SMTP non configuré');
+if (!process.env.CLOUDINARY_URL) console.warn('⚠️  CLOUDINARY_URL manquant');
 
-const ALLOWED_ORIGINS = [
+// ─── CORS ───────────────────────────────────────────────────────────────────
+export const ALLOWED_ORIGINS = [
   'https://www.freebara.com',
   'https://freebara.com',
   'https://freebaraapp-2.onrender.com',
   ...(IS_DEV ? ['http://localhost:5173', 'http://localhost:3000'] : []),
 ];
 
-const JWT_SECRET = process.env.JWT_SECRET || 'dev-only-secret-change-in-prod';
-// Note: en prod, le process.exit(1) ci-dessus empêche d'atteindre cette ligne sans JWT_SECRET
+// ─── Imports modules ─────────────────────────────────────────────────────────
+import { pool, db }          from './config/db.js';
+import { initDB } from './database/init';
+import { runMigrations } from './database/migrations';
+import { cacheGet, cacheSet, cacheDel, cacheSize } from './services/cache.js';
+import { metrics, errorTracker } from './services/metrics.js';
+import { enqueueJob, jobQueue }  from './services/queue.js';
+import { uploadToCloudinary }    from './services/cloudinary.js';
+import { startBackupJobs, getBackupHistory, snapshotCounts } from './services/backup.js';
+import {
+  analyzeContent,
+  autoModerate,
+  incrementSpamCounter,
+  moderationCache
+} from './middleware/moderation';
+import { authenticate, requireAdmin, requireSuperAdmin } from './middleware/auth.js';
+import { rateLimit } from './middleware/rateLimit.js';
+import { validate, schemas } from './middleware/validate.js';
+import { isValidEmail, sendOTPEmail } from './services/email.js';
+import { hashOtp }           from './config/db.js';
 
-const PORT       = parseInt(process.env.PORT || '3000');
-
-// ─── POSTGRESQL ───────────────────────────────────────────────────────────────
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL!.includes('localhost') ? false : { rejectUnauthorized: false },
-  max: 10,                    // Render Starter: max 10 connexions simultanées
-  min: 2,                     // garder 2 connexions chaudes
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 10000,
-  statement_timeout: 15000,   // tuer les requêtes > 15s (prévient les freezes)
-});
-
-// Helper raccourci
-const db = {
-  one: async (sql: string, p?: any[]) => { const r = await pool.query(sql, p); return r.rows[0] || null; },
-  all: async (sql: string, p?: any[]) => { const r = await pool.query(sql, p); return r.rows; },
-  run: (sql: string, p?: any[]) => pool.query(sql, p),
-};
-
-// ─── HASHAGE OTP (sécurité : jamais stocker en clair) ────────────────────────
-const OTP_SALT = process.env.OTP_SALT || process.env.JWT_SECRET || 'freebara-otp-salt';
-const hashOtp = (code: string): string =>
-  createHash('sha256').update(code + OTP_SALT).digest('hex');
-
-// ─── MIGRATIONS POSTGRESQL PROPRES ───────────────────────────────────────────
-async function runMigrations() {
-  // Table de suivi des migrations
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS migrations (
-      id         SERIAL PRIMARY KEY,
-      name       TEXT UNIQUE NOT NULL,
-      "appliedAt" TIMESTAMP DEFAULT NOW()
-    )
-  `);
-
-  const applied = new Set((await pool.query(`SELECT name FROM migrations`)).rows.map((r: any) => r.name));
-
-  const migrations: { name: string; sql: string }[] = [
-    {
-      name: '001_add_last_seen_users',
-      sql: `ALTER TABLE users ADD COLUMN IF NOT EXISTS "lastSeen" TIMESTAMP;
-            ALTER TABLE users ADD COLUMN IF NOT EXISTS "loginCount" INTEGER DEFAULT 0;`
-    },
-    {
-      name: '002_add_permissions_table',
-      sql: `CREATE TABLE IF NOT EXISTS permissions (
-              id          SERIAL PRIMARY KEY,
-              "userId"    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-              resource    TEXT NOT NULL,
-              action      TEXT NOT NULL,
-              granted     BOOLEAN DEFAULT TRUE,
-              "grantedBy" INTEGER,
-              "createdAt" TIMESTAMP DEFAULT NOW(),
-              UNIQUE("userId", resource, action)
-            );`
-    },
-    {
-      name: '003_add_user_sessions',
-      sql: `CREATE TABLE IF NOT EXISTS user_sessions (
-              id         TEXT PRIMARY KEY,
-              "userId"   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-              ip         TEXT,
-              "userAgent" TEXT,
-              "createdAt" TIMESTAMP DEFAULT NOW(),
-              "lastActiveAt" TIMESTAMP DEFAULT NOW(),
-              active     BOOLEAN DEFAULT TRUE
-            );
-            CREATE INDEX IF NOT EXISTS idx_sessions_user ON user_sessions("userId");`
-    },
-    {
-      name: '004_add_audit_trail',
-      sql: `CREATE TABLE IF NOT EXISTS audit_trail (
-              id         SERIAL PRIMARY KEY,
-              "userId"   INTEGER,
-              action     TEXT NOT NULL,
-              resource   TEXT,
-              "resourceId" INTEGER,
-              ip         TEXT,
-              "userAgent" TEXT,
-              before     JSONB,
-              after      JSONB,
-              "createdAt" TIMESTAMP DEFAULT NOW()
-            );
-            CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_trail("userId");
-            CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_trail("createdAt" DESC);`
-    },
-    {
-      name: '005_add_metrics_table',
-      sql: `CREATE TABLE IF NOT EXISTS metrics (
-              id        SERIAL PRIMARY KEY,
-              name      TEXT NOT NULL,
-              value     NUMERIC(10,2) NOT NULL,
-              tags      JSONB,
-              "createdAt" TIMESTAMP DEFAULT NOW()
-            );
-            CREATE INDEX IF NOT EXISTS idx_metrics_name ON metrics(name, "createdAt" DESC);`
-    },
-    {
-      name: '008_otp_security_index',
-      sql: `CREATE INDEX IF NOT EXISTS idx_otps_expires ON otps("expiresAt");
-            DELETE FROM otps WHERE "expiresAt" < NOW();`
-    },
-    {
-      name: '007_add_profile_fields',
-      sql: `ALTER TABLE users ADD COLUMN IF NOT EXISTS age INTEGER;
-            ALTER TABLE users ADD COLUMN IF NOT EXISTS "maritalStatus" TEXT;
-            ALTER TABLE users ADD COLUMN IF NOT EXISTS whatsapp TEXT;
-            ALTER TABLE users ADD COLUMN IF NOT EXISTS "externalPortfolioUrl" TEXT;
-            ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT;
-            ALTER TABLE users ADD COLUMN IF NOT EXISTS "companyId" INTEGER REFERENCES companies(id) ON DELETE SET NULL;`
-    },
-    {
-      name: '009_moderation_system',
-      sql: `
-        -- Enrichir la table reports existante
-        ALTER TABLE reports ADD COLUMN IF NOT EXISTS severity    TEXT DEFAULT 'medium' CHECK (severity IN ('low','medium','high','critical'));
-        ALTER TABLE reports ADD COLUMN IF NOT EXISTS "autoFlag"  BOOLEAN DEFAULT FALSE;
-        ALTER TABLE reports ADD COLUMN IF NOT EXISTS "aiScore"   NUMERIC(4,2);
-        ALTER TABLE reports ADD COLUMN IF NOT EXISTS "aiReason"  TEXT;
-        ALTER TABLE reports ADD COLUMN IF NOT EXISTS "reviewedBy" INTEGER;
-        ALTER TABLE reports ADD COLUMN IF NOT EXISTS "reviewedAt" TIMESTAMP;
-        ALTER TABLE reports ADD COLUMN IF NOT EXISTS "moderatorNote" TEXT;
-
-        -- Table de mots/phrases interdits (anti-spam / contenu dangereux)
-        CREATE TABLE IF NOT EXISTS moderation_rules (
-          id          SERIAL PRIMARY KEY,
-          pattern     TEXT NOT NULL UNIQUE,
-          type        TEXT NOT NULL CHECK (type IN ('spam','hate','violence','adult','scam','danger')),
-          severity    TEXT DEFAULT 'medium' CHECK (severity IN ('low','medium','high','critical')),
-          action      TEXT DEFAULT 'flag' CHECK (action IN ('flag','block','ban')),
-          "isActive"  BOOLEAN DEFAULT TRUE,
-          "createdBy" INTEGER,
-          "createdAt" TIMESTAMP DEFAULT NOW()
-        );
-
-        -- Historique des actions de modération
-        CREATE TABLE IF NOT EXISTS moderation_actions (
-          id              SERIAL PRIMARY KEY,
-          "moderatorId"   INTEGER,
-          "targetType"    TEXT NOT NULL,
-          "targetId"      INTEGER NOT NULL,
-          action          TEXT NOT NULL,
-          reason          TEXT,
-          "automated"     BOOLEAN DEFAULT FALSE,
-          "reportId"      INTEGER,
-          "createdAt"     TIMESTAMP DEFAULT NOW()
-        );
-
-        -- Compteur anti-spam par utilisateur
-        CREATE TABLE IF NOT EXISTS spam_counters (
-          "userId"        INTEGER PRIMARY KEY,
-          "postCount"     INTEGER DEFAULT 0,
-          "messageCount"  INTEGER DEFAULT 0,
-          "reportCount"   INTEGER DEFAULT 0,
-          "flagCount"     INTEGER DEFAULT 0,
-          "lastReset"     TIMESTAMP DEFAULT NOW(),
-          "isMuted"       BOOLEAN DEFAULT FALSE,
-          "mutedUntil"    TIMESTAMP
-        );
-
-        -- Index
-        CREATE INDEX IF NOT EXISTS idx_reports_status   ON reports(status, "createdAt" DESC);
-        CREATE INDEX IF NOT EXISTS idx_reports_target   ON reports("targetType","targetId");
-        CREATE INDEX IF NOT EXISTS idx_reports_autoflag ON reports("autoFlag") WHERE "autoFlag"=TRUE;
-        CREATE INDEX IF NOT EXISTS idx_mod_actions_mod  ON moderation_actions("moderatorId");
-        CREATE INDEX IF NOT EXISTS idx_mod_actions_target ON moderation_actions("targetType","targetId");
-
-        -- Règles de modération par défaut
-        INSERT INTO moderation_rules(pattern, type, severity, action) VALUES
-          ('whatsapp.com',     'spam',     'medium', 'flag'),
-          ('bit.ly',           'spam',     'medium', 'flag'),
-          ('tinyurl',          'spam',     'medium', 'flag'),
-          ('buy followers',    'spam',     'high',   'block'),
-          ('achetez maintenant','spam',    'low',    'flag'),
-          ('viagra',           'spam',     'high',   'block'),
-          ('nudes',            'adult',    'critical','block'),
-          ('attaque',          'violence', 'medium', 'flag'),
-          ('terroriste',       'danger',   'critical','block'),
-          ('explosif',         'danger',   'critical','block'),
-          ('arnaque',          'scam',     'high',   'flag'),
-          ('envoie argent',    'scam',     'high',   'block'),
-          ('wire transfer',    'scam',     'high',   'flag')
-        ON CONFLICT(pattern) DO NOTHING;
-      `
-    },
-    {
-      name: '010_privacy_policy',
-      sql: `ALTER TABLE users ADD COLUMN IF NOT EXISTS "privacyAccepted"   BOOLEAN DEFAULT FALSE;
-            ALTER TABLE users ADD COLUMN IF NOT EXISTS "privacyAcceptedAt" TIMESTAMP;
-            ALTER TABLE users ADD COLUMN IF NOT EXISTS "privacyVersion"    TEXT DEFAULT '1.0';`
-    },
-  ];
-
-  for (const m of migrations) {
-    if (applied.has(m.name)) continue;
-    try {
-      await pool.query(m.sql);
-      await pool.query(`INSERT INTO migrations(name) VALUES($1)`, [m.name]);
-      console.log(`✅ Migration appliquée: ${m.name}`);
-    } catch (e: any) {
-      console.warn(`⚠️ Migration échouée (${m.name}): ${e.message}`);
-    }
-  }
-}
-
-// ─── SYSTÈME DE PERMISSIONS GRANULAIRES ──────────────────────────────────────
+// ─── PERMISSIONS ─────────────────────────────────────────────────────────────
 const ROLE_PERMISSIONS: Record<string, string[]> = {
   user:      ['posts:read','posts:write','messages:read','messages:write','profile:read','profile:write','companies:read','events:read'],
   moderator: ['posts:read','posts:write','posts:delete','messages:read','users:read','reports:read','reports:write','companies:read','events:read','events:delete'],
-  admin:     ['*'], // tout
+  admin:     ['*'],
 };
-
-const hasPermission = async (userId: number, role: string, resource: string, action: string): Promise<boolean> => {
+const hasPermission = async (userId: number, role: string, resource: string, action: string) => {
   const key = `${resource}:${action}`;
   const rolePerms = ROLE_PERMISSIONS[role] ?? [];
   if (rolePerms.includes('*') || rolePerms.includes(key)) return true;
-  // Vérifier permissions individuelles en base
-  try {
-    const p = await db.one(`SELECT granted FROM permissions WHERE "userId"=$1 AND resource=$2 AND action=$3`, [userId, resource, action]);
-    return p?.granted === true;
-  } catch { return false; }
+  try { const p = await db.one(`SELECT granted FROM permissions WHERE "userId"=$1 AND resource=$2 AND action=$3`, [userId, resource, action]); return p?.granted === true; } catch { return false; }
 };
 
-const requirePermission = (resource: string, action: string) =>
-  async (req: any, res: any, next: any) => {
-    const ok = await hasPermission(req.userId, req.userRole, resource, action);
-    if (!ok) return res.status(403).json({ error: `Permission refusée: ${resource}:${action}` });
-    next();
-  };
-
-// ─── MONITORING & MÉTRIQUES ───────────────────────────────────────────────────
-const metrics = {
-  requests: 0,
-  errors:   0,
-  dbQueries: 0,
-  activeConnections: 0,
-  responseTimesMs: [] as number[],
-  recordResponseTime(ms: number) {
-    this.responseTimesMs.push(ms);
-    if (this.responseTimesMs.length > 1000) this.responseTimesMs.shift();
-  },
-  avgResponseTime() {
-    if (!this.responseTimesMs.length) return 0;
-    return Math.round(this.responseTimesMs.reduce((a, b) => a + b, 0) / this.responseTimesMs.length);
-  },
-  p95ResponseTime() {
-    if (!this.responseTimesMs.length) return 0;
-    const sorted = [...this.responseTimesMs].sort((a, b) => a - b);
-    return sorted[Math.floor(sorted.length * 0.95)];
-  },
-};
-
-// Enregistrer métriques en base toutes les 5 minutes
-setInterval(async () => {
-  try {
-    const poolStats = pool as any;
-    await pool.query(
-      `INSERT INTO metrics(name, value, tags) VALUES ($1,$2,$3),($4,$5,$6),($7,$8,$9),($10,$11,$12)`,
-      [
-        'requests_total',    metrics.requests,    JSON.stringify({ period: '5m' }),
-        'errors_total',      metrics.errors,      JSON.stringify({ period: '5m' }),
-        'avg_response_ms',   metrics.avgResponseTime(), JSON.stringify({}),
-        'p95_response_ms',   metrics.p95ResponseTime(), JSON.stringify({}),
-      ]
-    );
-    metrics.requests = 0;
-    metrics.errors   = 0;
-  } catch {}
-}, 5 * 60000);
-
-
-const logAction = async (level: string, action: string, userId?: number, ip?: string, details?: string) => {
-  try {
-    await pool.query(
-      `INSERT INTO db_logs (level, action, "userId", ip, details) VALUES ($1,$2,$3,$4,$5)`,
-      [level, action, userId ?? null, ip ?? null, details ?? null]
-    );
-  } catch {}
-};
-
-// ─── AUDIT TRAIL ─────────────────────────────────────────────────────────────
+// ─── AUDIT ───────────────────────────────────────────────────────────────────
 const audit = async (req: any, action: string, resource: string, resourceId?: number, before?: any, after?: any) => {
-  try {
-    await pool.query(
-      `INSERT INTO audit_trail("userId",action,resource,"resourceId",ip,"userAgent",before,after) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,
-      [req.userId ?? null, action, resource, resourceId ?? null, req.ip ?? null, req.headers?.['user-agent'] ?? null,
-       before ? JSON.stringify(before) : null, after ? JSON.stringify(after) : null]
-    );
-  } catch {}
+  try { await pool.query(`INSERT INTO audit_trail("userId",action,resource,"resourceId",ip,"userAgent",before,after) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, [req.userId ?? null, action, resource, resourceId ?? null, req.ip ?? null, req.headers?.['user-agent'] ?? null, before ? JSON.stringify(before) : null, after ? JSON.stringify(after) : null]); } catch {}
+};
+const logAction = async (level: string, action: string, userId?: number, ip?: string, details?: string) => {
+  try { await pool.query(`INSERT INTO db_logs(level,action,"userId",ip,details) VALUES($1,$2,$3,$4,$5)`, [level, action, userId ?? null, ip ?? null, details ?? null]); } catch {}
 };
 
-// ─── ERROR TRACKER (monitoring interne) ──────────────────────────────────────
-const errorTracker = {
-  errors: [] as { time: string; msg: string; context?: string }[],
-  capture(err: any, context?: string) {
-    const entry = { time: new Date().toISOString(), msg: String(err?.message ?? err), context };
-    this.errors.unshift(entry);
-    if (this.errors.length > 200) this.errors.pop();
-    console.error(`[ERROR]${context ? ' ' + context : ''} ${entry.msg}`);
-    logAction('ERROR', context ?? 'error', undefined, undefined, entry.msg).catch(() => {});
-  },
-};
-process.on('uncaughtException',  (e) => errorTracker.capture(e, 'uncaughtException'));
-process.on('unhandledRejection', (e) => errorTracker.capture(e, 'unhandledRejection'));
-
-// ─── MOTEUR DE MODÉRATION AUTOMATIQUE ────────────────────────────────────────
-// Analyse le contenu texte et retourne un score de risque 0-1 + catégorie
-const moderationCache = new Map<string, { score: number; reasons: string[]; action: string }>();
-
-const analyzeContent = async (text: string, userId: number): Promise<{
-  score: number; reasons: string[]; action: 'allow' | 'flag' | 'block'; severity: string;
-}> => {
-  if (!text || text.trim().length === 0) return { score: 0, reasons: [], action: 'allow', severity: 'low' };
-
-  const normalized = text.toLowerCase();
-  const cacheKey   = `modcache:${Buffer.from(normalized.substring(0, 100)).toString('base64')}`;
-  const cached     = cacheGet(cacheKey);
-  if (cached) return cached;
-
-  const reasons: string[] = [];
-  let score = 0;
-  let worstAction = 'allow';
-  let worstSeverity = 'low';
-
-  try {
-    // ── 1. Règles de la base de données ──────────────────────────────────
-    const rules = await db.all(
-      `SELECT pattern, type, severity, action FROM moderation_rules WHERE "isActive"=TRUE`,
-      []
-    );
-    for (const rule of rules) {
-      if (normalized.includes(rule.pattern.toLowerCase())) {
-        reasons.push(`${rule.type}: "${rule.pattern}"`);
-        const severityScore: Record<string, number> = { low: 0.2, medium: 0.4, high: 0.7, critical: 1.0 };
-        score = Math.max(score, severityScore[rule.severity] ?? 0.3);
-        if (rule.action === 'block' || worstAction === 'allow') worstAction = rule.action;
-        if (rule.action === 'block') worstAction = 'block';
-        else if (rule.action === 'flag' && worstAction !== 'block') worstAction = 'flag';
-        worstSeverity = rule.severity;
-      }
-    }
-
-    // ── 2. Heuristiques locales (sans API externe) ────────────────────────
-    // Répétition excessive (spam)
-    const words  = normalized.split(/\s+/);
-    const unique = new Set(words);
-    if (words.length > 10 && unique.size / words.length < 0.3) {
-      score = Math.max(score, 0.5);
-      reasons.push('spam: répétition excessive de mots');
-      if (worstAction === 'allow') worstAction = 'flag';
-    }
-
-    // Caps lock excessif (agressivité)
-    const capsRatio = (text.match(/[A-Z]/g)?.length ?? 0) / Math.max(text.length, 1);
-    if (text.length > 20 && capsRatio > 0.6) {
-      score = Math.max(score, 0.3);
-      reasons.push('comportement: texte en majuscules excessives');
-      if (worstAction === 'allow') worstAction = 'flag';
-    }
-
-    // Trop de liens (spam)
-    const linkCount = (text.match(/https?:\/\//g)?.length ?? 0);
-    if (linkCount > 3) {
-      score = Math.max(score, 0.5);
-      reasons.push(`spam: ${linkCount} liens détectés`);
-      if (worstAction === 'allow') worstAction = 'flag';
-    }
-
-    // Numéros de téléphone (phishing / spam)
-    const phonePattern = /(\+?\d[\s\-.]?){8,13}/g;
-    const phones = text.match(phonePattern);
-    if (phones && phones.length > 2) {
-      score = Math.max(score, 0.35);
-      reasons.push('spam: multiples numéros de téléphone');
-      if (worstAction === 'allow') worstAction = 'flag';
-    }
-
-    // ── 3. Anti-spam comportemental (fréquence) ───────────────────────────
-    const counter = await db.one(
-      `SELECT "postCount","messageCount","flagCount","isMuted","mutedUntil" FROM spam_counters WHERE "userId"=$1`,
-      [userId]
-    );
-    if (counter?.isMuted && counter.mutedUntil && new Date(counter.mutedUntil) > new Date()) {
-      return { score: 1, reasons: ['utilisateur muté'], action: 'block', severity: 'high' };
-    }
-    if ((counter?.postCount ?? 0) > 20) {
-      score = Math.max(score, 0.6);
-      reasons.push('spam: volume de publications élevé (>20 en 1h)');
-      worstAction = 'block';
-    }
-
-  } catch (e: any) {
-    console.warn('[MODERATION] Erreur analyse:', e.message);
-  }
-
-  const result = {
-    score: Math.min(1, score),
-    reasons,
-    action: worstAction as 'allow' | 'flag' | 'block',
-    severity: worstSeverity,
-  };
-
-  cacheSet(cacheKey, result, 60000); // cache 1 min
-  return result;
-};
-
-// Incrémenter le compteur spam d'un utilisateur
-const incrementSpamCounter = async (userId: number, type: 'post' | 'message' | 'flag') => {
-  const col = type === 'post' ? '"postCount"' : type === 'message' ? '"messageCount"' : '"flagCount"';
-  await pool.query(
-    `INSERT INTO spam_counters("userId", ${col})
-     VALUES($1, 1)
-     ON CONFLICT("userId") DO UPDATE SET ${col}=spam_counters.${col}+1`,
-    [userId]
-  ).catch(() => {});
-};
-
-// Remettre à zéro les compteurs toutes les heures
-setInterval(async () => {
-  await pool.query(
-    `UPDATE spam_counters SET "postCount"=0,"messageCount"=0,"lastReset"=NOW()
-     WHERE "lastReset" < NOW()-INTERVAL '1 hour'`
-  ).catch(() => {});
-}, 60 * 60 * 1000);
-
-// Créer automatiquement un signalement + action si critique
-const autoModerate = async (
-  content: string, userId: number,
-  targetType: string, targetId: number, ip: string
-) => {
-  const result = await analyzeContent(content, userId);
-  if (result.action === 'allow') return result;
-
-  // Enregistrer le signalement automatique
-  await pool.query(
-    `INSERT INTO reports("reporterId","targetType","targetId",reason,severity,"autoFlag","aiScore","aiReason",status)
-     VALUES($1,$2,$3,$4,$5,TRUE,$6,$7,$8)`,
-    [
-      userId, targetType, targetId,
-      `[AUTO] ${result.reasons.join(', ')}`,
-      result.severity,
-      result.score,
-      result.reasons.join(' | '),
-      result.action === 'block' ? 'action_taken' : 'pending',
-    ]
-  ).catch(() => {});
-
-  // Log action automatique
-  await pool.query(
-    `INSERT INTO moderation_actions("targetType","targetId",action,reason,"automated")
-     VALUES($1,$2,$3,$4,TRUE)`,
-    [targetType, targetId, result.action, result.reasons.join(', ')]
-  ).catch(() => {});
-
-  if (result.action === 'block' || result.score >= 0.7) {
-    await incrementSpamCounter(userId, 'flag');
-    // Muter automatiquement si flagCount > 5
-    const counter = await db.one(`SELECT "flagCount" FROM spam_counters WHERE "userId"=$1`, [userId]);
-    if ((counter?.flagCount ?? 0) >= 5) {
-      await pool.query(
-        `UPDATE spam_counters SET "isMuted"=TRUE,"mutedUntil"=NOW()+INTERVAL '24 hours' WHERE "userId"=$1`,
-        [userId]
-      ).catch(() => {});
-      await logAction('WARN', 'auto_muted', userId, ip, `flagCount atteint`);
-    }
-  }
-
-  return result;
-};
-
-
-const cache = new Map<string, { data: any; exp: number }>();
-const cacheGet = (key: string) => {
-  const e = cache.get(key);
-  if (!e || Date.now() > e.exp) { cache.delete(key); return null; }
-  return e.data;
-};
-const cacheSet = (key: string, data: any, ttlMs = 30000) =>
-  cache.set(key, { data, exp: Date.now() + ttlMs });
-const cacheDel = (...patterns: string[]) => {
-  for (const k of cache.keys())
-    if (patterns.some(p => k.startsWith(p))) cache.delete(k);
-};
-setInterval(() => { const n = Date.now(); for (const [k, v] of cache) if (n > v.exp) cache.delete(k); }, 2 * 60000);
-
-// ─── WORKER QUEUE (jobs async sans Redis) ────────────────────────────────────
-type Job = { type: string; payload: any; retries: number };
-const jobQueue: Job[] = [];
-let jobRunning = false;
-const enqueueJob = (type: string, payload: any) => jobQueue.push({ type, payload, retries: 0 });
-const processJobs = async () => {
-  if (jobRunning || jobQueue.length === 0) return;
-  jobRunning = true;
-  const job = jobQueue.shift()!;
-  try {
-    if (job.type === 'send_email') await sendOTPEmail(job.payload.email, job.payload.code);
-    else if (job.type === 'log')   await logAction(job.payload.level, job.payload.action, job.payload.userId, job.payload.ip, job.payload.details);
-    else if (job.type === 'notif') {
-      await pool.query(`INSERT INTO notifications("userId",type,content,"relatedId") VALUES($1,$2,$3,$4)`, [job.payload.userId, job.payload.type, job.payload.content, job.payload.relatedId]);
-    }
-  } catch (e: any) {
-    if (job.retries < 3) { job.retries++; jobQueue.unshift(job); }
-    else console.error(`[QUEUE] Job ${job.type} échoué après 3 tentatives: ${e.message}`);
-  } finally { jobRunning = false; }
-};
-setInterval(processJobs, 300);
-
-// ─── CLOUDINARY (upload images) ───────────────────────────────────────────────
-const uploadToCloudinary = async (base64Data: string, folder = 'freebara'): Promise<string> => {
-  if (!process.env.CLOUDINARY_URL) {
-    return `https://picsum.photos/seed/${Date.now()}/400/400`; // placeholder dev
-  }
-  const url      = new URL(process.env.CLOUDINARY_URL);
-  const apiKey   = url.username;
-  const apiSecret = url.password;
-  const cloudName = url.hostname;
-  const auth     = Buffer.from(`${apiKey}:${apiSecret}`).toString('base64');
-  const body     = new URLSearchParams({ file: base64Data, upload_preset: 'freebara', folder });
-  const resp     = await fetch(`https://api.cloudinary.com/v1_1/${cloudName}/image/upload`, {
-    method: 'POST',
-    headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/x-www-form-urlencoded' },
-    body,
-  });
-  const data = await resp.json() as any;
-  if (!data.secure_url) throw new Error('Upload Cloudinary échoué: ' + JSON.stringify(data));
-  return data.secure_url;
-};
-
-// ─── EMAIL (OTP) ──────────────────────────────────────────────────────────────
-
-
-const apiKey = process.env.RESEND_API_KEY;
-
-// ⚠️ sécurité : éviter crash serveur
-if (!apiKey) {
-  console.warn("⚠️ RESEND_API_KEY manquant - emails désactivés");
-}
-
-const resend = apiKey ? new Resend(apiKey) : null;
-
-const isValidEmail = (e: string) =>
-  /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
-
-export const sendOTPEmail = async (email: string, code: string) => {
-  // sécurité email
-  if (!isValidEmail(email)) {
-    console.error("❌ Email invalide :", email);
-    return;
-  }
-
-  // mode dev si pas de config
-  if (!resend) {
-    console.log(`\n📧 [DEV MODE] OTP pour ${email} : ${code}\n`);
-    return;
-  }
-
-  try {
-    const result = await resend.emails.send({
-      from: "FreeBara <noreply@freebara.com>",
-      to: email,
-      subject: "Votre code de connexion FreeBara",
-      html: `
-        <div style="font-family:sans-serif;max-width:480px;margin:auto;padding:32px;background:#f8fafc;border-radius:16px;">
-          <img src="https://www.freebara.com/logo__2_.png" alt="FreeBara" style="height:40px;margin-bottom:24px;" />
-          
-          <h2 style="color:#155be3;margin:0 0 8px;">Code de vérification</h2>
-          
-          <p style="color:#64748b;margin:0 0 24px;">
-            Utilisez ce code pour accéder à FreeBara :
-          </p>
-
-          <div style="background:#fff;border:2px solid #e2e8f0;border-radius:12px;padding:24px;text-align:center;font-size:36px;font-weight:900;letter-spacing:10px;color:#0f172a;">
-            ${code}
-          </div>
-
-          <p style="color:#94a3b8;font-size:12px;margin-top:20px;">
-            ⏱ Expire dans 10 minutes. Ne partagez jamais ce code.
-          </p>
-        </div>
-      `,
-    });
-
-    console.log("📧 Email OTP envoyé avec succès à", email);
-    console.log("📨 Resend response:", result);
-
-  } catch (error) {
-    console.error("❌ Erreur Resend:", error);
-  }
-};
-// ════════════════════════════════════════════════════════════════════════════
-// 🗄️  INITIALISATION BASE DE DONNÉES
-// ════════════════════════════════════════════════════════════════════════════
-async function initDB() {
-  // ── Tables utilisateurs & auth ──
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS users (
-      id                      SERIAL PRIMARY KEY,
-      email                   TEXT UNIQUE NOT NULL,
-      name                    TEXT,
-      profession              TEXT,
-      bio                     TEXT,
-      company                 TEXT,
-      "avatarUrl"             TEXT,
-      "coverUrl"              TEXT,
-      phone                   TEXT,
-      location                TEXT,
-      website                 TEXT,
-      church                  TEXT,
-      groups                  TEXT,
-      interests               TEXT,
-      skills                  TEXT,
-      marketing               TEXT,
-      goals                   TEXT,
-      badge                   TEXT DEFAULT 'Invité',
-      "referralCode"          TEXT UNIQUE,
-      "referredBy"            INTEGER,
-      balance                 NUMERIC(10,2) DEFAULT 0,
-      role                    TEXT DEFAULT 'user' CHECK (role IN ('user','moderator','admin')),
-      status                  TEXT DEFAULT 'active' CHECK (status IN ('active','banned','inactive')),
-      "bannedReason"          TEXT,
-      "notificationPreferences" JSONB DEFAULT '{}',
-      visibility              TEXT DEFAULT 'public',
-      country                 TEXT,
-      "createdAt"             TIMESTAMP DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS otps (
-      email       TEXT PRIMARY KEY,
-      code        TEXT NOT NULL,
-      "expiresAt" TIMESTAMP NOT NULL
-    );
-  `);
-
-  // ── Tables réseau & social ──
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS follows (
-      "followerId"  INTEGER NOT NULL,
-      "followingId" INTEGER NOT NULL,
-      PRIMARY KEY ("followerId","followingId")
-    );
-    CREATE TABLE IF NOT EXISTS connection_requests (
-      id           SERIAL PRIMARY KEY,
-      "senderId"   INTEGER NOT NULL,
-      "receiverId" INTEGER NOT NULL,
-      status       TEXT DEFAULT 'pending',
-      "createdAt"  TIMESTAMP DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS notifications (
-      id          SERIAL PRIMARY KEY,
-      "userId"    INTEGER NOT NULL,
-      type        TEXT NOT NULL,
-      content     TEXT NOT NULL,
-      "relatedId" INTEGER,
-      read        BOOLEAN DEFAULT FALSE,
-      "createdAt" TIMESTAMP DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS certifications (
-      id              SERIAL PRIMARY KEY,
-      "userId"        INTEGER NOT NULL,
-      name            TEXT NOT NULL,
-      organization    TEXT NOT NULL,
-      "dateObtained"  TEXT NOT NULL,
-      "createdAt"     TIMESTAMP DEFAULT NOW()
-    );
-  `);
-
-  // ── Tables posts & interactions ──
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS posts (
-      id          SERIAL PRIMARY KEY,
-      "authorId"  INTEGER NOT NULL,
-      "cellId"    INTEGER,
-      content     TEXT NOT NULL,
-      category    TEXT DEFAULT 'Tous',
-      "mediaUrls" JSONB,
-      views       INTEGER DEFAULT 0,
-      "createdAt" TIMESTAMP DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS post_likes (
-      "postId"    INTEGER NOT NULL,
-      "userId"    INTEGER NOT NULL,
-      type        TEXT DEFAULT 'like',
-      "createdAt" TIMESTAMP DEFAULT NOW(),
-      PRIMARY KEY ("postId","userId")
-    );
-    CREATE TABLE IF NOT EXISTS post_comments (
-      id          SERIAL PRIMARY KEY,
-      "postId"    INTEGER NOT NULL,
-      "userId"    INTEGER NOT NULL,
-      content     TEXT NOT NULL,
-      "createdAt" TIMESTAMP DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS post_boosts (
-      "postId"    INTEGER PRIMARY KEY,
-      "userId"    INTEGER NOT NULL,
-      amount      NUMERIC(10,2) NOT NULL,
-      "createdAt" TIMESTAMP DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS stories (
-      id          SERIAL PRIMARY KEY,
-      "userId"    INTEGER NOT NULL,
-      "mediaUrl"  TEXT NOT NULL,
-      "mediaType" TEXT DEFAULT 'image',
-      "createdAt" TIMESTAMP DEFAULT NOW(),
-      "expiresAt" TIMESTAMP NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS story_views (
-      "storyId"  INTEGER NOT NULL,
-      "userId"   INTEGER NOT NULL,
-      "viewedAt" TIMESTAMP DEFAULT NOW(),
-      PRIMARY KEY ("storyId","userId")
-    );
-    CREATE TABLE IF NOT EXISTS story_reactions (
-      id          SERIAL PRIMARY KEY,
-      "storyId"   INTEGER NOT NULL,
-      "userId"    INTEGER NOT NULL,
-      emoji       TEXT NOT NULL,
-      "createdAt" TIMESTAMP DEFAULT NOW()
-    );
-  `);
-
-  // ── Tables événements ──
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS events (
-      id              SERIAL PRIMARY KEY,
-      title           TEXT NOT NULL,
-      description     TEXT NOT NULL,
-      "imageUrl"      TEXT,
-      country         TEXT NOT NULL,
-      city            TEXT NOT NULL,
-      location        TEXT NOT NULL,
-      latitude        REAL,
-      longitude       REAL,
-      "startDate"     TIMESTAMP NOT NULL,
-      "endDate"       TIMESTAMP NOT NULL,
-      category        TEXT NOT NULL,
-      "communityId"   INTEGER,
-      "creatorId"     INTEGER NOT NULL,
-      price           NUMERIC(10,2) DEFAULT 0,
-      "visualUrl"     TEXT,
-      "shares_count"  INTEGER DEFAULT 0,
-      "createdAt"     TIMESTAMP DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS event_participants (
-      "eventId"   INTEGER NOT NULL,
-      "userId"    INTEGER NOT NULL,
-      PRIMARY KEY ("eventId","userId")
-    );
-    CREATE TABLE IF NOT EXISTS event_likes (
-      "eventId"   INTEGER NOT NULL,
-      "userId"    INTEGER NOT NULL,
-      "createdAt" TIMESTAMP DEFAULT NOW(),
-      PRIMARY KEY ("eventId","userId")
-    );
-    CREATE TABLE IF NOT EXISTS event_comments (
-      id          SERIAL PRIMARY KEY,
-      "eventId"   INTEGER,
-      "userId"    INTEGER,
-      content     TEXT NOT NULL,
-      "createdAt" TIMESTAMP DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS favorite_events (
-      "userId"    INTEGER NOT NULL,
-      "eventId"   INTEGER NOT NULL,
-      "createdAt" TIMESTAMP DEFAULT NOW(),
-      PRIMARY KEY ("userId","eventId")
-    );
-  `);
-
-  // ── Tables business & entreprises ──
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS companies (
-      id           SERIAL PRIMARY KEY,
-      "ownerId"    INTEGER NOT NULL,
-      name         TEXT NOT NULL,
-      sector       TEXT,
-      description  TEXT,
-      address      TEXT,
-      whatsapp     TEXT,
-      facebook     TEXT,
-      twitter      TEXT,
-      linkedin     TEXT,
-      "logoUrl"    TEXT,
-      "coverUrl"   TEXT,
-      "isShop"     BOOLEAN DEFAULT FALSE,
-      specialty    TEXT,
-      categories   TEXT,
-      country      TEXT,
-      city         TEXT,
-      latitude     REAL,
-      longitude    REAL,
-      "managerId"  INTEGER,
-      "createdAt"  TIMESTAMP DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS company_catalog (
-      id             SERIAL PRIMARY KEY,
-      "companyId"    INTEGER NOT NULL,
-      name           TEXT NOT NULL,
-      description    TEXT,
-      price          NUMERIC(10,2),
-      "imageUrl"     TEXT,
-      category       TEXT,
-      tag            TEXT,
-      "tagValue"     TEXT,
-      "shares_count" INTEGER DEFAULT 0,
-      "createdAt"    TIMESTAMP DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS stocks (
-      "productId"   INTEGER PRIMARY KEY,
-      quantity      INTEGER DEFAULT 0,
-      "minQuantity" INTEGER DEFAULT 5,
-      "costPrice"   NUMERIC(10,2) DEFAULT 0,
-      "lastUpdated" TIMESTAMP DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS stock_movements (
-      id          SERIAL PRIMARY KEY,
-      "productId" INTEGER NOT NULL,
-      quantity    INTEGER NOT NULL,
-      type        TEXT NOT NULL,
-      reason      TEXT,
-      "createdAt" TIMESTAMP DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS shop_orders (
-      id                 SERIAL PRIMARY KEY,
-      "companyId"        INTEGER NOT NULL,
-      "customerId"       INTEGER NOT NULL,
-      "productId"        INTEGER NOT NULL,
-      quantity           INTEGER DEFAULT 1,
-      "totalPrice"       NUMERIC(10,2) NOT NULL,
-      status             TEXT DEFAULT 'pending',
-      "customerName"     TEXT,
-      "customerWhatsapp" TEXT,
-      "createdAt"        TIMESTAMP DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS favorite_companies (
-      "userId"    INTEGER NOT NULL,
-      "companyId" INTEGER NOT NULL,
-      "createdAt" TIMESTAMP DEFAULT NOW(),
-      PRIMARY KEY ("userId","companyId")
-    );
-    CREATE TABLE IF NOT EXISTS favorite_products (
-      "userId"    INTEGER NOT NULL,
-      "productId" INTEGER NOT NULL,
-      "createdAt" TIMESTAMP DEFAULT NOW(),
-      PRIMARY KEY ("userId","productId")
-    );
-    CREATE TABLE IF NOT EXISTS transactions (
-      id          SERIAL PRIMARY KEY,
-      "userId"    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      date        DATE NOT NULL,
-      description TEXT NOT NULL,
-      category    TEXT NOT NULL,
-      amount      NUMERIC(10,2) NOT NULL,
-      type        TEXT NOT NULL CHECK (type IN ('income','expense')),
-      "createdAt" TIMESTAMP DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS funding_requests (
-      id             SERIAL PRIMARY KEY,
-      "userId"       INTEGER NOT NULL,
-      "companyId"    INTEGER NOT NULL,
-      "institutionId" INTEGER,
-      "fundingType"  TEXT NOT NULL,
-      amount         NUMERIC(10,2),
-      reason         TEXT,
-      "strategicData" JSONB,
-      status         TEXT DEFAULT 'En attente',
-      "createdAt"    TIMESTAMP DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS credit_institutions (
-      id               SERIAL PRIMARY KEY,
-      "creatorId"      INTEGER NOT NULL,
-      name             TEXT NOT NULL,
-      type             TEXT NOT NULL,
-      description      TEXT,
-      terms            TEXT,
-      eligibility      TEXT,
-      targets          TEXT,
-      "processingTime" TEXT,
-      "logoUrl"        TEXT,
-      "coverUrl"       TEXT,
-      address          TEXT,
-      city             TEXT,
-      country          TEXT,
-      "isHabilitated"  INTEGER DEFAULT 0,
-      "createdAt"      TIMESTAMP DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS ads (
-      id          SERIAL PRIMARY KEY,
-      "companyId" INTEGER NOT NULL,
-      goal        TEXT NOT NULL,
-      content     TEXT NOT NULL,
-      targeting   TEXT NOT NULL,
-      budget      NUMERIC(10,2) NOT NULL,
-      duration    INTEGER NOT NULL,
-      status      TEXT DEFAULT 'pending',
-      "createdAt" TIMESTAMP DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS reviews (
-      id           SERIAL PRIMARY KEY,
-      "userId"     INTEGER NOT NULL,
-      "targetType" TEXT NOT NULL,
-      "targetId"   INTEGER NOT NULL,
-      rating       INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
-      comment      TEXT,
-      "createdAt"  TIMESTAMP DEFAULT NOW()
-    );
-  `);
-
-  // ── Tables messages & chat ──
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS messages (
-      id           SERIAL PRIMARY KEY,
-      "senderId"   INTEGER NOT NULL,
-      "receiverId" INTEGER,
-      "roomId"     INTEGER,
-      content      TEXT NOT NULL,
-      "fileUrl"    TEXT,
-      "fileType"   TEXT,
-      "fileName"   TEXT,
-      read         BOOLEAN DEFAULT FALSE,
-      "isPinned"   BOOLEAN DEFAULT FALSE,
-      "replyToId"  INTEGER,
-      "createdAt"  TIMESTAMP DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS message_reactions (
-      id          SERIAL PRIMARY KEY,
-      "messageId" INTEGER NOT NULL,
-      "userId"    INTEGER NOT NULL,
-      emoji       TEXT NOT NULL,
-      "createdAt" TIMESTAMP DEFAULT NOW(),
-      UNIQUE("messageId","userId")
-    );
-    CREATE TABLE IF NOT EXISTS chat_rooms (
-      id          SERIAL PRIMARY KEY,
-      name        TEXT,
-      type        TEXT DEFAULT 'direct',
-      "avatarUrl" TEXT,
-      "creatorId" INTEGER,
-      "createdAt" TIMESTAMP DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS chat_room_members (
-      "roomId"   INTEGER NOT NULL,
-      "userId"   INTEGER NOT NULL,
-      "joinedAt" TIMESTAMP DEFAULT NOW(),
-      PRIMARY KEY ("roomId","userId")
-    );
-  `);
-
-  // ── Tables communautés & cellules ──
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS cells (
-      id          SERIAL PRIMARY KEY,
-      name        TEXT NOT NULL,
-      description TEXT,
-      "sponsorId" INTEGER,
-      "creatorId" INTEGER NOT NULL,
-      "coverUrl"  TEXT,
-      latitude    REAL,
-      longitude   REAL,
-      city        TEXT,
-      country     TEXT,
-      "createdAt" TIMESTAMP DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS cell_members (
-      "cellId"   INTEGER NOT NULL,
-      "userId"   INTEGER NOT NULL,
-      role       TEXT DEFAULT 'member',
-      "joinedAt" TIMESTAMP DEFAULT NOW(),
-      PRIMARY KEY ("cellId","userId")
-    );
-    CREATE TABLE IF NOT EXISTS communities (
-      id          SERIAL PRIMARY KEY,
-      name        TEXT NOT NULL,
-      description TEXT,
-      "createdAt" TIMESTAMP DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS community_members (
-      "communityId" INTEGER NOT NULL,
-      "userId"      INTEGER NOT NULL,
-      role          TEXT DEFAULT 'member',
-      PRIMARY KEY ("communityId","userId")
-    );
-    CREATE TABLE IF NOT EXISTS churches (
-      id          SERIAL PRIMARY KEY,
-      name        TEXT NOT NULL,
-      pastor      TEXT,
-      hq          TEXT,
-      description TEXT,
-      programs    TEXT,
-      "coverUrl"  TEXT,
-      latitude    REAL,
-      longitude   REAL,
-      city        TEXT,
-      country     TEXT,
-      "creatorId" INTEGER NOT NULL,
-      "createdAt" TIMESTAMP DEFAULT NOW()
-    );
-  `);
-
-  // ── Tables formation (Pannels) ──
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS pannels (
-      id          SERIAL PRIMARY KEY,
-      name        TEXT NOT NULL,
-      description TEXT,
-      theme       TEXT,
-      "ownerId"   INTEGER NOT NULL,
-      "avatarUrl" TEXT,
-      "logoUrl"   TEXT,
-      "coverUrl"  TEXT,
-      "createdAt" TIMESTAMP DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS pannel_members (
-      "pannelId" INTEGER NOT NULL,
-      "userId"   INTEGER NOT NULL,
-      role       TEXT DEFAULT 'member',
-      "joinedAt" TIMESTAMP DEFAULT NOW(),
-      PRIMARY KEY ("pannelId","userId")
-    );
-    CREATE TABLE IF NOT EXISTS pannel_courses (
-      id          SERIAL PRIMARY KEY,
-      "pannelId"  INTEGER NOT NULL,
-      title       TEXT NOT NULL,
-      description TEXT,
-      duration    TEXT,
-      "fileUrl"   TEXT NOT NULL,
-      "fileType"  TEXT NOT NULL,
-      views       INTEGER DEFAULT 0,
-      "createdAt" TIMESTAMP DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS pannel_progress (
-      "pannelId"    INTEGER NOT NULL,
-      "userId"      INTEGER NOT NULL,
-      "courseId"    INTEGER NOT NULL,
-      status        TEXT DEFAULT 'non_commence',
-      position      REAL DEFAULT 0,
-      notes         TEXT,
-      "stickyNotes" JSONB,
-      "updatedAt"   TIMESTAMP DEFAULT NOW(),
-      PRIMARY KEY ("pannelId","userId","courseId")
-    );
-    CREATE TABLE IF NOT EXISTS pannel_evaluations (
-      id            SERIAL PRIMARY KEY,
-      "pannelId"    INTEGER NOT NULL,
-      "userId"      INTEGER NOT NULL,
-      "courseTitle" TEXT,
-      grade         INTEGER,
-      feedback      TEXT,
-      "createdAt"   TIMESTAMP DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS pannel_badges (
-      id          SERIAL PRIMARY KEY,
-      "pannelId"  INTEGER NOT NULL,
-      "userId"    INTEGER NOT NULL,
-      "badgeType" TEXT NOT NULL,
-      "unlockedAt" TIMESTAMP DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS pannel_forum (
-      id          SERIAL PRIMARY KEY,
-      "pannelId"  INTEGER NOT NULL,
-      "userId"    INTEGER NOT NULL,
-      content     TEXT NOT NULL,
-      "createdAt" TIMESTAMP DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS pannel_course_comments (
-      id          SERIAL PRIMARY KEY,
-      "courseId"  INTEGER NOT NULL,
-      "userId"    INTEGER NOT NULL,
-      content     TEXT NOT NULL,
-      "createdAt" TIMESTAMP DEFAULT NOW()
-    );
-  `);
-
-  // ── Tables tâches ──
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS tasks (
-      id               SERIAL PRIMARY KEY,
-      "userId"         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      title            TEXT NOT NULL,
-      description      TEXT,
-      "dueDate"        DATE,
-      "reminderTime"   TEXT,
-      status           TEXT DEFAULT 'todo' CHECK (status IN ('todo','in_progress','done')),
-      priority         TEXT DEFAULT 'medium' CHECK (priority IN ('low','medium','high')),
-      category         TEXT DEFAULT 'Général',
-      "assignedUserId" INTEGER REFERENCES users(id) ON DELETE SET NULL,
-      "isArchived"     BOOLEAN DEFAULT FALSE,
-      "createdAt"      TIMESTAMP DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS task_subtasks (
-      id          SERIAL PRIMARY KEY,
-      "taskId"    INTEGER NOT NULL,
-      title       TEXT NOT NULL,
-      status      TEXT DEFAULT 'todo',
-      "createdAt" TIMESTAMP DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS task_dependencies (
-      "taskId"          INTEGER NOT NULL,
-      "dependsOnTaskId" INTEGER NOT NULL,
-      PRIMARY KEY ("taskId","dependsOnTaskId")
-    );
-  `);
-
-  // ── Tables admin & sécurité ──
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS reports (
-      id           SERIAL PRIMARY KEY,
-      "reporterId" INTEGER NOT NULL,
-      "targetType" TEXT NOT NULL,
-      "targetId"   INTEGER NOT NULL,
-      reason       TEXT NOT NULL,
-      status       TEXT DEFAULT 'pending',
-      "createdAt"  TIMESTAMP DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS admin_logs (
-      id          SERIAL PRIMARY KEY,
-      "adminId"   INTEGER NOT NULL,
-      action      TEXT NOT NULL,
-      "targetId"  INTEGER,
-      details     TEXT,
-      "createdAt" TIMESTAMP DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS db_logs (
-      id          SERIAL PRIMARY KEY,
-      level       TEXT NOT NULL,
-      action      TEXT NOT NULL,
-      "userId"    INTEGER,
-      ip          TEXT,
-      details     TEXT,
-      "createdAt" TIMESTAMP DEFAULT NOW()
-    );
-  `);
-  // ── Table services (complète) ──
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS services (
-      id               SERIAL PRIMARY KEY,
-      "providerId"     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      title            TEXT NOT NULL,
-      description      TEXT,
-      availability     TEXT,
-      budget           NUMERIC(10,2) DEFAULT 0,
-      type             TEXT DEFAULT 'projet',
-      "companyName"    TEXT,
-      location         TEXT,
-      "contractType"   TEXT,
-      "fileUrl"        TEXT,
-      category         TEXT,
-      "createdAt"      TIMESTAMP DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS service_applications (
-      id               SERIAL PRIMARY KEY,
-      "serviceId"      INTEGER NOT NULL REFERENCES services(id) ON DELETE CASCADE,
-      "userId"         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      message          TEXT,
-      "contactDetails" JSONB,
-      status           TEXT DEFAULT 'pending',
-      "createdAt"      TIMESTAMP DEFAULT NOW(),
-      UNIQUE("serviceId","userId")
-    );
-  `);
-
-  // ── Index de performance ──
-  try {
-    await pool.query(`
-      CREATE INDEX IF NOT EXISTS idx_posts_author        ON posts("authorId");
-      CREATE INDEX IF NOT EXISTS idx_posts_created       ON posts("createdAt" DESC);
-      CREATE INDEX IF NOT EXISTS idx_posts_category      ON posts(category);
-      CREATE INDEX IF NOT EXISTS idx_messages_sender     ON messages("senderId");
-      CREATE INDEX IF NOT EXISTS idx_messages_receiver   ON messages("receiverId");
-      CREATE INDEX IF NOT EXISTS idx_messages_room       ON messages("roomId");
-      CREATE INDEX IF NOT EXISTS idx_notifications_user  ON notifications("userId");
-      CREATE INDEX IF NOT EXISTS idx_notifications_read  ON notifications("userId", read) WHERE read = FALSE;
-      CREATE INDEX IF NOT EXISTS idx_follows_follower    ON follows("followerId");
-      CREATE INDEX IF NOT EXISTS idx_follows_following   ON follows("followingId");
-      CREATE INDEX IF NOT EXISTS idx_tasks_user          ON tasks("userId");
-      CREATE INDEX IF NOT EXISTS idx_tasks_status        ON tasks("userId", status);
-      CREATE INDEX IF NOT EXISTS idx_services_provider   ON services("providerId");
-      CREATE INDEX IF NOT EXISTS idx_services_category   ON services(category);
-      CREATE INDEX IF NOT EXISTS idx_service_apps_service ON service_applications("serviceId");
-      CREATE INDEX IF NOT EXISTS idx_service_apps_user    ON service_applications("userId");
-      CREATE INDEX IF NOT EXISTS idx_companies_owner     ON companies("ownerId");
-      CREATE INDEX IF NOT EXISTS idx_catalog_company     ON company_catalog("companyId");
-      CREATE INDEX IF NOT EXISTS idx_catalog_category    ON company_catalog(category);
-      CREATE INDEX IF NOT EXISTS idx_events_creator      ON events("creatorId");
-      CREATE INDEX IF NOT EXISTS idx_events_start        ON events("startDate");
-      CREATE INDEX IF NOT EXISTS idx_pannel_members_user ON pannel_members("userId");
-      CREATE INDEX IF NOT EXISTS idx_pannel_courses_panel ON pannel_courses("pannelId");
-      CREATE INDEX IF NOT EXISTS idx_pannel_progress_user ON pannel_progress("userId");
-      CREATE INDEX IF NOT EXISTS idx_cell_members_user   ON cell_members("userId");
-      CREATE INDEX IF NOT EXISTS idx_stories_user        ON stories("userId");
-      CREATE INDEX IF NOT EXISTS idx_stories_expires     ON stories("expiresAt");
-      CREATE INDEX IF NOT EXISTS idx_post_likes_post     ON post_likes("postId");
-      CREATE INDEX IF NOT EXISTS idx_post_comments_post  ON post_comments("postId");
-    `);
-    console.log('✅ Index créés');
-  } catch (e: any) {
-    console.warn('⚠️  Certains index non créés (migration requise?):', e.message);
-  }
-
-  console.log('✅ Toutes les tables PostgreSQL sont prêtes');
-}
-
-// ════════════════════════════════════════════════════════════════════════════
-// 🌐 DÉMARRAGE DU SERVEUR
 // ════════════════════════════════════════════════════════════════════════════
 async function startServer() {
   await initDB();
   await runMigrations();
+  await startBackupJobs();
 
   const app        = express();
   const httpServer = createServer(app);
   const io         = new Server(httpServer, {
     path: '/socket.io',
-    cors: { origin: ALLOWED_ORIGINS, methods: ['GET', 'POST'], credentials: true },
+    cors: { origin: ALLOWED_ORIGINS, methods: ['GET','POST'], credentials: true },
   });
 
   // ─── MIDDLEWARE ────────────────────────────────────────────────────────────
@@ -1266,19 +95,19 @@ async function startServer() {
   app.use(express.json({ limit: '50mb' }));
   app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-  // ─── SÉCURITÉ HEADERS RENFORCÉS ──────────────────────────────────────────
+  // ─── SÉCURITÉ HEADERS ─────────────────────────────────────────────────────
   app.use((req: any, res: any, next: any) => {
-    res.setHeader('X-Content-Type-Options',            'nosniff');
-    res.setHeader('X-Frame-Options',                   'DENY');
-    res.setHeader('X-XSS-Protection',                  '1; mode=block');
-    res.setHeader('Referrer-Policy',                   'strict-origin-when-cross-origin');
-    res.setHeader('Permissions-Policy',                'camera=(), microphone=(), geolocation=()');
-    res.setHeader('Strict-Transport-Security',         'max-age=31536000; includeSubDomains');
-    res.setHeader('Content-Security-Policy',           "default-src 'self'; connect-src 'self' https://api.cloudinary.com wss://www.freebara.com");
+    res.setHeader('X-Content-Type-Options',    'nosniff');
+    res.setHeader('X-Frame-Options',           'DENY');
+    res.setHeader('X-XSS-Protection',          '1; mode=block');
+    res.setHeader('Referrer-Policy',           'strict-origin-when-cross-origin');
+    res.setHeader('Permissions-Policy',        'camera=(), microphone=(), geolocation=()');
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    res.setHeader('Content-Security-Policy',   "default-src 'self'; connect-src 'self' https://api.cloudinary.com wss://www.freebara.com");
     next();
   });
 
-  // ─── MONITORING MIDDLEWARE (métriques + logs structurés) ─────────────────
+  // ─── MONITORING MIDDLEWARE ─────────────────────────────────────────────────
   app.use((req: any, res: any, next: any) => {
     const start = Date.now();
     metrics.requests++;
@@ -1286,105 +115,27 @@ async function startServer() {
       const ms = Date.now() - start;
       metrics.recordResponseTime(ms);
       if (res.statusCode >= 400) metrics.errors++;
-      const log = `${req.method} ${req.path} ${res.statusCode} ${ms}ms ip=${req.ip}`;
-      if      (res.statusCode >= 500) { console.error('🔴 ' + log); }
-      else if (res.statusCode >= 400) { console.warn ('🟡 ' + log); }
-      else if (ms > 3000)             { console.warn ('🐢 SLOW ' + log); }
-      if (res.statusCode >= 500) enqueueJob('log', { level: 'ERROR', action: 'http_500', ip: req.ip, details: log });
+      const log = `${req.method} ${req.path} ${res.statusCode} ${ms}ms`;
+      if (res.statusCode >= 500) console.error('🔴 ' + log);
+      else if (res.statusCode >= 400) console.warn('🟡 ' + log);
+      else if (ms > 3000) console.warn('🐢 SLOW ' + log);
     });
     next();
   });
-  // ─── RATE LIMITING AVANCÉ ─────────────────────────────────────────────────
-  type RLEntry = { count: number; reset: number; blocked?: number };
-  const rlMap = new Map<string, RLEntry>();
-  const rateLimit = (max: number, ms: number, blockMs = 0) =>
-    (req: any, res: any, next: any) => {
-      const key = `${req.ip ?? 'x'}:${req.path}`;
-      const now = Date.now();
-      let e = rlMap.get(key);
-      if (e?.blocked && now < e.blocked) {
-        res.setHeader('Retry-After', Math.ceil((e.blocked - now) / 1000));
-        return res.status(429).json({ error: 'Trop de tentatives. Réessayez plus tard.' });
-      }
-      if (!e || now > e.reset) { rlMap.set(key, { count: 1, reset: now + ms }); return next(); }
-      e.count++;
-      if (e.count > max) {
-        if (blockMs) e.blocked = now + blockMs;
-        res.setHeader('Retry-After', Math.ceil((e.reset - now) / 1000));
-        enqueueJob('log', { level: 'WARN', action: 'rate_limit', ip: req.ip, details: req.path });
-        return res.status(429).json({ error: 'Trop de requêtes. Réessayez dans un instant.' });
-      }
-      next();
-    };
-  setInterval(() => { const n = Date.now(); for (const [k, v] of rlMap) if (n > v.reset && (!v.blocked || n > v.blocked)) rlMap.delete(k); }, 5 * 60000);
-  // 5 tentatives OTP/10min puis blocage 1h
-  app.use('/api/auth/request-otp', rateLimit(5,  10 * 60000, 60 * 60000));
-  app.use('/api/auth/verify-otp',  rateLimit(10, 10 * 60000, 30 * 60000));
+
+  // ─── RATE LIMITING ─────────────────────────────────────────────────────────
+  app.use('/api/auth/request-otp', rateLimit(5,  10*60000, 60*60000));
+  app.use('/api/auth/verify-otp',  rateLimit(10, 10*60000, 30*60000));
   app.use('/api/auth',             rateLimit(20, 60000));
   app.use('/api',                  rateLimit(300, 60000));
 
-  // Monitoring middleware déjà déclaré ci-dessus
-
-  // ─── MIDDLEWARE AUTHENTIFICATION (cache + session + lastSeen) ────────────
-  const authenticate = async (req: any, res: any, next: any) => {
-    const token = req.headers.authorization?.split(' ')[1];
-    if (!token) return res.status(401).json({ error: 'Non autorisé' });
-    try {
-      const decoded = jwt.verify(token, JWT_SECRET) as { userId: number };
-      const cacheKey = `auth:${decoded.userId}`;
-      let user = cacheGet(cacheKey);
-      if (!user) {
-        user = await db.one(`SELECT id, status, role FROM users WHERE id=$1`, [decoded.userId]);
-        if (user) cacheSet(cacheKey, user, 30000);
-      }
-      if (!user)             return res.status(401).json({ error: 'Utilisateur introuvable' });
-      if (user.status === 'banned')
-        return res.status(403).json({ error: 'Compte suspendu. Contactez le support FreeBara.' });
-      req.userId   = decoded.userId;
-      req.userRole = user.role;
-      // Mettre à jour lastSeen toutes les 5 minutes (via cache pour éviter spam DB)
-      const lsKey = `lastseen:${decoded.userId}`;
-      if (!cacheGet(lsKey)) {
-        pool.query(`UPDATE users SET "lastSeen"=NOW() WHERE id=$1`, [decoded.userId]).catch(() => {});
-        cacheSet(lsKey, true, 5 * 60000);
-      }
-      next();
-    } catch {
-      res.status(401).json({ error: 'Session expirée. Veuillez vous reconnecter.' });
-    }
-  };
-
-  const requireAdmin      = (req: any, res: any, next: any) => {
-    if (req.userRole !== 'admin' && req.userRole !== 'moderator')
-      return res.status(403).json({ error: 'Accès réservé aux administrateurs' });
-    next();
-  };
-  const requireSuperAdmin = (req: any, res: any, next: any) => {
-    if (req.userRole !== 'admin')
-      return res.status(403).json({ error: 'Accès super-admin requis' });
-    next();
-  };
-
-  // ════════════════════════════════════════════════════════════════════════
-  // 🔍 HEALTH CHECK
-  // ════════════════════════════════════════════════════════════════════════
+  // ─── HEALTH CHECK ──────────────────────────────────────────────────────────
   app.get('/api/health', async (_, res) => {
     try {
       const start = Date.now();
       await pool.query('SELECT 1');
-      res.json({
-        status: 'ok',
-        db: 'postgresql',
-        dbLatency: `${Date.now() - start}ms`,
-        uptime: `${Math.floor(process.uptime())}s`,
-        memory: `${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB`,
-        cacheSize: cache.size,
-        queueSize: jobQueue.length,
-        time: new Date()
-      });
-    } catch {
-      res.status(500).json({ status: 'error', db: 'disconnected' });
-    }
+      res.json({ status:'ok', db:'postgresql', dbLatency:`${Date.now()-start}ms`, uptime:`${Math.floor(process.uptime())}s`, memory:`${Math.round(process.memoryUsage().heapUsed/1024/1024)}MB`, cacheSize:cacheSize(), queueSize:jobQueue.length, time:new Date() });
+    } catch { res.status(500).json({ status:'error', db:'disconnected' }); }
   });
 
   // ════════════════════════════════════════════════════════════════════════
@@ -2244,7 +995,7 @@ async function startServer() {
       errors: metrics.errors,
       avgResponseMs: metrics.avgResponseTime(),
       p95ResponseMs: metrics.p95ResponseTime(),
-      cacheSize: cache.size,
+     cacheSize: cacheSize(),
       queueSize: jobQueue.length,
       uptime: Math.floor(process.uptime()),
       memoryMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
@@ -2284,9 +1035,18 @@ async function startServer() {
 
   // ── Health-full enrichi ──────────────────────────────────────────────────────
   // ════════════════════════════════════════════════════════════════════════
-  // 🔌 SOCKET.IO (Temps réel)
-  // ════════════════════════════════════════════════════════════════════════
-  const onlineUsers = new Map<number, string>(); // userId → socketId
+
+  // ─── BACKUP ROUTES (admin) ────────────────────────────────────────────────
+  app.get('/api/admin/backup/history', authenticate, requireAdmin, async (_, res) => {
+    res.json(await getBackupHistory(48));
+  });
+  app.post('/api/admin/backup/snapshot', authenticate, requireSuperAdmin, async (_, res) => {
+    await snapshotCounts();
+    res.json({ success: true, message: 'Snapshot créé' });
+  });
+
+  // ─── SOCKET.IO ────────────────────────────────────────────────────────────
+  const onlineUsers = new Map<number, string>();
 
   io.use((socket, next) => {
     try {
@@ -2303,14 +1063,9 @@ async function startServer() {
   io.on('connection', (socket: any) => {
     onlineUsers.set(socket.userId, socket.id);
     socket.join(`user_${socket.userId}`);
-    // Mettre à jour lastSeen
     pool.query(`UPDATE users SET "lastSeen"=NOW() WHERE id=$1`, [socket.userId]).catch(() => {});
     io.emit('online_count', onlineUsers.size);
-
-    socket.on('disconnect', () => {
-      onlineUsers.delete(socket.userId);
-      io.emit('online_count', onlineUsers.size);
-    });
+    socket.on('disconnect', () => { onlineUsers.delete(socket.userId); io.emit('online_count', onlineUsers.size); });
     socket.on('join_room',        (roomId: any) => socket.join(`room_${roomId}`));
     socket.on('pin_message',      (d: any) => io.emit('message_pinned', d));
     socket.on('unpin_message',    (d: any) => io.emit('message_unpinned', d));
@@ -2320,82 +1075,43 @@ async function startServer() {
     socket.on('typing',           (d: any) => socket.to(`user_${d.to}`).emit('typing', { from: socket.userId }));
   });
 
-  // Route live online count
   app.get('/api/admin/online-count', authenticate, requireAdmin, (_, res) => {
     res.json({ count: onlineUsers.size, userIds: [...onlineUsers.keys()] });
   });
 
-  // ════════════════════════════════════════════════════════════════════════
-  // 📁 FICHIERS STATIQUES (Frontend React)
-  // ════════════════════════════════════════════════════════════════════════
-  const distPath = IS_DEV ? path.join(__dirname, 'dist') : __dirname;
+  // ─── STATIC FILES ─────────────────────────────────────────────────────────
+  const distPath = IS_DEV ? path.join(__dirname, '..', 'dist') : __dirname;
+  app.use(express.static(distPath));
+  app.get('*', (req, res) => {
+    if (req.path.startsWith('/api')) return res.status(404).json({ error: 'API route not found' });
+    res.sendFile(path.join(distPath, 'index.html'));
+  });
 
-  // ════════════════════════════════════════════════════════════════════════
-  // 📁 FICHIERS STATIQUES (Frontend React) — TOUJOURS EN DERNIER
-  // ════════════════════════════════════════════════════════════════════════
-app.use(express.static(distPath));
-
-// React Router fallback
-app.get('*', (req, res) => {
-  if (req.path.startsWith('/api')) {
-    return res.status(404).json({ error: 'API route not found' });
-  }
-
-  res.sendFile(path.join(distPath, 'index.html'));
-});
-
-  // ─── KEEP-ALIVE (prévient les cold starts sur Render Starter) ────────────
+  // ─── KEEP-ALIVE ───────────────────────────────────────────────────────────
   const SELF_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
   setInterval(async () => {
-    try {
-      await fetch(`${SELF_URL}/api/health`);
-      console.log('💓 Keep-alive ping OK');
-    } catch { console.warn('⚠️ Keep-alive ping échoué'); }
-  }, 10 * 60 * 1000); // toutes les 10 minutes
+    try { await fetch(`${SELF_URL}/api/health`); console.log('💓 Keep-alive OK'); }
+    catch { console.warn('⚠️ Keep-alive échoué'); }
+  }, 10 * 60 * 1000);
 
-  // ─── BACKUP AUTOMATIQUE (stats toutes les 24h) ────────────────────────────
-  const autoBackup = async () => {
-    try {
-      const [u, c, p, m] = await Promise.all([
-        db.one(`SELECT COUNT(*) as c FROM users`),
-        db.one(`SELECT COUNT(*) as c FROM companies`),
-        db.one(`SELECT COUNT(*) as c FROM posts`),
-        db.one(`SELECT COUNT(*) as c FROM messages`),
-      ]);
-      const stats = `users:${u.c} companies:${c.c} posts:${p.c} messages:${m.c}`;
-      await logAction('INFO', 'auto_backup_check', undefined, undefined, stats);
-      console.log(`💾 Stats: ${stats}`);
-    } catch (e: any) { errorTracker.capture(e, 'auto_backup'); }
-  };
-  autoBackup(); // run au démarrage
-  setInterval(autoBackup, 24 * 60 * 60 * 1000);
-
-  // ════════════════════════════════════════════════════════════════════════
-  // 🚀 DÉMARRAGE
-  // ════════════════════════════════════════════════════════════════════════
+  // ─── DÉMARRAGE ────────────────────────────────────────────────────────────
   httpServer.listen(PORT, '0.0.0.0', () => {
     console.log('\n════════════════════════════════════════');
-    console.log(`✅  FreeBara Server lancé sur le port ${PORT}`);
-    console.log(`🗄️   Base de données : PostgreSQL`);
-    console.log(`🔐  JWT Secret      : ${JWT_SECRET.substring(0, 12)}...`);
-    console.log(`📧  Email Service   : Resend`);
-    console.log(`🔑  Resend API Key  : ${process.env.RESEND_API_KEY ? '✔ Configuré' : '⚠️ Non configuré'}`); 
-    console.log(`🖼️   Cloudinary      : ${process.env.CLOUDINARY_URL ? '✅ Configuré' : '⚠️  Non configuré'}`);
-    console.log(`🛡️   Admin panel     : /api/admin/*`);
-    console.log(`📊  Monitoring      : /api/admin/health-full`);
-    console.log(`💾  Backup          : POST /api/admin/backup`);
+    console.log(`✅  FreeBara Server v2 — port ${PORT}`);
+    console.log(`🗄️   PostgreSQL | 🔐 JWT | 📧 Resend`);
+    console.log(`🛡️   Modération auto | 💾 Backup/heure`);
+    console.log(`✅  Validation | 📊 Dashboard admin`);
     console.log('════════════════════════════════════════\n');
   });
 
-  // Arrêt propre
   process.on('SIGTERM', async () => {
-    console.log('🛑 SIGTERM reçu — fermeture propre...');
+    console.log('🛑 SIGTERM — fermeture propre...');
     await pool.end();
     process.exit(0);
   });
 }
 
 startServer().catch((e) => {
-  console.error('❌ Erreur critique au démarrage:', e);
+  console.error('❌ Erreur critique:', e);
   process.exit(1);
 });
