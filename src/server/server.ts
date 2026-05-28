@@ -37,21 +37,16 @@ export const ALLOWED_ORIGINS = [
 
 // ─── Imports modules ─────────────────────────────────────────────────────────
 import { pool, db }          from './config/db.js';
-import { initDB } from './database/init.js';
-import { runMigrations } from './database/migrations.js';
+import { initDB }            from './database/init.js';
+import { runMigrations }     from './database/migrations.js';
 import { cacheGet, cacheSet, cacheDel, cacheSize } from './services/cache.js';
 import { metrics, errorTracker } from './services/metrics.js';
-import { enqueueJob, jobQueue }  from './services/queue.js';
+import { enqueueJob, jobQueue }  from './services/Queue.js';
 import { uploadToCloudinary }    from './services/cloudinary.js';
 import { startBackupJobs, getBackupHistory, snapshotCounts } from './services/backup.js';
-import {
-  analyzeContent,
-  autoModerate,
-  incrementSpamCounter,
-  moderationCache
-} from './middleware/moderation.js';
+import { analyzeContent, autoModerate, incrementSpamCounter, moderationCache } from './middleware/moderation.js';
 import { authenticate, requireAdmin, requireSuperAdmin } from './middleware/auth.js';
-import { rateLimit } from './middleware/rateLimit.js';
+import { rateLimit }         from './middleware/rateLimit.js';
 import { validate, schemas } from './middleware/validate.js';
 import { isValidEmail, sendOTPEmail } from './services/email.js';
 import { hashOtp }           from './config/db.js';
@@ -995,7 +990,7 @@ async function startServer() {
       errors: metrics.errors,
       avgResponseMs: metrics.avgResponseTime(),
       p95ResponseMs: metrics.p95ResponseTime(),
-     cacheSize: cacheSize(),
+      cacheSize: cacheSize(),
       queueSize: jobQueue.length,
       uptime: Math.floor(process.uptime()),
       memoryMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),

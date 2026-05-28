@@ -185,7 +185,7 @@ export const api = {
 
       if (text.trim().startsWith('<')) {
         console.error('API Error: Server returned HTML. Endpoint:', endpoint);
-        throw new Error(`Erreur serveur sur ${endpoint} : Réponse HTML reçue au lieu de JSON`);
+        return null;
       }
 
       try {

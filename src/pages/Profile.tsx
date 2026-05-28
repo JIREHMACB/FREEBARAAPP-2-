@@ -139,7 +139,7 @@ export default function Profile() {
   const handleDeleteAccount = async () => {
     try {
       await api.users.deleteAccount();
-      localStorage.removeItem('jce_token');
+      localStorage.removeItem('token');
       navigate('/login');
       toast.success('Votre compte a été supprimé définitivement.');
     } catch (error) {
@@ -323,7 +323,7 @@ export default function Profile() {
         : `En tant qu'expert JCE, suggère une vision inspirante pour un ${formData.profession} de ${formData.age} ans au ${formData.country}. Réponds uniquement avec la vision.`;
 
       const response = await ai.models.generateContent({
-        model: "gemini-3-flash-preview",
+        model: "gemini-2.0-flash-exp",
         contents: prompt,
       });
 
@@ -366,7 +366,7 @@ export default function Profile() {
       Exemple: [1, 5, 12]`;
 
       const response = await ai.models.generateContent({
-        model: "gemini-3-flash-preview",
+        model: "gemini-2.0-flash-exp",
         contents: prompt,
         config: {
           responseMimeType: "application/json",
@@ -427,8 +427,8 @@ export default function Profile() {
           });
         }
         
-        // Fetch data for the profile
-        const [eventsData, servicesData, networkData, certsData, favCompaniesData, allCompaniesData, postsData] = await Promise.all([
+        // Promise.allSettled : si une requête échoue, les autres continuent
+        const results = await Promise.allSettled([
           api.users.getEvents(targetUserId),
           api.users.getServices(),
           api.users.getFollowing(),
@@ -437,6 +437,8 @@ export default function Profile() {
           api.companies.getAll(),
           api.posts.getAll(1, 50, 'Tous', 'Tous', targetUserId)
         ]);
+        const [eventsData, servicesData, networkData, certsData, favCompaniesData, allCompaniesData, postsData] =
+          results.map((r: PromiseSettledResult<any>) => r.status === 'fulfilled' ? r.value : []);
         
         let networkRequestsData = [];
         try {
@@ -505,6 +507,25 @@ export default function Profile() {
   };
 
   const isOwnProfile = !userId || (currentUser && parseInt(userId) === currentUser.id);
+
+  // Guard : profil introuvable ou erreur réseau
+  if (!loading && !user) {
+    return (
+      <div className="min-h-screen flex flex-col items-center justify-center gap-4 p-8">
+        <div className="text-6xl">😕</div>
+        <h2 className="text-xl font-semibold text-slate-800">Profil introuvable</h2>
+        <p className="text-slate-500 text-center max-w-sm">
+          Ce profil n'existe pas ou une erreur réseau s'est produite.
+        </p>
+        <button
+          onClick={() => window.history.back()}
+          className="mt-2 px-5 py-2 bg-slate-900 text-white rounded-xl text-sm font-medium hover:bg-slate-700 transition-colors"
+        >
+          Retour
+        </button>
+      </div>
+    );
+  }
 
   const openEditModal = () => {
     setEditStep(1);
