@@ -10,7 +10,7 @@
     "build:frontend": "vite build",
     "build:backend": "tsc -p tsconfig.server.json",
     "build": "npm run build:frontend && npm run build:backend",
-    "start": "node dist/server.js",
+    "start": "node dist/server/server.js",
     "preview": "vite preview"
   },
   "dependencies": {
