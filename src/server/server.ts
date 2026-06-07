@@ -37,16 +37,21 @@ export const ALLOWED_ORIGINS = [
 
 // ─── Imports modules ─────────────────────────────────────────────────────────
 import { pool, db }          from './config/db.js';
-import { initDB }            from './database/init.js';
-import { runMigrations }     from './database/migrations.js';
+import { initDB } from './database/init';
+import { runMigrations } from './database/migrations';
 import { cacheGet, cacheSet, cacheDel, cacheSize } from './services/cache.js';
 import { metrics, errorTracker } from './services/metrics.js';
-import { enqueueJob, jobQueue }  from './services/Queue.js';
+import { enqueueJob, jobQueue }  from './services/queue.js';
 import { uploadToCloudinary }    from './services/cloudinary.js';
 import { startBackupJobs, getBackupHistory, snapshotCounts } from './services/backup.js';
-import { analyzeContent, autoModerate, incrementSpamCounter, moderationCache } from './middleware/moderation.js';
+import {
+  analyzeContent,
+  autoModerate,
+  incrementSpamCounter,
+  moderationCache   // ✅ FIX 1 — maintenant exporté depuis moderation.ts
+} from './middleware/moderation';
 import { authenticate, requireAdmin, requireSuperAdmin } from './middleware/auth.js';
-import { rateLimit }         from './middleware/rateLimit.js';
+import { rateLimit } from './middleware/rateLimit';  // ✅ FIX 2 — fichier créé
 import { validate, schemas } from './middleware/validate.js';
 import { isValidEmail, sendOTPEmail } from './services/email.js';
 import { hashOtp }           from './config/db.js';
@@ -772,6 +777,7 @@ async function startServer() {
   });
   app.put('/api/admin/users/:id/unban', authenticate, requireAdmin,      async (req: any, res) => { await pool.query(`UPDATE users SET status='active',"bannedReason"=NULL WHERE id=$1`,[req.params.id]); await pool.query(`INSERT INTO admin_logs("adminId",action,"targetId") VALUES($1,'unban_user',$2)`,[req.userId,req.params.id]); res.json({success:true}); });
   app.delete('/api/admin/users/:id',    authenticate, requireSuperAdmin, async (req: any, res) => { if(Number(req.params.id)===req.userId) return res.status(400).json({error:'Impossible'}); await pool.query(`DELETE FROM users WHERE id=$1`,[req.params.id]); await pool.query(`INSERT INTO admin_logs("adminId",action,"targetId") VALUES($1,'delete_user',$2)`,[req.userId,req.params.id]); await logAction('ADMIN','delete_user',req.userId,req.ip,`User ${req.params.id}`); res.json({success:true}); });
+
   // ════════════════════════════════════════════════════════════════════════
   // 🛡️  MODÉRATION — Panel admin complet
   // ════════════════════════════════════════════════════════════════════════
@@ -976,8 +982,8 @@ async function startServer() {
     res.json({ ...u, stats: { posts: posts.c, companies: companies.c, reports: reports.c } });
   });
 
-  // ── Métriques & monitoring ────s──────────────────────────────────────────────
-  app.get('/api/admin/metrics',         authenticate, requireSuperAdmin, async (req: any, res) => {
+  // ── Métriques & monitoring ────────────────────────────────────────────────
+  app.get('/api/admin/metrics', authenticate, requireSuperAdmin, async (req: any, res) => {
     const hours = Math.max(1, Math.min(168, parseInt(req.query.hours as string) || 24));
     const m = await db.all(
       `SELECT name, AVG(value) as avg, MAX(value) as max, MIN(value) as min,
@@ -990,7 +996,7 @@ async function startServer() {
       errors: metrics.errors,
       avgResponseMs: metrics.avgResponseTime(),
       p95ResponseMs: metrics.p95ResponseTime(),
-      cacheSize: cacheSize(),
+      cacheSize: cacheSize(),       // ✅ FIX 3 — remplacé cache.size par cacheSize()
       queueSize: jobQueue.length,
       uptime: Math.floor(process.uptime()),
       memoryMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
@@ -1027,9 +1033,6 @@ async function startServer() {
     cacheDel(`auth:${req.params.id}`);
     res.json({ success: true });
   });
-
-  // ── Health-full enrichi ──────────────────────────────────────────────────────
-  // ════════════════════════════════════════════════════════════════════════
 
   // ─── BACKUP ROUTES (admin) ────────────────────────────────────────────────
   app.get('/api/admin/backup/history', authenticate, requireAdmin, async (_, res) => {

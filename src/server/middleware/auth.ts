@@ -1,6 +1,6 @@
 import jwt from 'jsonwebtoken';
 import { db, pool } from '../config/db.js';
-import { cacheGet, cacheSet } from '../services/cache.ts/index.js';
+import { cacheGet, cacheSet } from '../services/cache.js';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-only-secret';
 

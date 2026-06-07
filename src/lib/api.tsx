@@ -3,13 +3,15 @@ import { toast } from 'react-hot-toast';
 import { io } from 'socket.io-client';
 
 // ✅ CORRECTION : BASE_URL pour le socket, API_URL avec /api pour les requêtes
-const BASE_URL = "https://www.freebara.com";
+const BASE_URL =
+  import.meta.env.VITE_API_BASE_URL || window.location.origin;
+
 const API_URL = `${BASE_URL}/api`;
 export const socket = io(BASE_URL, {
   path: "/socket.io",
   transports: ['websocket'],
   autoConnect: false,
-});
+}); 
 
 export const connectSocket = () => {
   const token = localStorage.getItem('token');

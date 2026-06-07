@@ -1,5 +1,5 @@
 import { pool, db } from '../config/db.js';
-import { cacheGet, cacheSet } from '../services/cache.ts/index.js';
+import { cacheGet, cacheSet } from '../services/cache.js';
 
 export const moderationCache = new Map<string, any>();
 
