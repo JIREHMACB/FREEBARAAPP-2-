@@ -35,26 +35,61 @@ export const ALLOWED_ORIGINS = [
   ...(IS_DEV ? ['http://localhost:5173', 'http://localhost:3000'] : []),
 ];
 
-// ─── Imports modules ─────────────────────────────────────────────────────────
-import { pool, db }          from './config/db.js';
-import { initDB } from './database/init';
-import { runMigrations } from './database/migrations';
-import { cacheGet, cacheSet, cacheDel, cacheSize } from './services/cache.js';
-import { metrics, errorTracker } from './services/metrics.js';
-import { enqueueJob, jobQueue }  from './services/queue.js';
-import { uploadToCloudinary }    from './services/cloudinary.js';
-import { startBackupJobs, getBackupHistory, snapshotCounts } from './services/backup.js';
+// ─── Imports modules ----------------------------------------
+import { pool, db, hashOtp } from './config/db.js';
+
+import { initDB } from './database/init.js';
+import { runMigrations } from './database/migrations.js';
+
+import {
+  cacheGet,
+  cacheSet,
+  cacheDel,
+  cacheSize
+} from './services/cache.js';
+
+import {
+  metrics,
+  errorTracker
+} from './services/metrics.js';
+
+import {
+  enqueueJob,
+  jobQueue
+} from './services/queue.js';
+
+import { uploadToCloudinary } from './services/cloudinary.js';
+
+import {
+  startBackupJobs,
+  getBackupHistory,
+  snapshotCounts
+} from './services/backup.js';
+
 import {
   analyzeContent,
   autoModerate,
   incrementSpamCounter,
-  moderationCache   // ✅ FIX 1 — maintenant exporté depuis moderation.ts
-} from './middleware/moderation';
-import { authenticate, requireAdmin, requireSuperAdmin } from './middleware/auth.js';
-import { rateLimit } from './middleware/rateLimit';  // ✅ FIX 2 — fichier créé
-import { validate, schemas } from './middleware/validate.js';
-import { isValidEmail, sendOTPEmail } from './services/email.js';
-import { hashOtp }           from './config/db.js';
+  moderationCache
+} from './middleware/moderation.js';
+
+import {
+  authenticate,
+  requireAdmin,
+  requireSuperAdmin
+} from './middleware/auth.js';
+
+import { rateLimit } from './middleware/rateLimit.js';
+
+import {
+  validate,
+  schemas
+} from './middleware/validate.js';
+
+import {
+  isValidEmail,
+  sendOTPEmail
+} from './services/email.js';
 
 // ─── PERMISSIONS ─────────────────────────────────────────────────────────────
 const ROLE_PERMISSIONS: Record<string, string[]> = {
@@ -88,6 +123,8 @@ async function startServer() {
   const io         = new Server(httpServer, {
     path: '/socket.io',
     cors: { origin: ALLOWED_ORIGINS, methods: ['GET','POST'], credentials: true },
+    transports: ['polling', 'websocket'],
+    allowUpgrades: true,
   });
 
   // ─── MIDDLEWARE ────────────────────────────────────────────────────────────
@@ -103,22 +140,47 @@ async function startServer() {
     res.setHeader('Referrer-Policy',           'strict-origin-when-cross-origin');
     res.setHeader('Permissions-Policy',        'camera=(), microphone=(), geolocation=()');
     res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
-    res.setHeader('Content-Security-Policy',   "default-src 'self'; connect-src 'self' https://api.cloudinary.com wss://www.freebara.com");
+    // ─── CSP — adaptée frontend Render + Google Fonts + WebSocket ────────────
+    const frontendOrigins = [
+      'https://www.freebara.com',
+      'https://freebara.com',
+      'https://freebaraapp-2.onrender.com',
+      ...(IS_DEV ? ['http://localhost:5173', 'http://localhost:3000'] : []),
+    ].join(' ');
+    const wsFrontend = IS_DEV
+      ? 'wss://www.freebara.com ws://localhost:*'
+      : 'wss://www.freebara.com';
+    const cspParts = [
+      `default-src 'self' ${frontendOrigins}`,
+      `connect-src 'self' ${frontendOrigins} https://api.cloudinary.com ${wsFrontend}`,
+      "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+      "style-src-elem 'self' 'unsafe-inline' https://fonts.googleapis.com",
+      "font-src 'self' https://fonts.gstatic.com data:",
+      "img-src 'self' data: blob: https://res.cloudinary.com https://picsum.photos https://www.freebara.com https://freebaraapp-2.onrender.com",
+      "script-src 'self' 'unsafe-inline'",
+      "worker-src 'self' blob:",
+      "frame-ancestors 'none'",
+    ];
+    res.setHeader('Content-Security-Policy', cspParts.join('; '));
     next();
   });
 
   // ─── MONITORING MIDDLEWARE ─────────────────────────────────────────────────
   app.use((req: any, res: any, next: any) => {
     const start = Date.now();
+    const reqId = Math.random().toString(36).slice(2, 8);
+    req._reqId = reqId;
     metrics.requests++;
     res.on('finish', () => {
-      const ms = Date.now() - start;
+      const ms  = Date.now() - start;
+      const log = `[${reqId}] ${req.method} ${req.path} ${res.statusCode} ${ms}ms ip=${req.ip ?? '-'}`;
       metrics.recordResponseTime(ms);
-      if (res.statusCode >= 400) metrics.errors++;
-      const log = `${req.method} ${req.path} ${res.statusCode} ${ms}ms`;
-      if (res.statusCode >= 500) console.error('🔴 ' + log);
-      else if (res.statusCode >= 400) console.warn('🟡 ' + log);
-      else if (ms > 3000) console.warn('🐢 SLOW ' + log);
+      if (res.statusCode >= 500) { metrics.errors++; console.error('🔴 ' + log); }
+      else if (res.statusCode >= 400) { metrics.errors++; console.warn('🟡 ' + log); }
+      else if (ms > 3000)              console.warn('🐢 SLOW ' + log);
+      else if (ms > 1000)              console.warn('🟠 ' + log);
+      // Log toutes les requêtes API en dev
+      else if (IS_DEV)                 console.log('🟢 ' + log);
     });
     next();
   });
@@ -134,8 +196,28 @@ async function startServer() {
     try {
       const start = Date.now();
       await pool.query('SELECT 1');
-      res.json({ status:'ok', db:'postgresql', dbLatency:`${Date.now()-start}ms`, uptime:`${Math.floor(process.uptime())}s`, memory:`${Math.round(process.memoryUsage().heapUsed/1024/1024)}MB`, cacheSize:cacheSize(), queueSize:jobQueue.length, time:new Date() });
-    } catch { res.status(500).json({ status:'error', db:'disconnected' }); }
+      const dbLatency = Date.now() - start;
+      const mem = process.memoryUsage();
+      res.json({
+        status:      'ok',
+        db:          'postgresql',
+        dbLatency:   `${dbLatency}ms`,
+        dbOk:        dbLatency < 2000,
+        uptime:      `${Math.floor(process.uptime())}s`,
+        memHeapMB:   Math.round(mem.heapUsed  / 1024 / 1024),
+        memRssMB:    Math.round(mem.rss        / 1024 / 1024),
+        cacheSize:   cacheSize(),
+        queueSize:   jobQueue.length,
+        avgRespMs:   metrics.avgResponseTime(),
+        p95RespMs:   metrics.p95ResponseTime(),
+        totalErrors: metrics.errors,
+        env:         IS_DEV ? 'development' : 'production',
+        time:        new Date().toISOString(),
+      });
+    } catch (e: any) {
+      console.error('❌ Health check DB failed:', e.message);
+      res.status(500).json({ status: 'error', db: 'disconnected', error: e.message });
+    }
   });
 
   // ════════════════════════════════════════════════════════════════════════
@@ -295,6 +377,53 @@ async function startServer() {
     res.json(await db.all(q, p));
   });
 
+  app.get('/api/users/me/following',        authenticate, async (req: any, res) => res.json(await db.all(`SELECT u.id,u.name,u.profession,u."avatarUrl",u.company,u.badge FROM users u JOIN follows f ON u.id=f."followingId" WHERE f."followerId"=$1`, [req.userId])));
+  app.get('/api/users/me/connections',      authenticate, async (req: any, res) => res.json(await db.all(`SELECT u.id,u.name,u.profession,u."avatarUrl" FROM users u WHERE u.id IN(SELECT "senderId" FROM connection_requests WHERE "receiverId"=$1 AND status='accepted' UNION SELECT "receiverId" FROM connection_requests WHERE "senderId"=$1 AND status='accepted')`, [req.userId])));
+  app.get('/api/users/me/network-requests', authenticate, async (req: any, res) => res.json(await db.all(`SELECT cr.*,u.name,u."avatarUrl",u.profession FROM connection_requests cr JOIN users u ON cr."senderId"=u.id WHERE cr."receiverId"=$1 AND cr.status='pending'`, [req.userId])));
+  app.get('/api/users/me/certifications',   authenticate, async (req: any, res) => res.json(await db.all(`SELECT id, "userId", name, organization, "dateObtained", "createdAt" FROM certifications WHERE "userId"=$1 ORDER BY "dateObtained" DESC`, [req.userId])));
+  app.post('/api/users/me/certifications',  authenticate, async (req: any, res) => { const {name,organization,dateObtained}=req.body; res.json(await db.one(`INSERT INTO certifications("userId",name,organization,"dateObtained") VALUES($1,$2,$3,$4) RETURNING *`, [req.userId,name,organization,dateObtained])); });
+  app.delete('/api/users/me/certifications/:id', authenticate, async (req: any, res) => { await pool.query(`DELETE FROM certifications WHERE id=$1 AND "userId"=$2`, [req.params.id, req.userId]); res.json({ success: true }); });
+  app.get('/api/users/me/transactions',     authenticate, async (req: any, res) => res.json(await db.all(`SELECT id, "userId", date, description, category, amount, type, "createdAt" FROM transactions WHERE "userId"=$1 ORDER BY date DESC`, [req.userId])));
+  app.post('/api/users/me/transactions',    authenticate, async (req: any, res) => { const {date,description,category,amount,type}=req.body; const tx=await db.one(`INSERT INTO transactions("userId",date,description,category,amount,type) VALUES($1,$2,$3,$4,$5,$6) RETURNING *`,[req.userId,date,description,category,amount,type]); io.to(`user_${req.userId}`).emit('transaction_update',tx); res.json(tx); });
+  app.get('/api/users/me/favorite-companies', authenticate, async (req: any, res) => res.json(await db.all(`SELECT c.* FROM companies c JOIN favorite_companies fc ON c.id=fc."companyId" WHERE fc."userId"=$1`, [req.userId])));
+  app.get('/api/users/me/favorite-products',  authenticate, async (req: any, res) => res.json(await db.all(`SELECT p.*,c.name as "companyName" FROM company_catalog p JOIN companies c ON p."companyId"=c.id JOIN favorite_products fp ON p.id=fp."productId" WHERE fp."userId"=$1`, [req.userId])));
+  app.get('/api/users/me/events',   authenticate, async (req: any, res) => res.json(await db.all(`SELECT e.* FROM events e JOIN event_participants ep ON e.id=ep."eventId" WHERE ep."userId"=$1 ORDER BY e."startDate" ASC`, [req.userId])));
+  app.get('/api/users/me/services', authenticate, async (req: any, res) => {
+    const cr = await db.all(`SELECT id, "providerId", title, description, availability, budget, type, "companyName", location, "contractType", "fileUrl", category, "createdAt" FROM services WHERE "providerId"=$1 ORDER BY "createdAt" DESC`, [req.userId]);
+    const ap = await db.all(`SELECT s.id, s."providerId", s.title, s.description, s.budget, s.type, s.category, s."createdAt" FROM services s JOIN service_applications sa ON s.id=sa."serviceId" WHERE sa."userId"=$1`, [req.userId]);
+    res.json({ created: cr, applied: ap });
+  });
+  app.post('/api/users/me/claim-church', authenticate, async (req: any, res) => { await pool.query(`UPDATE users SET church=$1 WHERE id=$2`, [req.body.churchName, req.userId]); res.json({ success: true }); });
+  app.put('/api/users/me/network-requests/:id/accept', authenticate, async (req: any, res) => {
+    await pool.query(`UPDATE connection_requests SET status='accepted' WHERE id=$1 AND "receiverId"=$2`, [req.params.id, req.userId]);
+    res.json({ success: true });
+  });
+  app.put('/api/users/me/network-requests/:id/reject', authenticate, async (req: any, res) => {
+    await pool.query(`UPDATE connection_requests SET status='rejected' WHERE id=$1 AND "receiverId"=$2`, [req.params.id, req.userId]);
+    res.json({ success: true });
+  });
+  app.delete('/api/users/me/connections/:id', authenticate, async (req: any, res) => {
+    await pool.query(`DELETE FROM connection_requests WHERE (("senderId"=$1 AND "receiverId"=$2) OR ("senderId"=$2 AND "receiverId"=$1)) AND status='accepted'`, [req.userId, req.params.id]);
+    res.json({ success: true });
+  });
+  app.get('/api/users/me/blocked', authenticate, async (req: any, res) => {
+    res.json(await db.all(`SELECT u.id,u.name,u."avatarUrl" FROM users u JOIN blocked_users b ON u.id=b."blockedId" WHERE b."blockerId"=$1`, [req.userId]));
+  });
+  app.get('/api/users/me/completion', authenticate, async (req: any, res) => {
+    const u = await db.one(`SELECT name,profession,bio,"avatarUrl",country,phone,location FROM users WHERE id=$1`, [req.userId]);
+    if (!u) return res.status(404).json({ error: 'Introuvable' });
+    const fields = ['name','profession','bio','avatarUrl','country','phone','location'] as const;
+    const filled = fields.filter(f => u[f]);
+    res.json({ percent: Math.round((filled.length / fields.length) * 100), missing: fields.filter(f => !u[f]) });
+  });
+  app.delete('/api/users/me/transactions/:id', authenticate, async (req: any, res) => {
+    await pool.query(`DELETE FROM transactions WHERE id=$1 AND "userId"=$2`, [req.params.id, req.userId]);
+    res.json({ success: true });
+  });
+  app.get('/api/users/me/transactions/stats', authenticate, async (req: any, res) => {
+    const stats = await db.one(`SELECT COALESCE(SUM(CASE WHEN type='credit' THEN amount ELSE 0 END),0) as income, COALESCE(SUM(CASE WHEN type='debit' THEN amount ELSE 0 END),0) as expenses FROM transactions WHERE "userId"=$1`, [req.userId]);
+    res.json({ income: parseFloat(stats.income), expenses: parseFloat(stats.expenses), balance: parseFloat(stats.income) - parseFloat(stats.expenses) });
+  });
   app.get('/api/users/:id', authenticate, async (req: any, res) => {
     const u = await db.one(`SELECT id,name,profession,bio,company,"avatarUrl","coverUrl",country,badge,role,"createdAt" FROM users WHERE id=$1`, [req.params.id]);
     if (!u) return res.status(404).json({ error: 'Introuvable' });
@@ -318,24 +447,7 @@ async function startServer() {
     catch { res.status(400).json({ error: 'Déjà envoyé' }); }
   });
 
-  app.get('/api/users/me/following',        authenticate, async (req: any, res) => res.json(await db.all(`SELECT u.id,u.name,u.profession,u."avatarUrl",u.company,u.badge FROM users u JOIN follows f ON u.id=f."followingId" WHERE f."followerId"=$1`, [req.userId])));
-  app.get('/api/users/me/connections',      authenticate, async (req: any, res) => res.json(await db.all(`SELECT u.id,u.name,u.profession,u."avatarUrl" FROM users u WHERE u.id IN(SELECT "senderId" FROM connection_requests WHERE "receiverId"=$1 AND status='accepted' UNION SELECT "receiverId" FROM connection_requests WHERE "senderId"=$1 AND status='accepted')`, [req.userId])));
-  app.get('/api/users/me/network-requests', authenticate, async (req: any, res) => res.json(await db.all(`SELECT cr.*,u.name,u."avatarUrl",u.profession FROM connection_requests cr JOIN users u ON cr."senderId"=u.id WHERE cr."receiverId"=$1 AND cr.status='pending'`, [req.userId])));
-  app.get('/api/users/me/certifications',   authenticate, async (req: any, res) => res.json(await db.all(`SELECT id, "userId", name, organization, "dateObtained", "createdAt" FROM certifications WHERE "userId"=$1 ORDER BY "dateObtained" DESC`, [req.userId])));
-  app.post('/api/users/me/certifications',  authenticate, async (req: any, res) => { const {name,organization,dateObtained}=req.body; res.json(await db.one(`INSERT INTO certifications("userId",name,organization,"dateObtained") VALUES($1,$2,$3,$4) RETURNING *`, [req.userId,name,organization,dateObtained])); });
-  app.delete('/api/users/me/certifications/:id', authenticate, async (req: any, res) => { await pool.query(`DELETE FROM certifications WHERE id=$1 AND "userId"=$2`, [req.params.id, req.userId]); res.json({ success: true }); });
-  app.get('/api/users/me/transactions',     authenticate, async (req: any, res) => res.json(await db.all(`SELECT id, "userId", date, description, category, amount, type, "createdAt" FROM transactions WHERE "userId"=$1 ORDER BY date DESC`, [req.userId])));
-  app.post('/api/users/me/transactions',    authenticate, async (req: any, res) => { const {date,description,category,amount,type}=req.body; const tx=await db.one(`INSERT INTO transactions("userId",date,description,category,amount,type) VALUES($1,$2,$3,$4,$5,$6) RETURNING *`,[req.userId,date,description,category,amount,type]); io.to(`user_${req.userId}`).emit('transaction_update',tx); res.json(tx); });
-  app.get('/api/users/me/favorite-companies', authenticate, async (req: any, res) => res.json(await db.all(`SELECT c.* FROM companies c JOIN favorite_companies fc ON c.id=fc."companyId" WHERE fc."userId"=$1`, [req.userId])));
-  app.get('/api/users/me/favorite-products',  authenticate, async (req: any, res) => res.json(await db.all(`SELECT p.*,c.name as "companyName" FROM company_catalog p JOIN companies c ON p."companyId"=c.id JOIN favorite_products fp ON p.id=fp."productId" WHERE fp."userId"=$1`, [req.userId])));
-  app.get('/api/users/me/events',   authenticate, async (req: any, res) => res.json(await db.all(`SELECT e.* FROM events e JOIN event_participants ep ON e.id=ep."eventId" WHERE ep."userId"=$1 ORDER BY e."startDate" ASC`, [req.userId])));
   app.get('/api/users/:id/events',  authenticate, async (req: any, res) => res.json(await db.all(`SELECT e.* FROM events e JOIN event_participants ep ON e.id=ep."eventId" WHERE ep."userId"=$1`, [req.params.id])));
-  app.get('/api/users/me/services', authenticate, async (req: any, res) => {
-    const cr = await db.all(`SELECT id, "providerId", title, description, availability, budget, type, "companyName", location, "contractType", "fileUrl", category, "createdAt" FROM services WHERE "providerId"=$1 ORDER BY "createdAt" DESC`, [req.userId]);
-    const ap = await db.all(`SELECT s.id, s."providerId", s.title, s.description, s.budget, s.type, s.category, s."createdAt" FROM services s JOIN service_applications sa ON s.id=sa."serviceId" WHERE sa."userId"=$1`, [req.userId]);
-    res.json({ created: cr, applied: ap });
-  });
-  app.post('/api/users/me/claim-church', authenticate, async (req: any, res) => { await pool.query(`UPDATE users SET church=$1 WHERE id=$2`, [req.body.churchName, req.userId]); res.json({ success: true }); });
 
   // ════════════════════════════════════════════════════════════════════════
   // 📝 PUBLICATIONS (Posts)
@@ -404,14 +516,14 @@ async function startServer() {
 
   app.put('/api/posts/:id', authenticate, async (req: any, res) => {
     const p = await db.one(`SELECT "authorId" FROM posts WHERE id=$1`, [req.params.id]);
-    if (!p || p.authorid !== req.userId) return res.status(403).json({ error: 'Non autorisé' });
+    if (!p || p.authorId !== req.userId) return res.status(403).json({ error: 'Non autorisé' });
     await pool.query(`UPDATE posts SET content=$1 WHERE id=$2`, [req.body.content, req.params.id]);
     res.json({ success: true });
   });
 
   app.delete('/api/posts/:id', authenticate, async (req: any, res) => {
     const p = await db.one(`SELECT "authorId" FROM posts WHERE id=$1`, [req.params.id]);
-    if (!p || p.authorid !== req.userId) return res.status(403).json({ error: 'Non autorisé' });
+    if (!p || p.authorId !== req.userId) return res.status(403).json({ error: 'Non autorisé' });
     await pool.query(`DELETE FROM posts WHERE id=$1`, [req.params.id]);
     res.json({ success: true });
   });
@@ -431,7 +543,7 @@ async function startServer() {
   app.get('/api/posts/:id/comments',  authenticate, async (req: any, res) => res.json(await db.all(`SELECT c.*,u.name as "authorName",u."avatarUrl" as "authorAvatar" FROM post_comments c JOIN users u ON c."userId"=u.id WHERE c."postId"=$1 ORDER BY c."createdAt" ASC`, [req.params.id])));
   app.get('/api/posts/:id/reactions', authenticate, async (req: any, res) => res.json(await db.all(`SELECT l.type,u.id as "userId",u.name,u."avatarUrl" FROM post_likes l JOIN users u ON l."userId"=u.id WHERE l."postId"=$1`, [req.params.id])));
   app.post('/api/posts/:id/comments', authenticate, async (req: any, res) => { const c=await db.one(`INSERT INTO post_comments("postId","userId",content) VALUES($1,$2,$3) RETURNING *`,[req.params.id,req.userId,req.body.content]); res.json(c); });
-  app.put('/api/posts/:postId/comments/:commentId', authenticate, async (req: any, res) => { const c=await db.one(`SELECT "userId" FROM post_comments WHERE id=$1`,[req.params.commentId]); if(!c||c.userid!==req.userId) return res.status(403).json({error:'Non autorisé'}); await pool.query(`UPDATE post_comments SET content=$1 WHERE id=$2`,[req.body.content,req.params.commentId]); res.json({success:true}); });
+  app.put('/api/posts/:postId/comments/:commentId', authenticate, async (req: any, res) => { const c=await db.one(`SELECT "userId" FROM post_comments WHERE id=$1`,[req.params.commentId]); if(!c||c.userId!==req.userId) return res.status(403).json({error:'Non autorisé'}); await pool.query(`UPDATE post_comments SET content=$1 WHERE id=$2`,[req.body.content,req.params.commentId]); res.json({success:true}); });
   app.delete('/api/posts/:postId/comments/:commentId', authenticate, async (req: any, res) => { await pool.query(`DELETE FROM post_comments WHERE id=$1 AND "userId"=$2`,[req.params.commentId,req.userId]); res.json({success:true}); });
   app.post('/api/posts/:id/view',  authenticate, async (req: any, res) => { await pool.query(`UPDATE posts SET views=views+1 WHERE id=$1`,[req.params.id]); res.json({success:true}); });
   app.post('/api/posts/:id/boost', authenticate, async (req: any, res) => { try { await pool.query(`INSERT INTO post_boosts("postId","userId",amount) VALUES($1,$2,$3)`,[req.params.id,req.userId,req.body.amount]); res.json({success:true}); } catch { res.status(400).json({error:'Déjà boosté'}); } });
@@ -448,8 +560,8 @@ async function startServer() {
   app.get('/api/events',     authenticate, async (_, res) => res.json(await db.all(`SELECT e.*,u.name as "creatorName",(SELECT COUNT(*) FROM event_participants WHERE "eventId"=e.id) as "participantsCount" FROM events e JOIN users u ON e."creatorId"=u.id ORDER BY e."startDate" ASC`, [])));
   app.post('/api/events',    authenticate, async (req: any, res) => { const {title,description,imageUrl,country,city,location,latitude,longitude,startDate,endDate,category,price,visualUrl}=req.body; res.json(await db.one(`INSERT INTO events(title,description,"imageUrl",country,city,location,latitude,longitude,"startDate","endDate",category,"creatorId",price,"visualUrl") VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`,[title,description,imageUrl,country,city,location,latitude,longitude,startDate,endDate,category,req.userId,price||0,visualUrl])); });
   app.get('/api/events/:id', authenticate, async (req: any, res) => { const e=await db.one(`SELECT e.*,u.name as "creatorName",(SELECT COUNT(*) FROM event_participants WHERE "eventId"=e.id) as "participantsCount",EXISTS(SELECT 1 FROM event_participants WHERE "eventId"=e.id AND "userId"=$1) as "isParticipating" FROM events e JOIN users u ON e."creatorId"=u.id WHERE e.id=$2`,[req.userId,req.params.id]); if(!e) return res.status(404).json({error:'Non trouvé'}); res.json(e); });
-  app.put('/api/events/:id', authenticate, async (req: any, res) => { const e=await db.one(`SELECT "creatorId" FROM events WHERE id=$1`,[req.params.id]); if(!e||e.creatorid!==req.userId) return res.status(403).json({error:'Non autorisé'}); const {title,description,imageUrl,country,city,location,startDate,endDate,category}=req.body; await pool.query(`UPDATE events SET title=$1,description=$2,"imageUrl"=$3,country=$4,city=$5,location=$6,"startDate"=$7,"endDate"=$8,category=$9 WHERE id=$10`,[title,description,imageUrl,country,city,location,startDate,endDate,category,req.params.id]); res.json({success:true}); });
-  app.delete('/api/events/:id', authenticate, async (req: any, res) => { const e=await db.one(`SELECT "creatorId" FROM events WHERE id=$1`,[req.params.id]); if(!e||e.creatorid!==req.userId) return res.status(403).json({error:'Non autorisé'}); await pool.query(`DELETE FROM events WHERE id=$1`,[req.params.id]); res.json({success:true}); });
+  app.put('/api/events/:id', authenticate, async (req: any, res) => { const e=await db.one(`SELECT "creatorId" FROM events WHERE id=$1`,[req.params.id]); if(!e||e.creatorId!==req.userId) return res.status(403).json({error:'Non autorisé'}); const {title,description,imageUrl,country,city,location,startDate,endDate,category}=req.body; await pool.query(`UPDATE events SET title=$1,description=$2,"imageUrl"=$3,country=$4,city=$5,location=$6,"startDate"=$7,"endDate"=$8,category=$9 WHERE id=$10`,[title,description,imageUrl,country,city,location,startDate,endDate,category,req.params.id]); res.json({success:true}); });
+  app.delete('/api/events/:id', authenticate, async (req: any, res) => { const e=await db.one(`SELECT "creatorId" FROM events WHERE id=$1`,[req.params.id]); if(!e||e.creatorId!==req.userId) return res.status(403).json({error:'Non autorisé'}); await pool.query(`DELETE FROM events WHERE id=$1`,[req.params.id]); res.json({success:true}); });
   app.post('/api/events/:id/participate',  authenticate, async (req: any, res) => { try { await pool.query(`INSERT INTO event_participants("eventId","userId") VALUES($1,$2)`,[req.params.id,req.userId]); res.json({success:true}); } catch { res.status(400).json({error:'Déjà participant'}); } });
   app.delete('/api/events/:id/participate',authenticate, async (req: any, res) => { await pool.query(`DELETE FROM event_participants WHERE "eventId"=$1 AND "userId"=$2`,[req.params.id,req.userId]); res.json({success:true}); });
   app.get('/api/events/:id/participants',  authenticate, async (req: any, res) => res.json(await db.all(`SELECT u.id,u.name,u."avatarUrl" FROM event_participants ep JOIN users u ON ep."userId"=u.id WHERE ep."eventId"=$1`,[req.params.id])));
@@ -480,7 +592,7 @@ async function startServer() {
       res.json(await db.one(`INSERT INTO services("providerId",title,description,availability,budget,type,"companyName",location,"contractType","fileUrl",category) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,[req.userId,title,description,availability,budget||0,type||'projet',companyName,location,contractType,fileUrl,category]));
     } catch (e: any) { res.status(500).json({ error: 'Erreur création service: ' + e.message }); }
   });
-  app.put('/api/services/:id', authenticate, async (req: any, res) => { const s=await db.one(`SELECT "providerId" FROM services WHERE id=$1`,[req.params.id]); if(!s||s.providerid!==req.userId) return res.status(403).json({error:'Non autorisé'}); const {title,description,budget,availability,type,companyName,location,contractType,fileUrl,category}=req.body; await pool.query(`UPDATE services SET title=$1,description=$2,budget=$3,availability=$4,type=$5,"companyName"=$6,location=$7,"contractType"=$8,"fileUrl"=$9,category=$10 WHERE id=$11`,[title,description,budget,availability,type,companyName,location,contractType,fileUrl,category,req.params.id]); res.json({success:true}); });
+  app.put('/api/services/:id', authenticate, async (req: any, res) => { const s=await db.one(`SELECT "providerId" FROM services WHERE id=$1`,[req.params.id]); if(!s||s.providerId!==req.userId) return res.status(403).json({error:'Non autorisé'}); const {title,description,budget,availability,type,companyName,location,contractType,fileUrl,category}=req.body; await pool.query(`UPDATE services SET title=$1,description=$2,budget=$3,availability=$4,type=$5,"companyName"=$6,location=$7,"contractType"=$8,"fileUrl"=$9,category=$10 WHERE id=$11`,[title,description,budget,availability,type,companyName,location,contractType,fileUrl,category,req.params.id]); res.json({success:true}); });
   app.delete('/api/services/:id',          authenticate, async (req: any, res) => { await pool.query(`DELETE FROM services WHERE id=$1 AND "providerId"=$2`,[req.params.id,req.userId]); res.json({success:true}); });
   app.post('/api/services/:id/apply',      authenticate, async (req: any, res) => { const {message,contactDetails}=req.body; try { await pool.query(`INSERT INTO service_applications("serviceId","userId",message,"contactDetails") VALUES($1,$2,$3,$4)`,[req.params.id,req.userId,message,contactDetails]); res.json({success:true}); } catch { res.status(400).json({error:'Déjà postulé'}); } });
   app.get('/api/services/:id/applications',authenticate, async (req: any, res) => res.json(await db.all(`SELECT sa.*,u.name,u."avatarUrl",u.email FROM service_applications sa JOIN users u ON sa."userId"=u.id WHERE sa."serviceId"=$1`,[req.params.id])));
@@ -586,7 +698,7 @@ async function startServer() {
       [req.userId, req.params.userId, content || '', fileUrl, fileType, fileName]
     );
     const s = await db.one(`SELECT name,"avatarUrl" FROM users WHERE id=$1`, [req.userId]);
-    const full = { ...msg, senderName: s.name, senderAvatar: s.avatarurl };
+    const full = { ...msg, senderName: s.name, senderAvatar: s.avatarUrl };
     io.to(`user_${req.params.userId}`).emit('new_message', full);
 
     if (content) incrementSpamCounter(req.userId, 'message').catch(() => {});
@@ -603,7 +715,7 @@ async function startServer() {
   app.post('/api/chat-rooms',            authenticate, async (req: any, res) => { const {name,type,memberIds,avatarUrl}=req.body; const room=await db.one(`INSERT INTO chat_rooms(name,type,"avatarUrl","creatorId") VALUES($1,$2,$3,$4) RETURNING *`,[name||null,type||'group',avatarUrl||null,req.userId]); await pool.query(`INSERT INTO chat_room_members("roomId","userId") VALUES($1,$2)`,[room.id,req.userId]); if(Array.isArray(memberIds)) for(const id of memberIds) { try { await pool.query(`INSERT INTO chat_room_members("roomId","userId") VALUES($1,$2) ON CONFLICT DO NOTHING`,[room.id,id]); } catch {} } res.json(room); });
   app.post('/api/chat-rooms/:id/members',authenticate, async (req: any, res) => { const {userIds}=req.body; if(Array.isArray(userIds)) for(const id of userIds) { try { await pool.query(`INSERT INTO chat_room_members("roomId","userId") VALUES($1,$2) ON CONFLICT DO NOTHING`,[req.params.id,id]); } catch {} } res.json({success:true}); });
   app.get('/api/chat-rooms/:id/messages',authenticate, async (req: any, res) => res.json(await db.all(`SELECT m.*,u.name as "senderName",u."avatarUrl" as "senderAvatar" FROM messages m JOIN users u ON m."senderId"=u.id WHERE m."roomId"=$1 ORDER BY m."createdAt" ASC`,[req.params.id])));
-  app.post('/api/chat-rooms/:id/messages',authenticate, async (req: any, res) => { const {content,fileUrl,fileType,fileName,replyToId}=req.body; const msg=await db.one(`INSERT INTO messages("senderId","roomId",content,"fileUrl","fileType","fileName","replyToId") VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *`,[req.userId,req.params.id,content||'',fileUrl,fileType,fileName,replyToId||null]); const s=await db.one(`SELECT name,"avatarUrl" FROM users WHERE id=$1`,[req.userId]); const full={...msg,senderName:s.name,senderAvatar:s.avatarurl}; io.to(`room_${req.params.id}`).emit('new_room_message',full); res.json(full); });
+  app.post('/api/chat-rooms/:id/messages',authenticate, async (req: any, res) => { const {content,fileUrl,fileType,fileName,replyToId}=req.body; const msg=await db.one(`INSERT INTO messages("senderId","roomId",content,"fileUrl","fileType","fileName","replyToId") VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *`,[req.userId,req.params.id,content||'',fileUrl,fileType,fileName,replyToId||null]); const s=await db.one(`SELECT name,"avatarUrl" FROM users WHERE id=$1`,[req.userId]); const full={...msg,senderName:s.name,senderAvatar:s.avatarUrl}; io.to(`room_${req.params.id}`).emit('new_room_message',full); res.json(full); });
   app.get('/api/chat-rooms/:id/members', authenticate, async (req: any, res) => res.json(await db.all(`SELECT u.id,u.name,u."avatarUrl" FROM chat_room_members crm JOIN users u ON crm."userId"=u.id WHERE crm."roomId"=$1`,[req.params.id])));
   app.put('/api/chat-rooms/:id',         authenticate, async (req: any, res) => { const {name,avatarUrl}=req.body; await pool.query(`UPDATE chat_rooms SET name=$1,"avatarUrl"=$2 WHERE id=$3 AND "creatorId"=$4`,[name,avatarUrl,req.params.id,req.userId]); res.json({success:true}); });
 
@@ -825,7 +937,7 @@ async function startServer() {
     await pool.query(`DELETE FROM posts WHERE id=$1`, [req.params.id]);
     await pool.query(
       `INSERT INTO admin_logs("adminId",action,"targetId",details) VALUES($1,'delete_post',$2,$3)`,
-      [req.userId, req.params.id, `authorId:${post.authorid}`]
+      [req.userId, req.params.id, `authorId:${post.authorId}`]
     );
     await audit(req, 'delete_post', 'posts', Number(req.params.id), post, null);
     cacheDel('posts:public:');
@@ -839,7 +951,7 @@ async function startServer() {
     await pool.query(`DELETE FROM messages WHERE id=$1`, [req.params.id]);
     await pool.query(
       `INSERT INTO admin_logs("adminId",action,"targetId",details) VALUES($1,'delete_message',$2,$3)`,
-      [req.userId, req.params.id, `senderId:${msg.senderid}`]
+      [req.userId, req.params.id, `senderId:${msg.senderId}`]
     );
     res.json({ success: true });
   });
@@ -1034,6 +1146,145 @@ async function startServer() {
     res.json({ success: true });
   });
 
+  // ═══════════════════════════════════════════════════════════════════════
+  // 🆕 ROUTES MANQUANTES — ajoutées
+  // ═══════════════════════════════════════════════════════════════════════
+
+  // ── Notifications ──────────────────────────────────────────────────────
+  app.put('/api/notifications/read-all', authenticate, async (req: any, res) => {
+    await pool.query(`UPDATE notifications SET read=TRUE WHERE "userId"=$1`, [req.userId]);
+    res.json({ success: true });
+  });
+  app.delete('/api/notifications/:id', authenticate, async (req: any, res) => {
+    await pool.query(`DELETE FROM notifications WHERE id=$1 AND "userId"=$2`, [req.params.id, req.userId]);
+    res.json({ success: true });
+  });
+
+  // ── Réseau social ──────────────────────────────────────────────────────
+  app.delete('/api/users/:id/follow', authenticate, async (req: any, res) => {
+    await pool.query(`DELETE FROM follows WHERE "followerId"=$1 AND "followingId"=$2`, [req.userId, req.params.id]);
+    res.json({ success: true });
+  });
+  app.get('/api/users/:id/followers', authenticate, async (req: any, res) => {
+    res.json(await db.all(`SELECT u.id,u.name,u."avatarUrl",u.profession FROM users u JOIN follows f ON u.id=f."followerId" WHERE f."followingId"=$1`, [req.params.id]));
+  });
+  app.get('/api/users/:id/following', authenticate, async (req: any, res) => {
+    res.json(await db.all(`SELECT u.id,u.name,u."avatarUrl",u.profession FROM users u JOIN follows f ON u.id=f."followingId" WHERE f."followerId"=$1`, [req.params.id]));
+  });
+
+  // ── Blocage utilisateurs ────────────────────────────────────────────────
+  app.post('/api/users/:id/block', authenticate, async (req: any, res) => {
+    try {
+      await pool.query(`INSERT INTO blocked_users("blockerId","blockedId") VALUES($1,$2) ON CONFLICT DO NOTHING`, [req.userId, req.params.id]);
+      res.json({ success: true });
+    } catch { res.status(400).json({ error: 'Erreur blocage' }); }
+  });
+  app.delete('/api/users/:id/block', authenticate, async (req: any, res) => {
+    await pool.query(`DELETE FROM blocked_users WHERE "blockerId"=$1 AND "blockedId"=$2`, [req.userId, req.params.id]);
+    res.json({ success: true });
+  });
+
+  // ── Vérification profil (onboarding) ───────────────────────────────────
+
+  // ── Recherche globale ──────────────────────────────────────────────────
+  app.get('/api/search', authenticate, async (req: any, res) => {
+    const { q, type } = req.query as any;
+    if (!q || q.length < 2) return res.json({ users: [], companies: [], events: [], posts: [], services: [] });
+    const like = `%${q}%`;
+    const [users, companies, events, posts, services] = await Promise.all([
+      !type || type === 'users'     ? db.all(`SELECT id,name,profession,"avatarUrl",country,badge FROM users WHERE (name ILIKE $1 OR profession ILIKE $1) AND status='active' LIMIT 10`, [like]) : [],
+      !type || type === 'companies' ? db.all(`SELECT id,name,sector,"logoUrl",country,city FROM companies WHERE name ILIKE $1 OR sector ILIKE $1 LIMIT 10`, [like]) : [],
+      !type || type === 'events'    ? db.all(`SELECT id,title,category,country,city,"startDate" FROM events WHERE title ILIKE $1 OR description ILIKE $1 LIMIT 10`, [like]) : [],
+      !type || type === 'posts'     ? db.all(`SELECT p.id,p.content,p."createdAt",u.name as "authorName" FROM posts p JOIN users u ON p."authorId"=u.id WHERE p.content ILIKE $1 LIMIT 10`, [like]) : [],
+      !type || type === 'services'  ? db.all(`SELECT id,title,type,budget,category FROM services WHERE title ILIKE $1 OR description ILIKE $1 LIMIT 10`, [like]) : [],
+    ]);
+    res.json({ users, companies, events, posts, services });
+  });
+
+  // ── Produits ────────────────────────────────────────────────────────────
+  app.get('/api/products/search', authenticate, async (req: any, res) => {
+    const { q, category } = req.query as any;
+    let sql = `SELECT p.*,c.name as "companyName" FROM company_catalog p JOIN companies c ON p."companyId"=c.id WHERE 1=1`;
+    const params: any[] = []; let i = 1;
+    if (q)        { sql += ` AND (p.name ILIKE $${i} OR p.description ILIKE $${i})`; params.push(`%${q}%`); i++; }
+    if (category) { sql += ` AND p.category=$${i++}`; params.push(category); }
+    sql += ` LIMIT 50`;
+    res.json(await db.all(sql, params));
+  });
+
+  // ── Stories ─────────────────────────────────────────────────────────────
+  app.delete('/api/stories/:id', authenticate, async (req: any, res) => {
+    await pool.query(`DELETE FROM stories WHERE id=$1 AND "userId"=$2`, [req.params.id, req.userId]);
+    res.json({ success: true });
+  });
+  app.get('/api/stories/:id/viewers', authenticate, async (req: any, res) => {
+    res.json(await db.all(`SELECT u.id,u.name,u."avatarUrl",sv."createdAt" as "viewedAt" FROM story_views sv JOIN users u ON sv."userId"=u.id WHERE sv."storyId"=$1`, [req.params.id]));
+  });
+
+  // ── Entreprises — admin ─────────────────────────────────────────────────
+  app.get('/api/admin/companies', authenticate, requireAdmin, async (req: any, res) => {
+    const { search, sector } = req.query as any;
+    let q = `SELECT c.*,u.name as "ownerName",u.email as "ownerEmail" FROM companies c JOIN users u ON c."ownerId"=u.id WHERE 1=1`;
+    const p: any[] = []; let i = 1;
+    if (search) { q += ` AND (c.name ILIKE $${i} OR u.name ILIKE $${i})`; p.push(`%${search}%`); i++; }
+    if (sector) { q += ` AND c.sector=$${i++}`; p.push(sector); }
+    q += ` ORDER BY c."createdAt" DESC`;
+    res.json(await db.all(q, p));
+  });
+  app.delete('/api/admin/companies/:id', authenticate, requireAdmin, async (req: any, res) => {
+    await pool.query(`DELETE FROM companies WHERE id=$1`, [req.params.id]);
+    await pool.query(`INSERT INTO admin_logs("adminId",action,"targetId") VALUES($1,'delete_company',$2)`, [req.userId, req.params.id]);
+    cacheDel('companies:');
+    res.json({ success: true });
+  });
+
+  // ── Événements — admin ──────────────────────────────────────────────────
+  app.get('/api/admin/events', authenticate, requireAdmin, async (_, res) => {
+    res.json(await db.all(`SELECT e.*,u.name as "creatorName",(SELECT COUNT(*) FROM event_participants WHERE "eventId"=e.id) as "participantsCount" FROM events e JOIN users u ON e."creatorId"=u.id ORDER BY e."createdAt" DESC`, []));
+  });
+  app.delete('/api/admin/events/:id', authenticate, requireAdmin, async (req: any, res) => {
+    await pool.query(`DELETE FROM events WHERE id=$1`, [req.params.id]);
+    await pool.query(`INSERT INTO admin_logs("adminId",action,"targetId") VALUES($1,'delete_event',$2)`, [req.userId, req.params.id]);
+    res.json({ success: true });
+  });
+
+  // ── Services — admin ────────────────────────────────────────────────────
+  app.get('/api/admin/services', authenticate, requireAdmin, async (_, res) => {
+    res.json(await db.all(`SELECT s.*,u.name as "providerName" FROM services s JOIN users u ON s."providerId"=u.id ORDER BY s."createdAt" DESC`, []));
+  });
+  app.delete('/api/admin/services/:id', authenticate, requireAdmin, async (req: any, res) => {
+    await pool.query(`DELETE FROM services WHERE id=$1`, [req.params.id]);
+    res.json({ success: true });
+  });
+
+  // ── Export CSV admin ────────────────────────────────────────────────────
+  app.get('/api/admin/export/users', authenticate, requireSuperAdmin, async (_, res) => {
+    const users = await db.all(`SELECT id,email,name,profession,country,role,status,"createdAt","loginCount","lastSeen" FROM users ORDER BY "createdAt" DESC`, []);
+    const header = 'id,email,name,profession,country,role,status,createdAt,loginCount,lastSeen\n';
+    const rows = users.map((u: any) =>
+      [u.id, u.email, `"${(u.name||'').replace(/"/g,'""')}"`, u.profession, u.country, u.role, u.status, u.createdAt, u.loginCount, u.lastSeen].join(',')
+    ).join('\n');
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', 'attachment; filename="freebara-users.csv"');
+    res.send(header + rows);
+  });
+
+  // ── Tâches assignées ────────────────────────────────────────────────────
+  app.get('/api/tasks/assigned', authenticate, async (req: any, res) => {
+    res.json(await db.all(`SELECT t.*,u.name as "assignerName" FROM tasks t JOIN users u ON t."userId"=u.id WHERE t."assignedUserId"=$1 AND t."isArchived"=FALSE ORDER BY t."createdAt" DESC`, [req.userId]));
+  });
+  app.put('/api/tasks/:id/archive', authenticate, async (req: any, res) => {
+    await pool.query(`UPDATE tasks SET "isArchived"=TRUE WHERE id=$1 AND "userId"=$2`, [req.params.id, req.userId]);
+    res.json({ success: true });
+  });
+
+  // ── Transactions ────────────────────────────────────────────────────────
+
+  // ── Certifications publiques ────────────────────────────────────────────
+  app.get('/api/users/:id/certifications', authenticate, async (req: any, res) => {
+    res.json(await db.all(`SELECT id,"userId",name,organization,"dateObtained","createdAt" FROM certifications WHERE "userId"=$1 ORDER BY "dateObtained" DESC`, [req.params.id]));
+  });
+
   // ─── BACKUP ROUTES (admin) ────────────────────────────────────────────────
   app.get('/api/admin/backup/history', authenticate, requireAdmin, async (_, res) => {
     res.json(await getBackupHistory(48));
@@ -1041,6 +1292,17 @@ async function startServer() {
   app.post('/api/admin/backup/snapshot', authenticate, requireSuperAdmin, async (_, res) => {
     await snapshotCounts();
     res.json({ success: true, message: 'Snapshot créé' });
+  });
+
+  // ─── MIDDLEWARE GLOBAL D'ERREUR (catch-all pour routes sans try/catch) ───────
+  app.use((err: any, req: any, res: any, next: any) => {
+    const status = err.status || err.statusCode || 500;
+    const msg    = err.message || 'Erreur interne';
+    errorTracker.capture(err, `${req.method} ${req.path}`);
+    console.error(`❌ [${status}] ${req.method} ${req.path} — ${msg}`);
+    if (!res.headersSent) {
+      res.status(status).json({ error: status >= 500 ? 'Erreur serveur' : msg });
+    }
   });
 
   // ─── SOCKET.IO ────────────────────────────────────────────────────────────
@@ -1094,16 +1356,28 @@ async function startServer() {
 
   // ─── DÉMARRAGE ────────────────────────────────────────────────────────────
   httpServer.listen(PORT, '0.0.0.0', () => {
-    console.log('\n════════════════════════════════════════');
+    const routeCount = (app as any)._router?.stack?.filter((r: any) => r.route)?.length ?? '?';
+    console.log('\n════════════════════════════════════════════════');
     console.log(`✅  FreeBara Server v2 — port ${PORT}`);
+    console.log(`🌍  Env: ${IS_DEV ? 'development' : 'production'}`);
     console.log(`🗄️   PostgreSQL | 🔐 JWT | 📧 Resend`);
     console.log(`🛡️   Modération auto | 💾 Backup/heure`);
-    console.log(`✅  Validation | 📊 Dashboard admin`);
-    console.log('════════════════════════════════════════\n');
+    console.log(`📡  Socket.IO: polling + websocket`);
+    console.log(`📊  Routes enregistrées: ${routeCount}`);
+    console.log(`🌐  CORS: ${ALLOWED_ORIGINS.join(', ')}`);
+    console.log('════════════════════════════════════════════════\n');
   });
 
   process.on('SIGTERM', async () => {
-    console.log('🛑 SIGTERM — fermeture propre...');
+    console.log('🛑 SIGTERM reçu — fermeture propre en cours...');
+    httpServer.close(() => console.log('🔌 Serveur HTTP fermé'));
+    await pool.end();
+    console.log('🗄️  Pool PostgreSQL fermé');
+    process.exit(0);
+  });
+
+  process.on('SIGINT', async () => {
+    console.log('🛑 SIGINT reçu — fermeture propre...');
     await pool.end();
     process.exit(0);
   });

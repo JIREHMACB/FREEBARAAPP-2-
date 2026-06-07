@@ -146,9 +146,11 @@ export const validate = (schema: ReturnType<typeof createValidator>) =>
   (req: any, res: any, next: any) => {
     const result = schema.safeParse(req.body);
     if (!result.success) {
+      // TypeScript union narrowing : dans la branche !success, on a forcément { success: false; error: ... }
+      const err = (result as { success: false; error: { message: string; issues: string[] } }).error;
       return res.status(400).json({
         error: 'Données invalides',
-        details: result.error.issues,
+        details: err.issues,
       });
     }
     next();
