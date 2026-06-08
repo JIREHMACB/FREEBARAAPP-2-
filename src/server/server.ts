@@ -10,6 +10,7 @@ import cors              from 'cors';
 import { fileURLToPath } from 'url';
 import dotenv            from 'dotenv';
 import * as path         from 'path';
+import * as fs            from 'fs';
 import jwt               from 'jsonwebtoken';
 
 dotenv.config();
@@ -35,61 +36,26 @@ export const ALLOWED_ORIGINS = [
   ...(IS_DEV ? ['http://localhost:5173', 'http://localhost:3000'] : []),
 ];
 
-// ─── Imports modules ----------------------------------------
-import { pool, db, hashOtp } from './config/db.js';
-
+// ─── Imports modules ─────────────────────────────────────────────────────────
+import { pool, db }          from './config/db.js';
 import { initDB } from './database/init.js';
 import { runMigrations } from './database/migrations.js';
-
-import {
-  cacheGet,
-  cacheSet,
-  cacheDel,
-  cacheSize
-} from './services/cache.js';
-
-import {
-  metrics,
-  errorTracker
-} from './services/metrics.js';
-
-import {
-  enqueueJob,
-  jobQueue
-} from './services/queue.js';
-
-import { uploadToCloudinary } from './services/cloudinary.js';
-
-import {
-  startBackupJobs,
-  getBackupHistory,
-  snapshotCounts
-} from './services/backup.js';
-
+import { cacheGet, cacheSet, cacheDel, cacheSize } from './services/cache.js';
+import { metrics, errorTracker } from './services/metrics.js';
+import { enqueueJob, jobQueue }  from './services/queue.js';
+import { uploadToCloudinary }    from './services/cloudinary.js';
+import { startBackupJobs, getBackupHistory, snapshotCounts } from './services/backup.js';
 import {
   analyzeContent,
   autoModerate,
   incrementSpamCounter,
   moderationCache
 } from './middleware/moderation.js';
-
-import {
-  authenticate,
-  requireAdmin,
-  requireSuperAdmin
-} from './middleware/auth.js';
-
+import { authenticate, requireAdmin, requireSuperAdmin } from './middleware/auth.js';
 import { rateLimit } from './middleware/rateLimit.js';
-
-import {
-  validate,
-  schemas
-} from './middleware/validate.js';
-
-import {
-  isValidEmail,
-  sendOTPEmail
-} from './services/email.js';
+import { validate, schemas } from './middleware/validate.js';
+import { isValidEmail, sendOTPEmail } from './services/email.js';
+import { hashOtp }           from './config/db.js';
 
 // ─── PERMISSIONS ─────────────────────────────────────────────────────────────
 const ROLE_PERMISSIONS: Record<string, string[]> = {
@@ -1340,11 +1306,30 @@ async function startServer() {
   });
 
   // ─── STATIC FILES ─────────────────────────────────────────────────────────
-  const distPath = IS_DEV ? path.join(__dirname, '..', 'dist') : __dirname;
+  // Auto-détection du dossier dist selon la structure de build réelle
+  const candidates = [
+    path.join(__dirname, '..', '..', 'dist'),   // dist/server/server.js → dist/
+    path.join(__dirname, '..', 'dist'),          // server/server.js      → dist/
+    path.join(__dirname, 'dist'),                // server.js             → dist/
+    path.join(process.cwd(), 'dist'),            // fallback CWD
+  ];
+  const distPath = candidates.find(p => fs.existsSync(path.join(p, 'index.html'))) ?? candidates[0];
+
+  console.log(`📁 distPath résolu: ${distPath}`);
+  console.log(`📄 index.html: ${fs.existsSync(path.join(distPath, 'index.html')) ? '✅ trouvé' : '❌ INTROUVABLE'}`);
+  if (!fs.existsSync(path.join(distPath, 'index.html'))) {
+    console.warn('⚠️  Chemins testés:', candidates.join(' | '));
+    try { console.warn('📂 CWD:', fs.readdirSync(process.cwd()).join(', ')); } catch {}
+  }
+
   app.use(express.static(distPath));
   app.get('*', (req, res) => {
-    if (req.path.startsWith('/api')) return res.status(404).json({ error: 'API route not found' });
-    res.sendFile(path.join(distPath, 'index.html'));
+    if (req.path.startsWith('/api')) return res.status(404).json({ error: 'Route API introuvable' });
+    const indexPath = path.join(distPath, 'index.html');
+    if (!fs.existsSync(indexPath)) {
+      return res.status(404).send(`<h2>Frontend introuvable</h2><p><code>${distPath}</code></p><p>Vérifiez que Vite build génère <code>dist/index.html</code> avant le build serveur.</p>`);
+    }
+    res.sendFile(indexPath);
   });
 
   // ─── KEEP-ALIVE ───────────────────────────────────────────────────────────
